@@ -3953,16 +3953,12 @@ bool static FlushStateToDisk(CValidationState &state, FlushStateMode mode) {
     }
     // Flush best chain related state. This can only be done if the blocks / block index write was also done.
     if (fDoFullFlush) {
-        // Typical CCoins structures on disk are around 128 bytes in size.
-        // Pushing a new one to the database can cause it to be written
-        // twice (once in the log, and once in the tables). This is already
-        // an overestimation, as most will delete an existing entry or
-        // overwrite one. Still, use a conservative safety factor of 2.
-        // Cap at 512MB to avoid false "disk space low" when cache is very large.
-        uint64_t nFlushBytes = std::min((uint64_t)(128 * 2 * 2) * pcoinsTip->GetCacheSize(), (uint64_t)(512 * 1024 * 1024));
-        if (!CheckDiskSpace(nFlushBytes))
-            return state.Error("out of disk space");
         // Flush the chainstate (which may refer to block index entries).
+        // Note: we only check for the 50MB base minimum (CheckDiskSpace(0) above).
+        // The pre-flight size estimate was removed because GetCacheSize() returns
+        // entry count (not bytes), leading to grossly overestimated requirements
+        // (e.g. 500MB+) that trigger false "disk space low" aborts during reindex.
+        // A real disk-full error is caught by pcoinsTip->Flush() returning false.
         if (!pcoinsTip->Flush())
             return AbortNode(state, "Failed to write to coin database");
 
