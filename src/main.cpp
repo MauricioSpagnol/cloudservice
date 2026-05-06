@@ -3958,7 +3958,9 @@ bool static FlushStateToDisk(CValidationState &state, FlushStateMode mode) {
         // twice (once in the log, and once in the tables). This is already
         // an overestimation, as most will delete an existing entry or
         // overwrite one. Still, use a conservative safety factor of 2.
-        if (!CheckDiskSpace(128 * 2 * 2 * pcoinsTip->GetCacheSize()))
+        // Cap at 512MB to avoid false "disk space low" when cache is very large.
+        uint64_t nFlushBytes = std::min((uint64_t)(128 * 2 * 2) * pcoinsTip->GetCacheSize(), (uint64_t)(512 * 1024 * 1024));
+        if (!CheckDiskSpace(nFlushBytes))
             return state.Error("out of disk space");
         // Flush the chainstate (which may refer to block index entries).
         if (!pcoinsTip->Flush())
@@ -5333,11 +5335,22 @@ void FindFilesToPrune(std::set<int>& setFilesToPrune, uint64_t nPruneAfterHeight
 
 bool CheckDiskSpace(uint64_t nAdditionalBytes)
 {
-    uint64_t nFreeBytesAvailable = boost::filesystem::space(GetDataDir()).available;
+    boost::filesystem::path dataDir = GetDataDir();
+    uint64_t nFreeBytesAvailable = boost::filesystem::space(dataDir).available;
+    uint64_t nRequired = nMinDiskSpace + nAdditionalBytes;
 
-    // Check for nMinDiskSpace bytes (currently 50MB)
-    if (nFreeBytesAvailable < nMinDiskSpace + nAdditionalBytes)
+    LogPrint("disk", "CheckDiskSpace: path=%s available=%lluMB required=%lluMB\n",
+        dataDir.string(), nFreeBytesAvailable / (1024*1024), nRequired / (1024*1024));
+
+    if (nFreeBytesAvailable < nRequired) {
+        LogPrintf("CheckDiskSpace FAILED: path=%s available=%lluMB required=%lluMB (base=%lluMB + additional=%lluMB)\n",
+            dataDir.string(),
+            nFreeBytesAvailable / (1024*1024),
+            nRequired / (1024*1024),
+            nMinDiskSpace / (1024*1024),
+            nAdditionalBytes / (1024*1024));
         return AbortNode("Disk space is low!", _("Error: Disk space is low!"));
+    }
 
     return true;
 }
