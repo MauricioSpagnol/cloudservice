@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# CS Coin Benchmark Daemon wrapper
+# Allows csd (the CS Coin daemon) to find and start csbenchd
+# via GetBenchDaemonPath() in src/fluxnode/benchmarks.cpp
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BENCH_DIR="$SCRIPT_DIR/../csbenchd"
+
+exec node "$BENCH_DIR/daemon.js" "$@"

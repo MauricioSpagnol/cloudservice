@@ -1,0 +1,21 @@
+{
+  "name": "csbenchd",
+  "version": "1.0.0",
+  "description": "CS Coin Benchmark Daemon",
+  "main": "daemon.js",
+  "scripts": {
+    "start": "node daemon.js",
+    "keygen": "node keygen.js"
+  },
+  "bin": {
+    "csbenchd": "./daemon.js",
+    "csbench-cli": "./cli.js"
+  },
+  "dependencies": {
+    "elliptic": "^6.5.4",
+    "bn.js": "^5.2.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

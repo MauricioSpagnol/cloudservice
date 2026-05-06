@@ -1,0 +1,5 @@
+Building Flux
+
+See the Fluxd github wiki (https://github.com/RunOnFlux/fluxd/wiki) for instructions on building fluxd,
+the intended-for-services, no-graphical-interface, reference
+implementation of Flux.

@@ -1,0 +1,40 @@
+diff --git a/darwin.jam b/darwin.jam
+index 8d47741..641d8bb 100644
+--- a/tools/build/src/tools/darwin.jam
++++ b/tools/build/src/tools/darwin.jam
+@@ -138,14 +138,14 @@ rule init ( version ? : command * : options * : requirement * )
+     common.handle-options darwin : $(condition) : $(command) : $(options) ;
+     
+     # - GCC 4.0 and higher in Darwin does not have -fcoalesce-templates.
+-    if $(real-version) < "4.0.0"
+-    {
+-        flags darwin.compile.c++ OPTIONS $(condition) : -fcoalesce-templates ;
+-    }
++#    if $(real-version) < "4.0.0"
++#    {
++#        flags darwin.compile.c++ OPTIONS $(condition) : -fcoalesce-templates ;
++#    }
+     # - GCC 4.2 and higher in Darwin does not have -Wno-long-double.
+-    if $(real-version) < "4.2.0"
+-    {
+-        flags darwin.compile OPTIONS $(condition) : -Wno-long-double ;
+-    }
++#    if $(real-version) < "4.2.0"
++#    {
++#        flags darwin.compile OPTIONS $(condition) : -Wno-long-double ;
++#    }
+     # - GCC on Darwin with -pedantic, suppress unsupported long long warning
+     flags darwin.compile OPTIONS $(condition)/<warnings>all : -Wno-long-long ;
+diff --git a/thread_data.hpp b/thread_data.hpp
+index 588e997..f062f84 100644
+--- a/boost/thread/pthread/thread_data.hpp
++++ b/boost/thread/pthread/thread_data.hpp
+@@ -57,7 +57,7 @@ namespace boost
+ #else
+           std::size_t page_size = ::sysconf( _SC_PAGESIZE);
+ #endif
+-#if PTHREAD_STACK_MIN > 0
++#ifdef PTHREAD_STACK_MIN
+           if (size<PTHREAD_STACK_MIN) size=PTHREAD_STACK_MIN;
+ #endif
+           size = ((size+page_size-1)/page_size)*page_size;

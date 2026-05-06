@@ -1,0 +1,116 @@
+sudo: required
+language: generic
+matrix:
+  include:
+    - os: linux
+      dist: xenial
+      env: PLATFORM="linux"
+    - os: linux
+      dist: xenial
+      env: PLATFORM="arm"
+    - os: linux
+      dist: xenial
+      env: PLATFORM="win"
+#    - os: osx
+#      osx_image: xcode10.2
+#      env: $PLATFORM="osx"
+before_install:
+  - if [[ "$PLATFORM" == "linux" ]]; then sudo apt-get update; fi
+  - if [[ "$PLATFORM" == "linux" ]]; then sudo apt-get install build-essential pkg-config libc6-dev m4 g++-multilib autoconf libtool ncurses-dev unzip git python python-zmq zlib1g-dev wget curl bsdmainutils automake libtinfo5; fi
+  - if [[ "$PLATFORM" == "arm" ]]; then sudo apt-get update; fi
+  - if [[ "$PLATFORM" == "arm" ]]; then sudo apt-get install build-essential pkg-config libc6-dev m4 g++-multilib autoconf libtool ncurses-dev unzip git python python-zmq zlib1g-dev wget curl bsdmainutils automake libtinfo5; fi
+  - if [[ "$PLATFORM" == "arm" ]]; then sudo apt-get install g++-aarch64-linux-gnu; fi
+  - if [[ "$PLATFORM" == "osx" ]]; then /usr/bin/ruby -e "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"; fi
+  - if [[ "$PLATFORM" == "osx" ]]; then brew update; fi
+  - if [[ "$PLATFORM" == "osx" ]]; then brew install cmake autoconf libtool automake coreutils pkgconfig gmp wget; fi
+  - if [[ "$PLATFORM" == "osx" ]]; then brew install gcc5 --without-multilib; fi
+  - if [[ "$PLATFORM" == "win" ]]; then sudo apt-get update; fi
+  - if [[ "$PLATFORM" == "win" ]]; then sudo apt-get install -y build-essential pkg-config libc6-dev m4 g++-multilib autoconf libtool ncurses-dev unzip git python python-zmq zlib1g-dev wget curl bsdmainutils automake libtinfo5 mingw-w64 mingw-w64-tools gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 cmake zip; fi
+  - export VERSION=`head -n 1 README.md | cut -c 8-`
+  - echo $VERSION
+  - export BRANCH=$(if [ "$TRAVIS_PULL_REQUEST" == "false" ]; then echo $TRAVIS_BRANCH; else echo $TRAVIS_PULL_REQUEST_BRANCH; fi)
+script:
+  - if [[ "$PLATFORM" == "linux" ]]; then ./zcutil/build.sh; fi
+  - if [[ "$PLATFORM" == "arm" ]]; then HOST=aarch64-linux-gnu ./zcutil/build.sh; fi
+  - if [[ "$PLATFORM" == "osx" ]]; then ./zcutil/build.sh; fi
+  - if [[ "$PLATFORM" == "win" ]]; then ./zcutil/build-win.sh; fi
+before_deploy:
+  - yes | gem update --system --force # fix deployment error
+  - gem install bundler
+  - gem install faraday-net_http -v '3.3.0' # Fix faraday version
+  - gem install uri
+  - gem install logger
+  - if [[ "$PLATFORM" == "linux" ]]; then ls -l ./src; fi
+  - if [[ "$PLATFORM" == "linux" ]]; then strip ./src/fluxd ./src/flux-cli ./src/flux-tx ./src/flux-gtest; fi
+  - if [[ "$PLATFORM" == "linux" ]]; then cp ./src/fluxd .; fi
+  - if [[ "$PLATFORM" == "linux" ]]; then cp ./src/flux-cli .; fi
+  - if [[ "$PLATFORM" == "linux" ]]; then cp ./src/flux-tx .; fi
+  - if [[ "$PLATFORM" == "linux" ]]; then cp ./src/flux-gtest .; fi
+  - if [[ "$PLATFORM" == "linux" ]]; then cp ./zcutil/fetch-params.sh .; fi
+  - if [[ "$PLATFORM" == "linux" ]]; then tar -cvzf Flux-Linux-$VERSION-$BRANCH-$TRAVIS_BUILD_NUMBER-TravisCI.tar.gz fluxd flux-cli flux-tx flux-gtest fetch-params.sh; fi
+  - if [[ "$PLATFORM" == "arm" ]]; then cp ./src/fluxd .; fi
+  - if [[ "$PLATFORM" == "arm" ]]; then cp ./src/flux-cli .; fi
+  - if [[ "$PLATFORM" == "arm" ]]; then cp ./src/flux-tx .; fi
+  - if [[ "$PLATFORM" == "arm" ]]; then cp ./zcutil/fetch-params.sh .; fi
+  - if [[ "$PLATFORM" == "arm" ]]; then tar -cvzf Flux-arm-$VERSION-$BRANCH-$TRAVIS_BUILD_NUMBER-TravisCI.tar.gz fluxd flux-cli flux-tx fetch-params.sh; fi
+  - if [[ "$PLATFORM" == "osx" ]]; then strip ./src/fluxd ./src/flux-cli ./src/flux-tx; fi
+  - if [[ "$PLATFORM" == "osx" ]]; then cp ./src/fluxd .; fi
+  - if [[ "$PLATFORM" == "osx" ]]; then cp ./src/flux-cli .; fi
+  - if [[ "$PLATFORM" == "osx" ]]; then cp ./src/flux-tx .; fi
+  - if [[ "$PLATFORM" == "osx" ]]; then cp ./zcutil/fetch-params.sh .; fi
+  - if [[ "$PLATFORM" == "osx" ]]; then tar -cvzf Flux-macOS-$VERSION-$BRANCH-$TRAVIS_BUILD_NUMBER-TravisCI.tar.gz fluxd flux-cli flux-tx fetch-params.sh; fi
+  - if [[ "$PLATFORM" == "win" ]]; then strip ./src/fluxd.exe ./src/flux-cli.exe ./src/flux-tx.exe; fi
+  - if [[ "$PLATFORM" == "win" ]]; then cp ./src/fluxd.exe .; fi
+  - if [[ "$PLATFORM" == "win" ]]; then cp ./src/flux-cli.exe .; fi
+  - if [[ "$PLATFORM" == "win" ]]; then cp ./src/flux-tx.exe .; fi
+  - if [[ "$PLATFORM" == "win" ]]; then cp ./zcutil/fetch-params.bat .; fi
+  - if [[ "$PLATFORM" == "win" ]]; then zip Flux-Windows-$VERSION-$BRANCH-$TRAVIS_BUILD_NUMBER-TravisCI.zip fluxd.exe flux-cli.exe flux-tx.exe fetch-params.bat; fi
+deploy:
+  - provider: releases
+    skip_cleanup: true
+    draft: true
+    token:
+      secure: nuvepmL9kXw4zeY8YW2wt3LSo9mO6RBEW5IxF8/UwBPxD3q+HrWejOB4cunlejqpIsenz3MRl9g5OrDsFS8NjKvp4Hwdq6cd1VjoPGk7Bfh6aT/gXRPQ43kh/4YK0g8xlQGx7xby7WakoWrDWRjQEWMolDBxXgkQ2UtJqxPi/Af/bk8M3n3b+PojRJa1+lRGKLquBjAT4Qk1taasnO01WIE4BEH58XK0IGmR2G/j6y5wrFTmBmvybrw2/Pqltias/8wpe/rRAEyrMeYn/SImdpsUMJm5QBxYIrPvybPqJfOR0lbRJwrNavFNHuaKg612ImEEwBi3+m2pnK5AlS1ikDMdl7J3eWaXPMi48IL5OKi8pogj1Y4iQDlfbbNTke5BviBdoESG0PuCNo3TUQjnEI5Ue2ZNjBdCn96+9nB3NQbD+WFGhMyHsw/dThqBlzagHo5g2JSITyNArFBlWykd8yOTT3ateu2L+OtuuDmByWx4I/kBpl2Uzy8B8yCmD05Kbl1F3KpapLjUrnWlZ0/il+Y5ZXvfIlZ71OW/S9uCILi9zkklkGciwlZF6JkEm1yxuX1MhNiCzjuNWvhSZmgRRoAIxfMuNf2dkycWb9ihN13gBba6W0uEzC4AyF9SPnoQtfQiexTRCK2BzsSbFQjggFIVnHYmnMnIN49l8fkzNKs=
+    file_glob: true
+    file:
+      - "Flux-Linux-$VERSION-$BRANCH-$TRAVIS_BUILD_NUMBER-TravisCI.tar.gz"
+    on:
+      condition: $PLATFORM = linux
+      all_branches: true
+      tags: true
+  - provider: releases
+    skip_cleanup: true
+    draft: true
+    token:
+      secure: nuvepmL9kXw4zeY8YW2wt3LSo9mO6RBEW5IxF8/UwBPxD3q+HrWejOB4cunlejqpIsenz3MRl9g5OrDsFS8NjKvp4Hwdq6cd1VjoPGk7Bfh6aT/gXRPQ43kh/4YK0g8xlQGx7xby7WakoWrDWRjQEWMolDBxXgkQ2UtJqxPi/Af/bk8M3n3b+PojRJa1+lRGKLquBjAT4Qk1taasnO01WIE4BEH58XK0IGmR2G/j6y5wrFTmBmvybrw2/Pqltias/8wpe/rRAEyrMeYn/SImdpsUMJm5QBxYIrPvybPqJfOR0lbRJwrNavFNHuaKg612ImEEwBi3+m2pnK5AlS1ikDMdl7J3eWaXPMi48IL5OKi8pogj1Y4iQDlfbbNTke5BviBdoESG0PuCNo3TUQjnEI5Ue2ZNjBdCn96+9nB3NQbD+WFGhMyHsw/dThqBlzagHo5g2JSITyNArFBlWykd8yOTT3ateu2L+OtuuDmByWx4I/kBpl2Uzy8B8yCmD05Kbl1F3KpapLjUrnWlZ0/il+Y5ZXvfIlZ71OW/S9uCILi9zkklkGciwlZF6JkEm1yxuX1MhNiCzjuNWvhSZmgRRoAIxfMuNf2dkycWb9ihN13gBba6W0uEzC4AyF9SPnoQtfQiexTRCK2BzsSbFQjggFIVnHYmnMnIN49l8fkzNKs=
+    file_glob: true
+    file:
+      - "Flux-arm-$VERSION-$BRANCH-$TRAVIS_BUILD_NUMBER-TravisCI.tar.gz"
+    on:
+      condition: $PLATFORM = arm
+      all_branches: true
+      tags: true
+  - provider: releases
+    skip_cleanup: true
+    draft: true
+    token:
+      secure: nuvepmL9kXw4zeY8YW2wt3LSo9mO6RBEW5IxF8/UwBPxD3q+HrWejOB4cunlejqpIsenz3MRl9g5OrDsFS8NjKvp4Hwdq6cd1VjoPGk7Bfh6aT/gXRPQ43kh/4YK0g8xlQGx7xby7WakoWrDWRjQEWMolDBxXgkQ2UtJqxPi/Af/bk8M3n3b+PojRJa1+lRGKLquBjAT4Qk1taasnO01WIE4BEH58XK0IGmR2G/j6y5wrFTmBmvybrw2/Pqltias/8wpe/rRAEyrMeYn/SImdpsUMJm5QBxYIrPvybPqJfOR0lbRJwrNavFNHuaKg612ImEEwBi3+m2pnK5AlS1ikDMdl7J3eWaXPMi48IL5OKi8pogj1Y4iQDlfbbNTke5BviBdoESG0PuCNo3TUQjnEI5Ue2ZNjBdCn96+9nB3NQbD+WFGhMyHsw/dThqBlzagHo5g2JSITyNArFBlWykd8yOTT3ateu2L+OtuuDmByWx4I/kBpl2Uzy8B8yCmD05Kbl1F3KpapLjUrnWlZ0/il+Y5ZXvfIlZ71OW/S9uCILi9zkklkGciwlZF6JkEm1yxuX1MhNiCzjuNWvhSZmgRRoAIxfMuNf2dkycWb9ihN13gBba6W0uEzC4AyF9SPnoQtfQiexTRCK2BzsSbFQjggFIVnHYmnMnIN49l8fkzNKs=
+    file_glob: true
+    file:
+      - "Flux-macOS-$VERSION-$BRANCH-$TRAVIS_BUILD_NUMBER-TravisCI.tar.gz"
+    on:
+      condition: $PLATFORM = osx
+      all_branches: true
+      tags: true
+  - provider: releases
+    skip_cleanup: true
+    draft: true
+    token:
+      secure: nuvepmL9kXw4zeY8YW2wt3LSo9mO6RBEW5IxF8/UwBPxD3q+HrWejOB4cunlejqpIsenz3MRl9g5OrDsFS8NjKvp4Hwdq6cd1VjoPGk7Bfh6aT/gXRPQ43kh/4YK0g8xlQGx7xby7WakoWrDWRjQEWMolDBxXgkQ2UtJqxPi/Af/bk8M3n3b+PojRJa1+lRGKLquBjAT4Qk1taasnO01WIE4BEH58XK0IGmR2G/j6y5wrFTmBmvybrw2/Pqltias/8wpe/rRAEyrMeYn/SImdpsUMJm5QBxYIrPvybPqJfOR0lbRJwrNavFNHuaKg612ImEEwBi3+m2pnK5AlS1ikDMdl7J3eWaXPMi48IL5OKi8pogj1Y4iQDlfbbNTke5BviBdoESG0PuCNo3TUQjnEI5Ue2ZNjBdCn96+9nB3NQbD+WFGhMyHsw/dThqBlzagHo5g2JSITyNArFBlWykd8yOTT3ateu2L+OtuuDmByWx4I/kBpl2Uzy8B8yCmD05Kbl1F3KpapLjUrnWlZ0/il+Y5ZXvfIlZ71OW/S9uCILi9zkklkGciwlZF6JkEm1yxuX1MhNiCzjuNWvhSZmgRRoAIxfMuNf2dkycWb9ihN13gBba6W0uEzC4AyF9SPnoQtfQiexTRCK2BzsSbFQjggFIVnHYmnMnIN49l8fkzNKs=
+    file_glob: true
+    file:
+      - "Flux-Windows-$VERSION-$BRANCH-$TRAVIS_BUILD_NUMBER-TravisCI.zip"
+    on:
+      condition: $PLATFORM = win
+      all_branches: true
+      tags: true

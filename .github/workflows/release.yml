@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential libtool autotools-dev automake pkg-config \
+            libssl-dev libevent-dev bsdmainutils \
+            libboost-system-dev libboost-filesystem-dev \
+            libboost-chrono-dev libboost-program-options-dev \
+            libboost-test-dev libboost-thread-dev \
+            libminiupnpc-dev libzmq3-dev \
+            curl wget git python3
+
+      - name: Cache depends
+        uses: actions/cache@v4
+        with:
+          path: depends/built
+          key: depends-ubuntu22-${{ hashFiles('depends/packages/*.mk') }}
+
+      - name: Build depends (includes Berkeley DB 6.2)
+        run: |
+          ls depends/Makefile  # confirma que o Makefile existe no checkout
+          DEPENDS_HOST=$(./depends/config.guess)
+          make -C depends -j$(nproc) HOST=$DEPENDS_HOST NO_PROTON=1
+          echo "DEPENDS_HOST=$DEPENDS_HOST" >> $GITHUB_ENV
+
+      - name: Build CS Coin
+        run: |
+          ./autogen.sh
+          ./configure \
+            --prefix=$(pwd)/depends/${{ env.DEPENDS_HOST }} \
+            --with-incompatible-bdb \
+            --disable-tests --disable-bench --disable-gui-tests \
+            --without-gui --without-miniupnpc \
+            --disable-proton
+          make -j$(nproc)
+
+      - name: Package csd
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          ASSET="csd-linux-amd64-v${VERSION}.tar.gz"
+          mkdir -p dist/csd
+          cp src/csd src/cs-cli src/cs-tx dist/csd/
+          strip dist/csd/csd dist/csd/cs-cli dist/csd/cs-tx
+          tar -czf "${ASSET}" -C dist csd
+          echo "CSD_ASSET=${ASSET}" >> $GITHUB_ENV
+
+      - name: Generate SHA256SUMS
+        run: |
+          sha256sum "${{ env.CSD_ASSET }}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "CS Coin v${{ steps.version.outputs.VERSION }}"
+          body: |
+            ## CS Coin Node v${{ steps.version.outputs.VERSION }}
+
+            ### Assets
+            - `csd-linux-amd64-v${{ steps.version.outputs.VERSION }}.tar.gz` — daemon + cs-cli + cs-tx
+            - `SHA256SUMS` — checksums SHA256
+
+            ### Instalação
+            O CS Coin Node é instalado exclusivamente via **CS Node OS ISO**.
+            Use `cs-mage update` para atualizar o daemon em um node já instalado.
+          files: |
+            ${{ env.CSD_ASSET }}
+            SHA256SUMS
+          draft: false
+          prerelease: false

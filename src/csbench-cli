@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# CS Coin Benchmark CLI wrapper
+# Allows csd (the CS Coin daemon) to call csbench-cli
+# via GetBenchCliPath() in src/fluxnode/benchmarks.cpp
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BENCH_DIR="$SCRIPT_DIR/../csbenchd"
+
+exec node "$BENCH_DIR/cli.js" "$@"
