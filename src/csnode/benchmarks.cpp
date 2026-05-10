@@ -233,7 +233,7 @@ bool GetBenchmarkSignedTransaction(const CTransaction& tx, CTransaction& signedT
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
         ss << tx;
         std::string txHexStr = HexStr(ss.begin(), ss.end());
-        std::string response = GetStdoutFromCommand(GetBenchCliPath() + testnet + "signfluxnodetransaction " + txHexStr, true);
+        std::string response = GetStdoutFromCommand(GetBenchCliPath() + testnet + "signcsnodetransaction " + txHexStr, true);
 
         UniValue signedresponse;
         signedresponse.read(response);

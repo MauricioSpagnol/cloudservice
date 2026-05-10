@@ -1767,12 +1767,27 @@ static const CRPCCommand commands[] =
                 { "fluxnode",   "startdeterministicfluxnode", &startdeterministicfluxnode, false },
                 { "fluxnode",   "viewdeterministicfluxnodelist", &viewdeterministicfluxnodelist, false },
 
+                /* CS-named aliases (same functions, preferred names) */
+                { "fluxnode",   "createcsnodekey",        &createfluxnodekey,      false  },
+                { "fluxnode",   "getcsnodeoutputs",        &getfluxnodeoutputs,     false  },
+                { "fluxnode",   "startcsnode",             &startfluxnode,          false  },
+                { "fluxnode",   "listcsnodes",             &listfluxnodes,          false  },
+                { "fluxnode",   "getcsnodecount",          &getfluxnodecount,       false  },
+                { "fluxnode",   "csnodecurrentwinner",     &fluxnodecurrentwinner,  false  },
+                { "fluxnode",   "getcsnodestatus",         &getfluxnodestatus,      false  },
+                { "fluxnode",   "listcsnodeconf",          &listfluxnodeconf,       false  },
+                { "hidden",     "rebuildcsnodedb",         &rebuildfluxnodedb,      false  },
+                { "fluxnode",   "startdeterministiccsnode",      &startdeterministicfluxnode,      false },
+                { "fluxnode",   "viewdeterministiccsnodelist",   &viewdeterministicfluxnodelist,   false },
+
                 { "benchmarks", "getbenchmarks",         &getbenchmarks,           false  },
                 { "benchmarks", "getbenchstatus",        &getbenchstatus,          false  },
                 { "benchmarks", "stopzelbenchd",        &stopzelbenchd,          false  },
                 { "benchmarks", "startzelbenchd",       &startzelbenchd,         false  },
                 { "benchmarks", "stopfluxbenchd",        &stopfluxbenchd,          false  },
                 { "benchmarks", "startfluxbenchd",       &startfluxbenchd,         false  },
+                { "benchmarks", "stopcsbenchd",          &stopfluxbenchd,          false  },
+                { "benchmarks", "startcsbenchd",         &startfluxbenchd,         false  },
 
                 /** Not shown in help menu */
                 { "hidden",     "createsporkkeys",        &createsporkkeys,         false  },
