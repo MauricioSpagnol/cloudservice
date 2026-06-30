@@ -180,6 +180,11 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_OPOI].nProtocolVersion = 170020;
         consensus.vUpgrades[Consensus::UPGRADE_OPOI].nActivationHeight = 250000;
 
+        // OPoI Phase 3 escrow
+        consensus.nOPoIMinStake              = 100 * COIN;  // 100 CS minimum stake
+        consensus.nOPoIChallengeWindowBlocks = 144;         // ~1 hour at 25s/block
+        consensus.nOPoIUnstakeCooldownBlocks = 1440;        // ~10 hours cooldown
+
         consensus.nZawyLWMAAveragingWindow = 60;
         consensus.eh_epoch_fade_length = 11;
 
@@ -358,6 +363,11 @@ public:
 
         consensus.vUpgrades[Consensus::UPGRADE_OPOI].nProtocolVersion = 170020;
         consensus.vUpgrades[Consensus::UPGRADE_OPOI].nActivationHeight = 5000;
+
+        // OPoI Phase 3 escrow (testnet — lower values for easier testing)
+        consensus.nOPoIMinStake              = 10 * COIN;   // 10 CS on testnet
+        consensus.nOPoIChallengeWindowBlocks = 20;          // ~8 minutes on testnet
+        consensus.nOPoIUnstakeCooldownBlocks = 60;          // ~25 minutes on testnet
 
         consensus.nZawyLWMAAveragingWindow = 60;
         consensus.eh_epoch_fade_length = 10;

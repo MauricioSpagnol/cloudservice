@@ -202,7 +202,7 @@ std::string CTxOut::ToString() const
     return strprintf("CTxOut(nValue=%d.%08d, scriptPubKey=%s)", nValue / COIN, nValue % COIN, HexStr(scriptPubKey).substr(0, 30));
 }
 
-CMutableTransaction::CMutableTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION), fOverwintered(false), nVersionGroupId(0), nExpiryHeight(0), nLockTime(0), valueBalance(0), csappLockedAmount(0), opoiMaxTokens(0), opoiPayment(0), opoiSigTime(0) {}
+CMutableTransaction::CMutableTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION), fOverwintered(false), nVersionGroupId(0), nExpiryHeight(0), nLockTime(0), valueBalance(0), csappLockedAmount(0), opoiMaxTokens(0), opoiPayment(0), opoiSigTime(0), opoiCollateralIn() {}
 CMutableTransaction::CMutableTransaction(const CTransaction& tx) : nVersion(tx.nVersion), fOverwintered(tx.fOverwintered), nVersionGroupId(tx.nVersionGroupId), nExpiryHeight(tx.nExpiryHeight),
                                                                    vin(tx.vin), vout(tx.vout), nLockTime(tx.nLockTime),
                                                                    valueBalance(tx.valueBalance), vShieldedSpend(tx.vShieldedSpend), vShieldedOutput(tx.vShieldedOutput),
@@ -218,7 +218,8 @@ CMutableTransaction::CMutableTransaction(const CTransaction& tx) : nVersion(tx.n
                                                                    opoiMinerAddress(tx.opoiMinerAddress), opoiModel(tx.opoiModel),
                                                                    opoiPromptHash(tx.opoiPromptHash), opoiResponseHash(tx.opoiResponseHash),
                                                                    opoiMaxTokens(tx.opoiMaxTokens), opoiPayment(tx.opoiPayment),
-                                                                   opoiSigTime(tx.opoiSigTime), opoiSig(tx.opoiSig)
+                                                                   opoiSigTime(tx.opoiSigTime), opoiSig(tx.opoiSig),
+                                                                   opoiCollateralIn(tx.opoiCollateralIn)
 {
 }
 
@@ -254,7 +255,8 @@ CTransaction::CTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION
                                nFluxTxVersion(0), P2SHRedeemScript(), csappDeploymentId(), csappOwner(), csappSpecJson(), csappIp(), csappLockedAmount(0), csappSig(),
                                opoiRequestId(), opoiRequester(), opoiMinerAddress(), opoiModel(),
                                opoiPromptHash(), opoiResponseHash(),
-                               opoiMaxTokens(0), opoiPayment(0), opoiSigTime(0), opoiSig()  { }
+                               opoiMaxTokens(0), opoiPayment(0), opoiSigTime(0), opoiSig(),
+                               opoiCollateralIn()  { }
 
 CTransaction::CTransaction(const CMutableTransaction &tx) : nVersion(tx.nVersion), fOverwintered(tx.fOverwintered), nVersionGroupId(tx.nVersionGroupId), nExpiryHeight(tx.nExpiryHeight),
                                                             vin(tx.vin), vout(tx.vout), nLockTime(tx.nLockTime),
@@ -271,7 +273,8 @@ CTransaction::CTransaction(const CMutableTransaction &tx) : nVersion(tx.nVersion
                                                             opoiMinerAddress(tx.opoiMinerAddress), opoiModel(tx.opoiModel),
                                                             opoiPromptHash(tx.opoiPromptHash), opoiResponseHash(tx.opoiResponseHash),
                                                             opoiMaxTokens(tx.opoiMaxTokens), opoiPayment(tx.opoiPayment),
-                                                            opoiSigTime(tx.opoiSigTime), opoiSig(tx.opoiSig)
+                                                            opoiSigTime(tx.opoiSigTime), opoiSig(tx.opoiSig),
+                                                            opoiCollateralIn(tx.opoiCollateralIn)
 {
     UpdateHash();
 }
@@ -297,7 +300,8 @@ CTransaction::CTransaction(
                               opoiMinerAddress(tx.opoiMinerAddress), opoiModel(tx.opoiModel),
                               opoiPromptHash(tx.opoiPromptHash), opoiResponseHash(tx.opoiResponseHash),
                               opoiMaxTokens(tx.opoiMaxTokens), opoiPayment(tx.opoiPayment),
-                              opoiSigTime(tx.opoiSigTime), opoiSig(tx.opoiSig)
+                              opoiSigTime(tx.opoiSigTime), opoiSig(tx.opoiSig),
+                              opoiCollateralIn(tx.opoiCollateralIn)
 {
     assert(evilDeveloperFlag);
 }
@@ -320,7 +324,8 @@ CTransaction::CTransaction(CMutableTransaction &&tx) : nVersion(tx.nVersion), fO
                                                        opoiMinerAddress(std::move(tx.opoiMinerAddress)), opoiModel(std::move(tx.opoiModel)),
                                                        opoiPromptHash(tx.opoiPromptHash), opoiResponseHash(tx.opoiResponseHash),
                                                        opoiMaxTokens(tx.opoiMaxTokens), opoiPayment(tx.opoiPayment),
-                                                       opoiSigTime(tx.opoiSigTime), opoiSig(std::move(tx.opoiSig))
+                                                       opoiSigTime(tx.opoiSigTime), opoiSig(std::move(tx.opoiSig)),
+                                                       opoiCollateralIn(tx.opoiCollateralIn)
 {
     UpdateHash();
 }
@@ -378,6 +383,7 @@ CTransaction& CTransaction::operator=(const CTransaction &tx) {
     *const_cast<CAmount*>(&opoiPayment) = tx.opoiPayment;
     *const_cast<uint32_t*>(&opoiSigTime) = tx.opoiSigTime;
     *const_cast<std::vector<unsigned char>*>(&opoiSig) = tx.opoiSig;
+    *const_cast<COutPoint*>(&opoiCollateralIn) = tx.opoiCollateralIn;
 
     return *this;
 }

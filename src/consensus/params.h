@@ -132,7 +132,12 @@ struct Params {
     int64_t nZawyLWMAAveragingWindow;  // N
 
     /** Parameters for Equihash epoche fade **/
-    unsigned long eh_epoch_fade_length = 0;	
+    unsigned long eh_epoch_fade_length = 0;
+
+    /** OPoI Phase 3 — escrow parameters **/
+    int64_t nOPoIMinStake;              // minimum collateral to register as OPoI miner (zatoshis)
+    int     nOPoIChallengeWindowBlocks; // blocks after RESPONSE during which a CHALLENGE is valid
+    int     nOPoIUnstakeCooldownBlocks; // blocks after UNSTAKE before collateral is released
 
 };
 } // namespace Consensus

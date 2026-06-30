@@ -59,9 +59,12 @@ static const int32_t FLUXNODE_INTERNAL_P2SH_TX_VERSION = 2;
 static const int32_t CSAPP_TX_VERSION = 7;
 
 // OPoI transaction — Optimistic Proof of Inference (GPU miner AI work)
-static const int32_t OPOI_TX_VERSION      = 8;
-static const int8_t  OPOI_REQUEST_TX_TYPE  = 1; // client posts an AI request
-static const int8_t  OPOI_RESPONSE_TX_TYPE = 2; // miner commits proof of inference
+static const int32_t OPOI_TX_VERSION       = 8;
+static const int8_t  OPOI_REQUEST_TX_TYPE   = 1; // client posts an AI request
+static const int8_t  OPOI_RESPONSE_TX_TYPE  = 2; // miner commits proof of inference
+static const int8_t  OPOI_STAKE_TX_TYPE     = 3; // miner locks collateral to participate
+static const int8_t  OPOI_UNSTAKE_TX_TYPE   = 4; // miner begins cooldown to reclaim collateral
+static const int8_t  OPOI_CHALLENGE_TX_TYPE = 5; // anyone disputes a RESPONSE within challenge window
 
 /**
  * A shielded input to a transaction. It contains data that describes a Spend transfer.
@@ -627,17 +630,19 @@ public:
     const CAmount    csappLockedAmount;   // CSCOIN locked for billing (REGISTER only)
     const std::vector<unsigned char> csappSig; // Owner signature
 
-    // OPoI Tx Version 8 — Optimistic Proof of Inference
+    // OPoI Tx Version 8 — Optimistic Proof of Inference (Phase 2: REQUEST/RESPONSE)
     const std::string opoiRequestId;      // UUID identifying the inference job
-    const std::string opoiRequester;      // CS address of the client (REQUEST only)
-    const std::string opoiMinerAddress;   // CS address of the miner  (RESPONSE only)
+    const std::string opoiRequester;      // requester addr (REQUEST) / challenger addr (CHALLENGE)
+    const std::string opoiMinerAddress;   // miner addr (RESPONSE / STAKE / UNSTAKE)
     const std::string opoiModel;          // Model name, e.g. "gemma3:4b" (REQUEST only)
-    const uint256     opoiPromptHash;     // SHA-256 of the prompt text (REQUEST only)
-    const uint256     opoiResponseHash;   // SHA-256 of the response   (RESPONSE only)
-    const uint32_t    opoiMaxTokens;      // Max tokens requested       (REQUEST only)
-    const CAmount     opoiPayment;        // Reward in CSCOIN for the miner (REQUEST only)
+    const uint256     opoiPromptHash;     // SHA-256 of the prompt (REQUEST only)
+    const uint256     opoiResponseHash;   // SHA-256 of the response (RESPONSE) / claimed hash (CHALLENGE)
+    const uint32_t    opoiMaxTokens;      // Max tokens (REQUEST only)
+    const CAmount     opoiPayment;        // Reward (REQUEST) / stake amount (STAKE)
     const uint32_t    opoiSigTime;        // Signature timestamp
-    const std::vector<unsigned char> opoiSig; // Signature by requester/miner
+    const std::vector<unsigned char> opoiSig; // Signature by actor
+    // Phase 3: escrow
+    const COutPoint   opoiCollateralIn;   // Collateral UTXO reference (STAKE only)
 
 
     /** Construct a CTransaction that qualifies as IsNull() */
@@ -758,16 +763,27 @@ public:
             return;
         } else if (nVersion == OPOI_TX_VERSION) {
             READWRITE(*const_cast<int8_t*>(&nType));
-            READWRITE(*const_cast<std::string*>(&opoiRequestId));
             READWRITE(*const_cast<uint32_t*>(&opoiSigTime));
             if (nType == OPOI_REQUEST_TX_TYPE) {
+                READWRITE(*const_cast<std::string*>(&opoiRequestId));
                 READWRITE(*const_cast<std::string*>(&opoiRequester));
                 READWRITE(*const_cast<std::string*>(&opoiModel));
                 READWRITE(*const_cast<uint256*>(&opoiPromptHash));
                 READWRITE(*const_cast<uint32_t*>(&opoiMaxTokens));
                 READWRITE(*const_cast<CAmount*>(&opoiPayment));
             } else if (nType == OPOI_RESPONSE_TX_TYPE) {
+                READWRITE(*const_cast<std::string*>(&opoiRequestId));
                 READWRITE(*const_cast<std::string*>(&opoiMinerAddress));
+                READWRITE(*const_cast<uint256*>(&opoiResponseHash));
+            } else if (nType == OPOI_STAKE_TX_TYPE) {
+                READWRITE(*const_cast<std::string*>(&opoiMinerAddress));
+                READWRITE(*const_cast<COutPoint*>(&opoiCollateralIn));
+                READWRITE(*const_cast<CAmount*>(&opoiPayment));
+            } else if (nType == OPOI_UNSTAKE_TX_TYPE) {
+                READWRITE(*const_cast<std::string*>(&opoiMinerAddress));
+            } else if (nType == OPOI_CHALLENGE_TX_TYPE) {
+                READWRITE(*const_cast<std::string*>(&opoiRequestId));
+                READWRITE(*const_cast<std::string*>(&opoiRequester));
                 READWRITE(*const_cast<uint256*>(&opoiResponseHash));
             }
             if (!(s.GetType() & SER_GETHASH))
@@ -824,6 +840,18 @@ public:
 
     bool IsOPoIResponse() const {
         return IsOPoITx() && nType == OPOI_RESPONSE_TX_TYPE;
+    }
+
+    bool IsOPoIStake() const {
+        return IsOPoITx() && nType == OPOI_STAKE_TX_TYPE;
+    }
+
+    bool IsOPoIUnstake() const {
+        return IsOPoITx() && nType == OPOI_UNSTAKE_TX_TYPE;
+    }
+
+    bool IsOPoIChallenge() const {
+        return IsOPoITx() && nType == OPOI_CHALLENGE_TX_TYPE;
     }
 
     bool IsFluxnodeUpgradeTx() const {
@@ -964,6 +992,7 @@ struct CMutableTransaction
     CAmount     opoiPayment;
     uint32_t    opoiSigTime;
     std::vector<unsigned char> opoiSig;
+    COutPoint   opoiCollateralIn;  // Phase 3: collateral UTXO (STAKE only)
 
     CMutableTransaction();
     CMutableTransaction(const CTransaction& tx);

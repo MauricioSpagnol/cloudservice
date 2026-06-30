@@ -3883,6 +3883,10 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     int64_t nTime4 = GetTimeMicros(); nTimeCallbacks += nTime4 - nTime3;
     LogPrint("bench", "    - Callbacks: %.2fms [%.2fs]\n", 0.001 * (nTime4 - nTime3), nTimeCallbacks * 0.000001);
 
+    // OPoI Phase 3: slash miners with unanswered challenges and release cooled-down unstakes
+    if (NetworkUpgradeActive(pindex->nHeight, chainparams.GetConsensus(), Consensus::UPGRADE_OPOI))
+        ProcessExpiredChallenges((uint32_t)pindex->nHeight, chainparams.GetConsensus());
+
     return true;
 }
 
