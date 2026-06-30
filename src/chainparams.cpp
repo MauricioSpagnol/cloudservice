@@ -177,6 +177,8 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_P2SHNODES].nProtocolVersion = 170019;
         consensus.vUpgrades[Consensus::UPGRADE_P2SHNODES].nActivationHeight = Consensus::NetworkUpgrade::ALWAYS_ACTIVE;
 
+        consensus.vUpgrades[Consensus::UPGRADE_OPOI].nProtocolVersion = 170020;
+        consensus.vUpgrades[Consensus::UPGRADE_OPOI].nActivationHeight = 250000;
 
         consensus.nZawyLWMAAveragingWindow = 60;
         consensus.eh_epoch_fade_length = 11;
@@ -353,6 +355,9 @@ public:
 
         consensus.vUpgrades[Consensus::UPGRADE_P2SHNODES].nProtocolVersion = 170019;
         consensus.vUpgrades[Consensus::UPGRADE_P2SHNODES].nActivationHeight = Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+
+        consensus.vUpgrades[Consensus::UPGRADE_OPOI].nProtocolVersion = 170020;
+        consensus.vUpgrades[Consensus::UPGRADE_OPOI].nActivationHeight = 5000;
 
         consensus.nZawyLWMAAveragingWindow = 60;
         consensus.eh_epoch_fade_length = 10;

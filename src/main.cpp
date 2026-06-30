@@ -1049,6 +1049,13 @@ bool ContextualCheckTransaction(
         }
     }
 
+    if (tx.IsOPoITx()) {
+        bool opoiActive = NetworkUpgradeActive(nHeight, chainparams.GetConsensus(), Consensus::UPGRADE_OPOI);
+        if (!opoiActive)
+            return state.DoSTx(dosLevel, error("ContextualCheckTransaction(): OPoI tx seen before activation height"),
+                               REJECT_INVALID, "tx-opoi-not-active", false, tx);
+    }
+
     if (!tx.IsFluxnodeTx() && !tx.IsCSAppTx() && !tx.IsOPoITx()) {
         if (saplingActive) {
             // Reject transactions with valid version but missing overwintered flag
@@ -3188,6 +3195,10 @@ static DisconnectResult DisconnectBlock(const CBlock& block, CValidationState& s
         // Undo CSApp transactions
         if (tx.IsCSAppTx())
             ProcessCSAppTransaction(tx, (uint32_t)pindex->nHeight, /*fUndo=*/true);
+
+        // Undo OPoI transactions
+        if (tx.IsOPoITx())
+            ProcessOPoITransaction(tx, (uint32_t)pindex->nHeight, /*fUndo=*/true);
 
         // Check that all outputs are available and match the outputs in the block itself
         // exactly.

@@ -34,6 +34,7 @@ enum UpgradeIndex {
     UPGRADE_FLUX,
     UPGRADE_HALVING,
     UPGRADE_P2SHNODES,
+    UPGRADE_OPOI,          // Optimistic Proof of Inference (tx version 8)
     // NOTE: Also add new upgrades to NetworkUpgradeInfo in upgrades.cpp
     MAX_NETWORK_UPGRADES
 };
