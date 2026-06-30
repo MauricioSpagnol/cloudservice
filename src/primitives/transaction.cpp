@@ -202,7 +202,7 @@ std::string CTxOut::ToString() const
     return strprintf("CTxOut(nValue=%d.%08d, scriptPubKey=%s)", nValue / COIN, nValue % COIN, HexStr(scriptPubKey).substr(0, 30));
 }
 
-CMutableTransaction::CMutableTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION), fOverwintered(false), nVersionGroupId(0), nExpiryHeight(0), nLockTime(0), valueBalance(0), csappLockedAmount(0) {}
+CMutableTransaction::CMutableTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION), fOverwintered(false), nVersionGroupId(0), nExpiryHeight(0), nLockTime(0), valueBalance(0), csappLockedAmount(0), opoiMaxTokens(0), opoiPayment(0), opoiSigTime(0) {}
 CMutableTransaction::CMutableTransaction(const CTransaction& tx) : nVersion(tx.nVersion), fOverwintered(tx.fOverwintered), nVersionGroupId(tx.nVersionGroupId), nExpiryHeight(tx.nExpiryHeight),
                                                                    vin(tx.vin), vout(tx.vout), nLockTime(tx.nLockTime),
                                                                    valueBalance(tx.valueBalance), vShieldedSpend(tx.vShieldedSpend), vShieldedOutput(tx.vShieldedOutput),
@@ -213,9 +213,13 @@ CMutableTransaction::CMutableTransaction(const CTransaction& tx) : nVersion(tx.n
                                                                    nFluxTxVersion(tx.nFluxTxVersion), P2SHRedeemScript(tx.P2SHRedeemScript),
                                                                    csappDeploymentId(tx.csappDeploymentId), csappOwner(tx.csappOwner),
                                                                    csappSpecJson(tx.csappSpecJson), csappIp(tx.csappIp),
-                                                                   csappLockedAmount(tx.csappLockedAmount), csappSig(tx.csappSig)
+                                                                   csappLockedAmount(tx.csappLockedAmount), csappSig(tx.csappSig),
+                                                                   opoiRequestId(tx.opoiRequestId), opoiRequester(tx.opoiRequester),
+                                                                   opoiMinerAddress(tx.opoiMinerAddress), opoiModel(tx.opoiModel),
+                                                                   opoiPromptHash(tx.opoiPromptHash), opoiResponseHash(tx.opoiResponseHash),
+                                                                   opoiMaxTokens(tx.opoiMaxTokens), opoiPayment(tx.opoiPayment),
+                                                                   opoiSigTime(tx.opoiSigTime), opoiSig(tx.opoiSig)
 {
-    
 }
 
 uint256 CMutableTransaction::GetHash() const
@@ -247,7 +251,10 @@ void CTransaction::UpdateHash() const
 CTransaction::CTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION), fOverwintered(false), nVersionGroupId(0), nExpiryHeight(0), vin(), vout(), nLockTime(0),
                                valueBalance(0), vShieldedSpend(), vShieldedOutput(), vJoinSplit(), joinSplitPubKey(), joinSplitSig(), bindingSig(), nType(FLUXNODE_NO_TYPE),
                                collateralIn(), collateralPubkey(), pubKey(), sigTime(0), ip(), sig(), benchmarkTier(0), benchmarkSig(), benchmarkSigTime(0), nUpdateType(0),
-                               nFluxTxVersion(0), P2SHRedeemScript(), csappDeploymentId(), csappOwner(), csappSpecJson(), csappIp(), csappLockedAmount(0), csappSig()  { }
+                               nFluxTxVersion(0), P2SHRedeemScript(), csappDeploymentId(), csappOwner(), csappSpecJson(), csappIp(), csappLockedAmount(0), csappSig(),
+                               opoiRequestId(), opoiRequester(), opoiMinerAddress(), opoiModel(),
+                               opoiPromptHash(), opoiResponseHash(),
+                               opoiMaxTokens(0), opoiPayment(0), opoiSigTime(0), opoiSig()  { }
 
 CTransaction::CTransaction(const CMutableTransaction &tx) : nVersion(tx.nVersion), fOverwintered(tx.fOverwintered), nVersionGroupId(tx.nVersionGroupId), nExpiryHeight(tx.nExpiryHeight),
                                                             vin(tx.vin), vout(tx.vout), nLockTime(tx.nLockTime),
@@ -259,7 +266,12 @@ CTransaction::CTransaction(const CMutableTransaction &tx) : nVersion(tx.nVersion
                                                             nFluxTxVersion(tx.nFluxTxVersion), P2SHRedeemScript(tx.P2SHRedeemScript),
                                                             csappDeploymentId(tx.csappDeploymentId), csappOwner(tx.csappOwner),
                                                             csappSpecJson(tx.csappSpecJson), csappIp(tx.csappIp),
-                                                            csappLockedAmount(tx.csappLockedAmount), csappSig(tx.csappSig)
+                                                            csappLockedAmount(tx.csappLockedAmount), csappSig(tx.csappSig),
+                                                            opoiRequestId(tx.opoiRequestId), opoiRequester(tx.opoiRequester),
+                                                            opoiMinerAddress(tx.opoiMinerAddress), opoiModel(tx.opoiModel),
+                                                            opoiPromptHash(tx.opoiPromptHash), opoiResponseHash(tx.opoiResponseHash),
+                                                            opoiMaxTokens(tx.opoiMaxTokens), opoiPayment(tx.opoiPayment),
+                                                            opoiSigTime(tx.opoiSigTime), opoiSig(tx.opoiSig)
 {
     UpdateHash();
 }
@@ -280,7 +292,12 @@ CTransaction::CTransaction(
                               P2SHRedeemScript(tx.P2SHRedeemScript),
                               csappDeploymentId(tx.csappDeploymentId), csappOwner(tx.csappOwner),
                               csappSpecJson(tx.csappSpecJson), csappIp(tx.csappIp),
-                              csappLockedAmount(tx.csappLockedAmount), csappSig(tx.csappSig)
+                              csappLockedAmount(tx.csappLockedAmount), csappSig(tx.csappSig),
+                              opoiRequestId(tx.opoiRequestId), opoiRequester(tx.opoiRequester),
+                              opoiMinerAddress(tx.opoiMinerAddress), opoiModel(tx.opoiModel),
+                              opoiPromptHash(tx.opoiPromptHash), opoiResponseHash(tx.opoiResponseHash),
+                              opoiMaxTokens(tx.opoiMaxTokens), opoiPayment(tx.opoiPayment),
+                              opoiSigTime(tx.opoiSigTime), opoiSig(tx.opoiSig)
 {
     assert(evilDeveloperFlag);
 }
@@ -298,7 +315,12 @@ CTransaction::CTransaction(CMutableTransaction &&tx) : nVersion(tx.nVersion), fO
                                                        P2SHRedeemScript(tx.P2SHRedeemScript),
                                                        csappDeploymentId(tx.csappDeploymentId), csappOwner(tx.csappOwner),
                                                        csappSpecJson(tx.csappSpecJson), csappIp(tx.csappIp),
-                                                       csappLockedAmount(tx.csappLockedAmount), csappSig(std::move(tx.csappSig))
+                                                       csappLockedAmount(tx.csappLockedAmount), csappSig(std::move(tx.csappSig)),
+                                                       opoiRequestId(std::move(tx.opoiRequestId)), opoiRequester(std::move(tx.opoiRequester)),
+                                                       opoiMinerAddress(std::move(tx.opoiMinerAddress)), opoiModel(std::move(tx.opoiModel)),
+                                                       opoiPromptHash(tx.opoiPromptHash), opoiResponseHash(tx.opoiResponseHash),
+                                                       opoiMaxTokens(tx.opoiMaxTokens), opoiPayment(tx.opoiPayment),
+                                                       opoiSigTime(tx.opoiSigTime), opoiSig(std::move(tx.opoiSig))
 {
     UpdateHash();
 }
@@ -344,6 +366,18 @@ CTransaction& CTransaction::operator=(const CTransaction &tx) {
     *const_cast<std::string*>(&csappIp) = tx.csappIp;
     *const_cast<CAmount*>(&csappLockedAmount) = tx.csappLockedAmount;
     *const_cast<std::vector<unsigned char>*>(&csappSig) = tx.csappSig;
+
+    // OPoI tx data
+    *const_cast<std::string*>(&opoiRequestId) = tx.opoiRequestId;
+    *const_cast<std::string*>(&opoiRequester) = tx.opoiRequester;
+    *const_cast<std::string*>(&opoiMinerAddress) = tx.opoiMinerAddress;
+    *const_cast<std::string*>(&opoiModel) = tx.opoiModel;
+    *const_cast<uint256*>(&opoiPromptHash) = tx.opoiPromptHash;
+    *const_cast<uint256*>(&opoiResponseHash) = tx.opoiResponseHash;
+    *const_cast<uint32_t*>(&opoiMaxTokens) = tx.opoiMaxTokens;
+    *const_cast<CAmount*>(&opoiPayment) = tx.opoiPayment;
+    *const_cast<uint32_t*>(&opoiSigTime) = tx.opoiSigTime;
+    *const_cast<std::vector<unsigned char>*>(&opoiSig) = tx.opoiSig;
 
     return *this;
 }

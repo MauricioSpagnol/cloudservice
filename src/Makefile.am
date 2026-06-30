@@ -227,6 +227,7 @@ BITCOIN_CORE_H = \
   csnode/csnodeconfig.h \
   csnode/csnodecachedb.h \
   csapp/csapp.h \
+  opoi/opoi.h \
   zmq/zmqabstractnotifier.h \
   zmq/zmqconfig.h\
   zmq/zmqnotificationinterface.h \
@@ -290,6 +291,8 @@ libbitcoin_server_a_SOURCES = \
   csnode/csnodecachedb.cpp \
   csapp/csapp.cpp \
   rpc/csapp.cpp \
+  opoi/opoi.cpp \
+  rpc/opoi.cpp \
   $(BITCOIN_CORE_H) \
   $(LIBFLUX_H)
 

@@ -24,6 +24,8 @@ void RegisterRawTransactionRPCCommands(CRPCTable &tableRPC);
 void RegisterFluxnodeRPCCommands(CRPCTable &tableRPC);
 /** Register CSApp RPC commands */
 void RegisterCSAppRPCCommands(CRPCTable &tableRPC);
+/** Register OPoI (Optimistic Proof of Inference) RPC commands */
+void RegisterOPoIRPCCommands(CRPCTable &tableRPC);
 
 static inline void RegisterAllCoreRPCCommands(CRPCTable &tableRPC)
 {
@@ -34,6 +36,7 @@ static inline void RegisterAllCoreRPCCommands(CRPCTable &tableRPC)
     RegisterRawTransactionRPCCommands(tableRPC);
     RegisterFluxnodeRPCCommands(tableRPC);
     RegisterCSAppRPCCommands(tableRPC);
+    RegisterOPoIRPCCommands(tableRPC);
 }
 
 #endif

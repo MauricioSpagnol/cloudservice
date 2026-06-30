@@ -58,6 +58,11 @@ static const int32_t FLUXNODE_INTERNAL_P2SH_TX_VERSION = 2;
 // CSApp transaction — stores decentralised app specs on-chain
 static const int32_t CSAPP_TX_VERSION = 7;
 
+// OPoI transaction — Optimistic Proof of Inference (GPU miner AI work)
+static const int32_t OPOI_TX_VERSION      = 8;
+static const int8_t  OPOI_REQUEST_TX_TYPE  = 1; // client posts an AI request
+static const int8_t  OPOI_RESPONSE_TX_TYPE = 2; // miner commits proof of inference
+
 /**
  * A shielded input to a transaction. It contains data that describes a Spend transfer.
  */
@@ -622,6 +627,18 @@ public:
     const CAmount    csappLockedAmount;   // CSCOIN locked for billing (REGISTER only)
     const std::vector<unsigned char> csappSig; // Owner signature
 
+    // OPoI Tx Version 8 — Optimistic Proof of Inference
+    const std::string opoiRequestId;      // UUID identifying the inference job
+    const std::string opoiRequester;      // CS address of the client (REQUEST only)
+    const std::string opoiMinerAddress;   // CS address of the miner  (RESPONSE only)
+    const std::string opoiModel;          // Model name, e.g. "gemma3:4b" (REQUEST only)
+    const uint256     opoiPromptHash;     // SHA-256 of the prompt text (REQUEST only)
+    const uint256     opoiResponseHash;   // SHA-256 of the response   (RESPONSE only)
+    const uint32_t    opoiMaxTokens;      // Max tokens requested       (REQUEST only)
+    const CAmount     opoiPayment;        // Reward in CSCOIN for the miner (REQUEST only)
+    const uint32_t    opoiSigTime;        // Signature timestamp
+    const std::vector<unsigned char> opoiSig; // Signature by requester/miner
+
 
     /** Construct a CTransaction that qualifies as IsNull() */
     CTransaction();
@@ -739,6 +756,25 @@ public:
             if (ser_action.ForRead())
                 UpdateHash();
             return;
+        } else if (nVersion == OPOI_TX_VERSION) {
+            READWRITE(*const_cast<int8_t*>(&nType));
+            READWRITE(*const_cast<std::string*>(&opoiRequestId));
+            READWRITE(*const_cast<uint32_t*>(&opoiSigTime));
+            if (nType == OPOI_REQUEST_TX_TYPE) {
+                READWRITE(*const_cast<std::string*>(&opoiRequester));
+                READWRITE(*const_cast<std::string*>(&opoiModel));
+                READWRITE(*const_cast<uint256*>(&opoiPromptHash));
+                READWRITE(*const_cast<uint32_t*>(&opoiMaxTokens));
+                READWRITE(*const_cast<CAmount*>(&opoiPayment));
+            } else if (nType == OPOI_RESPONSE_TX_TYPE) {
+                READWRITE(*const_cast<std::string*>(&opoiMinerAddress));
+                READWRITE(*const_cast<uint256*>(&opoiResponseHash));
+            }
+            if (!(s.GetType() & SER_GETHASH))
+                READWRITE(*const_cast<std::vector<unsigned char>*>(&opoiSig));
+            if (ser_action.ForRead())
+                UpdateHash();
+            return;
         }
 
         READWRITE(*const_cast<std::vector<CTxIn>*>(&vin));
@@ -776,6 +812,18 @@ public:
 
     bool IsCSAppTx() const {
         return nVersion == CSAPP_TX_VERSION;
+    }
+
+    bool IsOPoITx() const {
+        return nVersion == OPOI_TX_VERSION;
+    }
+
+    bool IsOPoIRequest() const {
+        return IsOPoITx() && nType == OPOI_REQUEST_TX_TYPE;
+    }
+
+    bool IsOPoIResponse() const {
+        return IsOPoITx() && nType == OPOI_RESPONSE_TX_TYPE;
     }
 
     bool IsFluxnodeUpgradeTx() const {
@@ -905,6 +953,18 @@ struct CMutableTransaction
     CAmount csappLockedAmount;
     std::vector<unsigned char> csappSig;
 
+    // OPoI Tx Version 8 — Optimistic Proof of Inference
+    std::string opoiRequestId;
+    std::string opoiRequester;
+    std::string opoiMinerAddress;
+    std::string opoiModel;
+    uint256     opoiPromptHash;
+    uint256     opoiResponseHash;
+    uint32_t    opoiMaxTokens;
+    CAmount     opoiPayment;
+    uint32_t    opoiSigTime;
+    std::vector<unsigned char> opoiSig;
+
     CMutableTransaction();
     CMutableTransaction(const CTransaction& tx);
 
@@ -1012,6 +1072,23 @@ struct CMutableTransaction
             }
             if (!(s.GetType() & SER_GETHASH))
                 READWRITE(csappSig);
+            return;
+        } else if (nVersion == OPOI_TX_VERSION) {
+            READWRITE(nType);
+            READWRITE(opoiRequestId);
+            READWRITE(opoiSigTime);
+            if (nType == OPOI_REQUEST_TX_TYPE) {
+                READWRITE(opoiRequester);
+                READWRITE(opoiModel);
+                READWRITE(opoiPromptHash);
+                READWRITE(opoiMaxTokens);
+                READWRITE(opoiPayment);
+            } else if (nType == OPOI_RESPONSE_TX_TYPE) {
+                READWRITE(opoiMinerAddress);
+                READWRITE(opoiResponseHash);
+            }
+            if (!(s.GetType() & SER_GETHASH))
+                READWRITE(opoiSig);
             return;
         }
 

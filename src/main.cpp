@@ -41,6 +41,7 @@
 #include "csnode/obfuscation.h"
 #include "csnode/activecsnode.h"
 #include "csapp/csapp.h"
+#include "opoi/opoi.h"
 
 #include <sstream>
 
@@ -691,7 +692,7 @@ bool IsStandardTx(const CTransaction& tx, string& reason, const CChainParams& ch
 {
     bool saplingActive = NetworkUpgradeActive(nHeight, chainparams.GetConsensus(), Consensus::UPGRADE_ACADIA);
 
-    if (!tx.IsFluxnodeTx() && !tx.IsCSAppTx()) {
+    if (!tx.IsFluxnodeTx() && !tx.IsCSAppTx() && !tx.IsOPoITx()) {
         if (saplingActive) {
             // Sapling standard rules apply
             if (tx.nVersion > CTransaction::SAPLING_MAX_CURRENT_VERSION ||
@@ -1048,7 +1049,7 @@ bool ContextualCheckTransaction(
         }
     }
 
-    if (!tx.IsFluxnodeTx() && !tx.IsCSAppTx()) {
+    if (!tx.IsFluxnodeTx() && !tx.IsCSAppTx() && !tx.IsOPoITx()) {
         if (saplingActive) {
             // Reject transactions with valid version but missing overwintered flag
             if (tx.nVersion >= SAPLING_MIN_TX_VERSION && !tx.fOverwintered) {
@@ -1422,7 +1423,7 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
      *        0 <= tx.nVersion < OVERWINTER_MIN_TX_VERSION
      *        OVERWINTER_MAX_TX_VERSION < tx.nVersion <= INT32_MAX
      */
-    if (!tx.IsFluxnodeTx() && !tx.IsCSAppTx()) {
+    if (!tx.IsFluxnodeTx() && !tx.IsCSAppTx() && !tx.IsOPoITx()) {
         if (!tx.fOverwintered && tx.nVersion < SPROUT_MIN_TX_VERSION) {
             return state.DoS(100, error("CheckTransaction(): version too low"),
                              REJECT_INVALID, "bad-txns-version-too-low");
@@ -1536,6 +1537,11 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
         if (tx.nType != CSAPP_REGISTER_TX_TYPE && tx.nType != CSAPP_UPDATE_TX_TYPE && tx.nType != CSAPP_STOP_TX_TYPE)
             return state.DoS(10, error("CheckTransaction(): CSApp Tx invalid nType"),
                              REJECT_INVALID, "bad-txns-csapp-tx-invalid-type");
+    }
+
+    if (tx.IsOPoITx()) {
+        if (!CheckOPoITransaction(tx, state))
+            return false;
     }
 
     // Size limits
@@ -3613,6 +3619,10 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             // Process CSApp transactions
             if (tx.IsCSAppTx())
                 ProcessCSAppTransaction(tx, (uint32_t)pindex->nHeight);
+
+            // Process OPoI transactions
+            if (tx.IsOPoITx())
+                ProcessOPoITransaction(tx, (uint32_t)pindex->nHeight);
             if (!view.HaveShieldedRequirements(tx))
                 return state.DoS(100, error("ConnectBlock(): JoinSplit requirements not met"),
                                  REJECT_INVALID, "bad-txns-joinsplit-requirements-not-met");
