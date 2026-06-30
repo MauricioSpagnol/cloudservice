@@ -148,7 +148,13 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "spork", 1},
     { "printsnapshot", 0},
     { "createp2shstarttx", 3},
-    { "getchaintips", 0 }
+    { "getchaintips", 0 },
+    // OPoI
+    { "stakeopoi",          2 },   // collateral_vout (integer)
+    { "submitopoirequest",  3 },   // max_tokens (integer)
+    { "submitopoirequest",  4 },   // payment (integer/amount)
+    { "listopoirequests",   0 },   // verbose (bool treated as int)
+    { "listopoiresponses",  0 }
 };
 
 class CRPCConvertTable

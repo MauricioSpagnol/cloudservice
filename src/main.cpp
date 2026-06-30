@@ -3631,8 +3631,8 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             if (tx.IsCSAppTx())
                 ProcessCSAppTransaction(tx, (uint32_t)pindex->nHeight);
 
-            // Process OPoI transactions
-            if (tx.IsOPoITx())
+            // Process OPoI transactions — only on real connect, not TestBlockValidity (fJustCheck)
+            if (!fJustCheck && tx.IsOPoITx())
                 ProcessOPoITransaction(tx, (uint32_t)pindex->nHeight);
             if (!view.HaveShieldedRequirements(tx))
                 return state.DoS(100, error("ConnectBlock(): JoinSplit requirements not met"),

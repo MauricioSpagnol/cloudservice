@@ -31,7 +31,7 @@
 
 std::string CRPCFluxnodeCache::filter = "";
 int64_t CRPCFluxnodeCache::nHeight = -1;
-UniValue CRPCFluxnodeCache::list = NullUniValue;
+UniValue CRPCFluxnodeCache::list;
 
 UniValue rebuildfluxnodedb(const UniValue& params, bool fHelp, string cmdname) {
     if (fHelp || params.size() > 0)

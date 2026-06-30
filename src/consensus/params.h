@@ -135,9 +135,9 @@ struct Params {
     unsigned long eh_epoch_fade_length = 0;
 
     /** OPoI Phase 3 — escrow parameters **/
-    int64_t nOPoIMinStake;              // minimum collateral to register as OPoI miner (zatoshis)
-    int     nOPoIChallengeWindowBlocks; // blocks after RESPONSE during which a CHALLENGE is valid
-    int     nOPoIUnstakeCooldownBlocks; // blocks after UNSTAKE before collateral is released
+    int64_t nOPoIMinStake              = 0;   // minimum collateral (zatoshis); set in chainparams
+    int     nOPoIChallengeWindowBlocks = 144; // blocks after RESPONSE during which CHALLENGE is valid
+    int     nOPoIUnstakeCooldownBlocks = 1440;// blocks after UNSTAKE before collateral is released
 
 };
 } // namespace Consensus

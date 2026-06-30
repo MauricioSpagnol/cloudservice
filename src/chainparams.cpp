@@ -521,6 +521,14 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_P2SHNODES].nProtocolVersion = 170019;
         consensus.vUpgrades[Consensus::UPGRADE_P2SHNODES].nActivationHeight = Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
 
+        consensus.vUpgrades[Consensus::UPGRADE_OPOI].nProtocolVersion = 170020;
+        consensus.vUpgrades[Consensus::UPGRADE_OPOI].nActivationHeight = Consensus::NetworkUpgrade::ALWAYS_ACTIVE;
+
+        // OPoI Phase 3 escrow (regtest — minimal values for unit testing)
+        consensus.nOPoIMinStake              = 1 * COIN;
+        consensus.nOPoIChallengeWindowBlocks = 5;
+        consensus.nOPoIUnstakeCooldownBlocks = 10;
+
         consensus.nMinimumChainWork = uint256S("0x00");
 
         consensus.nZawyLWMAAveragingWindow = 60;
