@@ -162,6 +162,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "votemodelopoi",      2 },   // approve (bool)
     // F15-D
     { "submitshardresult",  1 },   // shard_index (integer)
+    { "submitshardresult",  5 },   // token_count (integer) — F16
     { "getshardresult",     1 },   // shard_index (integer)
     // F15-H cross-language test
     { "opoiselecttopkexperts", 2 }, // num_experts (integer)

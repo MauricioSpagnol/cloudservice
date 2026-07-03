@@ -568,6 +568,28 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
                 txNew.vout.push_back(CTxOut(req.payment, GetScriptForDestination(minerDest)));
                 totalOPoIPayment += req.payment;
             }
+
+            // F16: shard-routed payments (SHARD_RESULT) — same opoiBudget as
+            // RESPONSE above. Aggregated per miner address since a miner can
+            // be in the resolved majority of more than one shard in this
+            // block (mirrors CheckOPoIPayments, which must match this exactly).
+            {
+                auto shardPayments = GetShardPaymentsForBlock(pblock->vtx, chainparams.GetConsensus());
+                std::map<std::string, CAmount> aggregated;
+                for (const auto& p : shardPayments) aggregated[p.minerAddress] += p.amount;
+
+                for (const auto& kv : aggregated) {
+                    CTxDestination minerDest = DecodeDestination(kv.first);
+                    if (!IsValidDestination(minerDest))
+                        continue;
+                    if (totalOPoIPayment + kv.second > opoiBudget)
+                        continue;
+                    if (totalOPoIPayment + kv.second > txNew.vout[0].nValue)
+                        continue;
+                    txNew.vout.push_back(CTxOut(kv.second, GetScriptForDestination(minerDest)));
+                    totalOPoIPayment += kv.second;
+                }
+            }
             txNew.vout[0].nValue -= totalOPoIPayment;
 
             // OPoI: add coinbase outputs for challenger rewards (challenges expiring at nHeight)

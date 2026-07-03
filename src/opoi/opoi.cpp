@@ -179,6 +179,10 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
                     [&](const ShardResultSubmission& s) { return s.minerAddress == tx.opoiMinerAddress; }),
                     subs.end());
             }
+            // F16: undo the block that resolved this shard's payment too —
+            // removing a submission can drop it back below majority, and the
+            // coinbase that paid it is itself being disconnected right now.
+            g_opoiCache.UnmarkShardPaid(tx.opoiRequestId, tx.opoiShardIndex);
         }
         return true;
     }
@@ -332,6 +336,7 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         sub.minerAddress       = tx.opoiMinerAddress;
         sub.boundaryOutputHash = tx.opoiResponseHash;
         sub.routerLogitsHash   = tx.opoiCommitment;
+        sub.tokenCount         = tx.opoiTokenCount;
         sub.blockHeight        = blockHeight;
         sub.txHash             = tx.GetHash();
         g_opoiCache.AddShardResult(tx.opoiRequestId, tx.opoiShardIndex, sub);
@@ -364,6 +369,7 @@ void RebuildOPoICache()
                 ProcessExpiredChallenges((uint32_t)pindex->nHeight, params);
                 ProcessExpiredRequests((uint32_t)pindex->nHeight, params);
                 ProcessModelVotingWindows((uint32_t)pindex->nHeight, params);
+                ProcessShardPayments(block.vtx, params);
             }
         }
         pindex = chainActive.Next(pindex);
@@ -912,10 +918,13 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                 }
             }
         }
-        // Verify submitter's signature
+        // Verify submitter's signature. F16: covers tokenCount too — it directly
+        // drives the per-token fee component of shard payments, same reasoning
+        // as the RESPONSE sigMsg bug fix (see comment there).
         {
             std::string sigMsg = std::string("SHARD") + tx.opoiRequestId + strprintf("%u", tx.opoiShardIndex)
-                                + tx.opoiMinerAddress + tx.opoiResponseHash.GetHex() + tx.opoiCommitment.GetHex();
+                                + tx.opoiMinerAddress + tx.opoiResponseHash.GetHex() + tx.opoiCommitment.GetHex()
+                                + strprintf("%u", tx.opoiTokenCount);
             if (!VerifyOPoISig(tx.opoiMinerAddress, sigMsg, tx.opoiSig))
                 return state.DoS(100, error("CheckOPoITransaction(): SHARD_RESULT invalid signature for %s",
                                             tx.opoiMinerAddress),
@@ -937,6 +946,16 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
 // an output paying the miner:
 //   total_payment = request.payment + tx.opoiTokenCount * request.feePerToken
 // Called from ConnectBlock before the tx processing loop, using the pre-block cache.
+//
+// F16: also verifies shard-routed payments (see GetShardPaymentsForBlock),
+// against the same opoiBudget — RESPONSE (whole-model) and SHARD_RESULT
+// (shard-routed pipeline) both pay for real OPoI compute out of one budget.
+//
+// Each coinbase output can satisfy at most one obligation (outUsed) — without
+// this, two different obligations that happen to want the same (address,
+// amount) — plausible now that shard payments can coincide with a RESPONSE
+// payment, or with each other — could both silently pass by matching the same
+// single output twice, letting the block underpay.
 
 bool CheckOPoIPayments(const std::vector<CTransaction>& vtx,
                        int nHeight,
@@ -945,6 +964,18 @@ bool CheckOPoIPayments(const std::vector<CTransaction>& vtx,
 {
     if (vtx.empty()) return true;
     const CTransaction& coinbase = vtx[0];
+    std::vector<bool> outUsed(coinbase.vout.size(), false);
+
+    auto findAndClaimOutput = [&](const CScript& expectedScript, CAmount amount) {
+        for (size_t j = 0; j < coinbase.vout.size(); ++j) {
+            if (!outUsed[j] && coinbase.vout[j].scriptPubKey == expectedScript &&
+                coinbase.vout[j].nValue == amount) {
+                outUsed[j] = true;
+                return true;
+            }
+        }
+        return false;
+    };
 
     // OPoI budget: up to nOPoISubsidyPct (10%) of block subsidy — halving-aware.
     const CAmount blockSubsidy  = GetBlockSubsidy(nHeight, params);
@@ -981,16 +1012,7 @@ bool CheckOPoIPayments(const std::vector<CTransaction>& vtx,
                                         tx.opoiMinerAddress),
                              REJECT_INVALID, "bad-cb-opoi-invalid-miner-addr");
 
-        CScript expectedScript = GetScriptForDestination(minerDest);
-        bool found = false;
-        for (const CTxOut& out : coinbase.vout) {
-            if (out.scriptPubKey == expectedScript && out.nValue == totalPayment) {
-                found = true;
-                break;
-            }
-        }
-
-        if (!found) {
+        if (!findAndClaimOutput(GetScriptForDestination(minerDest), totalPayment)) {
             return state.DoS(100, error("CheckOPoIPayments(): coinbase missing OPoI payment of %s to %s for request %s",
                                         FormatMoney(totalPayment), tx.opoiMinerAddress, tx.opoiRequestId),
                              REJECT_INVALID, "bad-cb-opoi-missing-payment");
@@ -998,7 +1020,181 @@ bool CheckOPoIPayments(const std::vector<CTransaction>& vtx,
         totalPaymentsChecked += totalPayment;
     }
 
+    // F16: shard-routed payments, aggregated per miner address (a miner can be
+    // in the resolved majority of more than one shard in the same block).
+    {
+        auto shardPayments = GetShardPaymentsForBlock(vtx, params);
+        std::map<std::string, CAmount> aggregated;
+        for (const auto& p : shardPayments) aggregated[p.minerAddress] += p.amount;
+
+        for (const auto& kv : aggregated) {
+            const std::string& minerAddress = kv.first;
+            CAmount totalPayment = kv.second;
+
+            if (totalPaymentsChecked + totalPayment > opoiBudget) {
+                LogPrint("opoi", "CheckOPoIPayments: shard payment %s to %s exceeds OPoI budget, skipping\n",
+                         FormatMoney(totalPayment), minerAddress);
+                continue;
+            }
+
+            CTxDestination minerDest = DecodeDestination(minerAddress);
+            if (!IsValidDestination(minerDest))
+                return state.DoS(100, error("CheckOPoIPayments(): SHARD_RESULT has invalid miner address %s",
+                                            minerAddress),
+                                 REJECT_INVALID, "bad-cb-opoi-invalid-shard-miner-addr");
+
+            if (!findAndClaimOutput(GetScriptForDestination(minerDest), totalPayment)) {
+                return state.DoS(100, error("CheckOPoIPayments(): coinbase missing shard payment of %s to %s",
+                                            FormatMoney(totalPayment), minerAddress),
+                                 REJECT_INVALID, "bad-cb-opoi-missing-shard-payment");
+            }
+            totalPaymentsChecked += totalPayment;
+        }
+    }
+
     return true;
+}
+
+// ── GetEffectiveShardMinSubmissions ───────────────────────────────────────────
+// F15-F: how many submissions a shard actually needs before its majority is
+// final — lowered from the configured nOPoIShardMinSubmissions when fewer
+// miners could ever possibly submit (e.g. an expert hosted by only 1-2 active
+// stakers). Shared by getshardresult (RPC) and GetShardPaymentsForBlock so
+// "resolved" always means the same thing whether queried or paid.
+
+int GetEffectiveShardMinSubmissions(const OPoIRequest& req, uint32_t shardIndex,
+                                    const Consensus::Params& params)
+{
+    int configuredMin = params.nOPoIShardMinSubmissions;
+    ModelManifest manifest;
+    if (!g_opoiCache.GetModelManifest(req.model, manifest) || !manifest.IsActive())
+        return configuredMin;
+
+    auto meg = BuildModelExecutionGraph(manifest);
+    if (shardIndex >= meg.size())
+        return configuredMin;
+
+    const ShardDescriptor& d = meg[shardIndex];
+    int available = (d.shardType == OPOI_SHARD_EXPERT)
+        ? g_opoiCache.CountActiveExpertHosts(d.expertId)
+        : g_opoiCache.CountActiveStakers();
+    if (available > 0 && available < configuredMin)
+        return available;
+    return configuredMin;
+}
+
+// ── GetShardPaymentsForBlock ───────────────────────────────────────────────────
+// See the design notes on this declaration in opoi.h.
+
+std::vector<OPoIShardPayment> GetShardPaymentsForBlock(const std::vector<CTransaction>& vtx,
+                                                        const Consensus::Params& params)
+{
+    std::vector<OPoIShardPayment> out;
+
+    // Distinct (requestId, shardIndex) touched by a SHARD_RESULT tx in this
+    // block — a shard with no new submission this block can't have newly
+    // resolved (if it was already resolved, it was already paid).
+    std::set<std::pair<std::string, uint32_t>> touched;
+    for (size_t i = 1; i < vtx.size(); ++i) {
+        const CTransaction& tx = vtx[i];
+        if (tx.nVersion == OPOI_TX_VERSION && tx.nType == OPOI_SHARD_RESULT_TX_TYPE)
+            touched.insert({tx.opoiRequestId, tx.opoiShardIndex});
+    }
+
+    for (const auto& key : touched) {
+        const std::string& requestId  = key.first;
+        uint32_t            shardIndex = key.second;
+        if (g_opoiCache.IsShardPaid(requestId, shardIndex))
+            continue; // already paid in a previous block
+
+        OPoIRequest req;
+        if (!g_opoiCache.GetRequest(requestId, req) || req.payment <= 0)
+            continue;
+
+        // Combine the pre-block cache with this block's own SHARD_RESULT txs
+        // for this exact shard — same anti-equivocation rule AddShardResult
+        // already enforces (one submission per miner, first one wins). This
+        // works whether called pre-apply (CreateNewBlock/CheckOPoIPayments,
+        // cache doesn't have this block's txs yet) or post-apply
+        // (ProcessShardPayments, cache already has them — the `seen` set just
+        // makes the second pass a no-op).
+        std::vector<ShardResultSubmission> subs = g_opoiCache.ListShardResults(requestId, shardIndex);
+        std::set<std::string> seen;
+        for (const auto& s : subs) seen.insert(s.minerAddress);
+        for (size_t i = 1; i < vtx.size(); ++i) {
+            const CTransaction& tx = vtx[i];
+            if (tx.nVersion != OPOI_TX_VERSION || tx.nType != OPOI_SHARD_RESULT_TX_TYPE)
+                continue;
+            if (tx.opoiRequestId != requestId || tx.opoiShardIndex != shardIndex)
+                continue;
+            if (!seen.insert(tx.opoiMinerAddress).second)
+                continue;
+            ShardResultSubmission sub;
+            sub.minerAddress       = tx.opoiMinerAddress;
+            sub.boundaryOutputHash = tx.opoiResponseHash;
+            sub.tokenCount         = tx.opoiTokenCount;
+            subs.push_back(sub);
+        }
+
+        int effectiveMin = GetEffectiveShardMinSubmissions(req, shardIndex, params);
+        uint256 majorityHash;
+        uint32_t majorityTokenCount = 0;
+        std::vector<std::string> agreeing, divergent;
+        if (!ComputeShardMajority(subs, effectiveMin, majorityHash, majorityTokenCount, agreeing, divergent) || agreeing.empty())
+            continue; // not resolved yet
+
+        // This shard's share of req.payment: weighted by layer span for DENSE
+        // shards. A request whose model doesn't resolve to an ACTIVE
+        // ModelManifest is treated as a single implicit shard (the whole
+        // payment) — same fallback CheckOPoITransaction already applies for
+        // free-text model names unrelated to any manifest.
+        CAmount shardShare = req.payment;
+        ModelManifest manifest;
+        if (g_opoiCache.GetModelManifest(req.model, manifest) && manifest.IsActive()) {
+            auto meg = BuildModelExecutionGraph(manifest);
+            uint64_t totalWeight = 0, myWeight = 0;
+            bool found = false;
+            for (const auto& d : meg) {
+                uint64_t w = (d.shardType == OPOI_SHARD_DENSE) ? (uint64_t)(d.layerEnd - d.layerStart) : 1;
+                totalWeight += w;
+                if (d.shardIndex == shardIndex) { myWeight = w; found = true; }
+            }
+            if (!found || totalWeight == 0)
+                continue; // shardIndex out of range for this manifest — CheckOPoITransaction already gates this, shouldn't happen
+            shardShare = (CAmount)(req.payment * (CAmount)myWeight / (CAmount)totalWeight);
+        }
+        if (shardShare <= 0)
+            continue;
+
+        // F16: per-token fee, NOT divided across shards like the base payment
+        // is — each shard's miners ran a real forward pass per token through
+        // their own slice of the model, so token-based compensation applies
+        // per shard independently (mirrors RESPONSE's total = payment +
+        // tokenCount * feePerToken, just scoped to this one shard).
+        CAmount perShardTotal = shardShare;
+        if (req.feePerToken > 0 && majorityTokenCount > 0)
+            perShardTotal += (CAmount)majorityTokenCount * req.feePerToken;
+
+        CAmount perMiner = perShardTotal / (CAmount)agreeing.size();
+        if (perMiner <= 0)
+            continue;
+
+        for (const auto& addr : agreeing)
+            out.push_back({requestId, shardIndex, addr, perMiner});
+    }
+
+    return out;
+}
+
+// ── ProcessShardPayments ───────────────────────────────────────────────────────
+// Called from ConnectBlock/RebuildOPoICache after ProcessOPoITransaction has
+// applied this block's own SHARD_RESULT txs. Marks every shard paid this
+// block so GetShardPaymentsForBlock never returns it again.
+
+void ProcessShardPayments(const std::vector<CTransaction>& vtx, const Consensus::Params& params)
+{
+    for (const auto& p : GetShardPaymentsForBlock(vtx, params))
+        g_opoiCache.MarkShardPaid(p.requestId, p.shardIndex);
 }
 
 // ── GetChallengerRewardsAtHeight ──────────────────────────────────────────────
