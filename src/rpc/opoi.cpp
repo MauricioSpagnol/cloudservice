@@ -628,6 +628,39 @@ UniValue opoivrfverifyraw(const UniValue& params, bool fHelp)
     return ret;
 }
 
+// ── opoiselecttopkexperts (F15-H cross-language test) ────────────────────────
+// Exposes SelectTopKExperts (opoi_shard.h) directly so cs-miner's Rust mirror
+// (expert_router.rs) can be checked for byte-for-byte agreement without
+// needing a live Model Manifest/request — the two MUST always agree, since
+// CheckOPoITransaction uses this to gate which EXPERT shard submissions are
+// valid, and cs-miner uses its own copy to decide what to attempt.
+
+UniValue opoiselecttopkexperts(const UniValue& params, bool fHelp)
+{
+    if (fHelp || params.size() != 4)
+        throw std::runtime_error(
+            "opoiselecttopkexperts \"request_id\" \"prompt_hash_hex\" num_experts top_k\n"
+            "\nReturns the deterministic top-k expert selection for arbitrary inputs —\n"
+            "exists purely to cross-check cs-miner's Rust mirror of this algorithm.\n"
+            "\nResult:\n"
+            "{ selected: [ints] }\n"
+        );
+
+    std::string requestId = params[0].get_str();
+    uint256 promptHash;
+    promptHash.SetHex(params[1].get_str());
+    uint32_t numExperts = (uint32_t)params[2].get_int64();
+    uint32_t topK       = (uint32_t)params[3].get_int64();
+
+    auto selected = SelectTopKExperts(requestId, promptHash, numExperts, topK);
+
+    UniValue arr(UniValue::VARR);
+    for (uint32_t e : selected) arr.push_back((int)e);
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("selected", arr);
+    return ret;
+}
+
 // ── Phase 3 helpers ───────────────────────────────────────────────────────────
 
 static std::string StakeStatusStr(int8_t s) {
@@ -656,6 +689,9 @@ static UniValue OPoIStakeToUniValue(const OPoIStake& s)
     obj.pushKV("collateral_txid",s.collateralIn.hash.GetHex());
     obj.pushKV("collateral_vout",(int)s.collateralIn.n);
     obj.pushKV("amount",         ValueFromAmount(s.amount));
+    obj.pushKV("model_id",       s.modelId);
+    obj.pushKV("tier",           (int)s.tier);
+    obj.pushKV("pom_root",       s.pomRoot.GetHex());
     obj.pushKV("block_height",   (int)s.blockHeight);
     obj.pushKV("status",         StakeStatusStr(s.stakeStatus));
     obj.pushKV("unstake_height", (int)s.unstakeHeight);
@@ -663,6 +699,7 @@ static UniValue OPoIStakeToUniValue(const OPoIStake& s)
     UniValue experts(UniValue::VARR);
     for (uint32_t e : s.hostedExpertIds) experts.push_back((int)e);
     obj.pushKV("hosted_expert_ids", experts);
+    obj.pushKV("endpoint", s.endpoint);
     return obj;
 }
 
@@ -682,9 +719,9 @@ static UniValue OPoIChallengeToUniValue(const OPoIChallenge& c)
 
 UniValue stakeopoi(const UniValue& params, bool fHelp)
 {
-    if (fHelp || params.size() < 3 || params.size() > 4)
+    if (fHelp || params.size() < 3 || params.size() > 5)
         throw std::runtime_error(
-            "stakeopoi \"miner_address\" \"collateral_txid\" collateral_vout ( hosted_expert_ids )\n"
+            "stakeopoi \"miner_address\" \"collateral_txid\" collateral_vout ( hosted_expert_ids endpoint )\n"
             "\nRegister an OPoI stake for a miner.\n"
             "\nThe referenced UTXO must be >= the network minimum stake (100 CS on mainnet).\n"
             "\nArguments:\n"
@@ -692,11 +729,14 @@ UniValue stakeopoi(const UniValue& params, bool fHelp)
             "2. collateral_txid     (string, required) TXID of the collateral UTXO\n"
             "3. collateral_vout     (numeric, required) Output index of the collateral UTXO\n"
             "4. hosted_expert_ids   (array, optional) F15-E: MoE expert IDs this miner hosts\n"
+            "5. endpoint            (string, optional) F15-H: \"host:port\" this miner's\n"
+            "                       cs-miner HTTP API is reachable at, for coordinator\n"
+            "                       shard relay. Omit if not reachable (e.g. behind NAT).\n"
             "\nResult:\n"
             "{ txid, miner_address }\n"
             "\nExamples:\n"
             + HelpExampleCli("stakeopoi", "\"t1MinerAddr...\" \"abc123...\" 0")
-            + HelpExampleCli("stakeopoi", "\"t1MinerAddr...\" \"abc123...\" 0 \"[0,1]\"")
+            + HelpExampleCli("stakeopoi", "\"t1MinerAddr...\" \"abc123...\" 0 \"[0,1]\" \"1.2.3.4:3500\"")
             + HelpExampleRpc("stakeopoi", "\"t1MinerAddr...\", \"abc123...\", 0")
         );
 
@@ -715,6 +755,7 @@ UniValue stakeopoi(const UniValue& params, bool fHelp)
         for (unsigned int i = 0; i < arr.size(); i++)
             hostedExpertIds.push_back((uint32_t)arr[i].get_int64());
     }
+    std::string endpoint = (params.size() > 4) ? params[4].get_str() : "";
 
     if (minerAddr.empty()) throw std::runtime_error("miner_address must not be empty");
     if (colTxid.IsNull())  throw std::runtime_error("collateral_txid is invalid");
@@ -745,6 +786,7 @@ UniValue stakeopoi(const UniValue& params, bool fHelp)
     mutTx.opoiCollateralIn= colOut;
     mutTx.opoiPayment     = stakeAmount;
     mutTx.opoiHostedExpertIds = hostedExpertIds;
+    mutTx.opoiEndpoint    = endpoint;
     mutTx.opoiSigTime     = (uint32_t)GetTime();
 
     std::string sigMsg = minerAddr + colTxid.GetHex() + strprintf("%u", colVout);
@@ -1712,6 +1754,7 @@ static const CRPCCommand commands[] =
     { "hidden", "rebuilopoidb",       &rebuilopoidb,        false },
     { "hidden", "opoivrfselftest",    &opoivrfselftest,     false },
     { "hidden", "opoivrfverifyraw",   &opoivrfverifyraw,    false },
+    { "hidden", "opoiselecttopkexperts", &opoiselecttopkexperts, false },
 };
 
 void RegisterOPoIRPCCommands(CRPCTable& tableRPC)

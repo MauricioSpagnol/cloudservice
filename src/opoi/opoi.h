@@ -175,6 +175,9 @@ struct OPoIStake {
     CPubKey     minerPubKey;
     // F15-E: which MoE expert IDs this miner declared hosting (empty = dense-only)
     std::vector<uint32_t> hostedExpertIds;
+    // F15-H: "host:port" this miner's cs-miner HTTP API is reachable at (empty
+    // = not relay-reachable, e.g. behind NAT).
+    std::string endpoint;
 
     ADD_SERIALIZE_METHODS;
     template <typename Stream, typename Operation>
@@ -185,6 +188,7 @@ struct OPoIStake {
         READWRITE(stakeStatus); READWRITE(unstakeHeight);
         READWRITE(responsesTotal); READWRITE(responsesChallenged); READWRITE(responsesSlashed);
         READWRITE(canaryStrikes); READWRITE(minerPubKey); READWRITE(hostedExpertIds);
+        READWRITE(endpoint);
     }
 
     bool HostsExpert(uint32_t expertId) const {
@@ -193,7 +197,7 @@ struct OPoIStake {
 
     void SetNull() {
         minerAddress.clear(); collateralIn.SetNull(); amount = 0;
-        modelId.clear(); tier = 0; pomRoot.SetNull(); hostedExpertIds.clear();
+        modelId.clear(); tier = 0; pomRoot.SetNull(); hostedExpertIds.clear(); endpoint.clear();
         blockHeight = 0; lastRenewalHeight = 0; sigTime = 0; txHash.SetNull();
         stakeStatus = OPOI_STAKE_ACTIVE; unstakeHeight = 0;
         responsesTotal = 0; responsesChallenged = 0; responsesSlashed = 0;

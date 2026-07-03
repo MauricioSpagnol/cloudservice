@@ -238,6 +238,7 @@ CMutableTransaction::CMutableTransaction(const CTransaction& tx) : nVersion(tx.n
                                                                    opoiTier(tx.opoiTier),
                                                                    opoiPomRoot(tx.opoiPomRoot),
                                                                    opoiHostedExpertIds(tx.opoiHostedExpertIds),
+                                                                   opoiEndpoint(tx.opoiEndpoint),
                                                                    opoiPromptTokenCount(tx.opoiPromptTokenCount),
                                                                    opoiIsCanary(tx.opoiIsCanary),
                                                                    opoiTestSuite(tx.opoiTestSuite),
@@ -295,7 +296,7 @@ CTransaction::CTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION
                                opoiCollateralIn(), opoiChallengePhase(0), opoiCommitHash(), opoiProofData(),
                                opoiChallengeNonce(), opoiChallengerCollateralIn(), opoiResponsePhase(0),
                                opoiResponseCommitHash(), opoiResponseNonce(), opoiVrfOutput(), opoiModelId(),
-                               opoiTier(0), opoiPomRoot(), opoiHostedExpertIds(), opoiPromptTokenCount(0), opoiIsCanary(0),
+                               opoiTier(0), opoiPomRoot(), opoiHostedExpertIds(), opoiEndpoint(), opoiPromptTokenCount(0), opoiIsCanary(0),
                                opoiTestSuite(), opoiFotonAddress(), opoiFotonVerifyResult(0),
                                opoiFotonCollateralIn(),
                                opoiModelArchType(0), opoiModelTotalParams(0), opoiModelActiveParamsPerToken(0),
@@ -338,6 +339,7 @@ CTransaction::CTransaction(const CMutableTransaction &tx) : nVersion(tx.nVersion
                                                             opoiTier(tx.opoiTier),
                                                             opoiPomRoot(tx.opoiPomRoot),
                                                             opoiHostedExpertIds(tx.opoiHostedExpertIds),
+                                                            opoiEndpoint(tx.opoiEndpoint),
                                                             opoiPromptTokenCount(tx.opoiPromptTokenCount),
                                                             opoiIsCanary(tx.opoiIsCanary),
                                                             opoiTestSuite(tx.opoiTestSuite),
@@ -400,6 +402,7 @@ CTransaction::CTransaction(
                               opoiTier(tx.opoiTier),
                               opoiPomRoot(tx.opoiPomRoot),
                               opoiHostedExpertIds(tx.opoiHostedExpertIds),
+                              opoiEndpoint(tx.opoiEndpoint),
                               opoiPromptTokenCount(tx.opoiPromptTokenCount),
                               opoiIsCanary(tx.opoiIsCanary),
                               opoiTestSuite(tx.opoiTestSuite),
@@ -459,6 +462,7 @@ CTransaction::CTransaction(CMutableTransaction &&tx) : nVersion(tx.nVersion), fO
                                                        opoiTier(tx.opoiTier),
                                                        opoiPomRoot(tx.opoiPomRoot),
                                                        opoiHostedExpertIds(std::move(tx.opoiHostedExpertIds)),
+                                                       opoiEndpoint(std::move(tx.opoiEndpoint)),
                                                        opoiPromptTokenCount(tx.opoiPromptTokenCount),
                                                        opoiIsCanary(tx.opoiIsCanary),
                                                        opoiTestSuite(tx.opoiTestSuite),
@@ -553,6 +557,7 @@ CTransaction& CTransaction::operator=(const CTransaction &tx) {
     *const_cast<uint8_t*>(&opoiTier) = tx.opoiTier;
     *const_cast<uint256*>(&opoiPomRoot) = tx.opoiPomRoot;
     *const_cast<std::vector<uint32_t>*>(&opoiHostedExpertIds) = tx.opoiHostedExpertIds;
+    *const_cast<std::string*>(&opoiEndpoint) = tx.opoiEndpoint;
     *const_cast<uint32_t*>(&opoiPromptTokenCount) = tx.opoiPromptTokenCount;
     *const_cast<uint8_t*>(&opoiIsCanary) = tx.opoiIsCanary;
     *const_cast<uint256*>(&opoiTestSuite) = tx.opoiTestSuite;

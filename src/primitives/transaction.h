@@ -681,6 +681,10 @@ public:
     const uint256              opoiPomRoot;                 // Merkle root of GGUF weights
     // F15-E: which MoE experts this stake hosts (STAKE only; empty if dense-only miner)
     const std::vector<uint32_t> opoiHostedExpertIds;
+    // F15-H: "host:port" this miner's cs-miner HTTP API is reachable at, for
+    // coordinator-to-miner shard relay (STAKE only; empty = not relay-reachable,
+    // e.g. behind NAT — miner can still poll/submit via RPC on its own).
+    const std::string          opoiEndpoint;
     // F11-A: Prompt token count for fee calculation (REQUEST only)
     const uint32_t             opoiPromptTokenCount;        // estimated tokens in prompt
     // F9-F / F14-B: Canary flag + VERIFIABLE test suite (REQUEST only)
@@ -867,6 +871,7 @@ public:
                 READWRITE(*const_cast<uint8_t*>(&opoiTier));
                 READWRITE(*const_cast<uint256*>(&opoiPomRoot));
                 READWRITE(*const_cast<std::vector<uint32_t>*>(&opoiHostedExpertIds));
+                READWRITE(*const_cast<std::string*>(&opoiEndpoint));
             } else if (nType == OPOI_UNSTAKE_TX_TYPE) {
                 READWRITE(*const_cast<std::string*>(&opoiMinerAddress));
             } else if (nType == OPOI_CHALLENGE_TX_TYPE) {
@@ -1166,6 +1171,8 @@ struct CMutableTransaction
     uint256              opoiPomRoot;
     // F15-E
     std::vector<uint32_t> opoiHostedExpertIds;
+    // F15-H
+    std::string          opoiEndpoint;
     // F11-A
     uint32_t             opoiPromptTokenCount      = 0;
     // F9-F / F14-B
@@ -1337,6 +1344,7 @@ struct CMutableTransaction
                 READWRITE(opoiTier);
                 READWRITE(opoiPomRoot);
                 READWRITE(opoiHostedExpertIds);
+                READWRITE(opoiEndpoint);
             } else if (nType == OPOI_UNSTAKE_TX_TYPE) {
                 READWRITE(opoiMinerAddress);
             } else if (nType == OPOI_CHALLENGE_TX_TYPE) {

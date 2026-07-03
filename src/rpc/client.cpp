@@ -161,7 +161,10 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "votemodelopoi",      2 },   // approve (bool)
     // F15-D
     { "submitshardresult",  1 },   // shard_index (integer)
-    { "getshardresult",     1 }    // shard_index (integer)
+    { "getshardresult",     1 },   // shard_index (integer)
+    // F15-H cross-language test
+    { "opoiselecttopkexperts", 2 }, // num_experts (integer)
+    { "opoiselecttopkexperts", 3 }  // top_k (integer)
 };
 
 class CRPCConvertTable

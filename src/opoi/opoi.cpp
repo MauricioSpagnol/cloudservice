@@ -240,6 +240,7 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         stake.tier          = tx.opoiTier;
         stake.pomRoot       = tx.opoiPomRoot;
         stake.hostedExpertIds = tx.opoiHostedExpertIds; // F15-E
+        stake.endpoint = tx.opoiEndpoint; // F15-H
         stake.blockHeight   = blockHeight;
         stake.sigTime       = tx.opoiSigTime;
         stake.txHash        = tx.GetHash();
@@ -889,6 +890,19 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                         return state.DoS(10, error("CheckOPoITransaction(): SHARD_RESULT miner %s does not host expert %u",
                                                    tx.opoiMinerAddress, d.expertId),
                                          REJECT_INVALID, "bad-txns-opoi-shard-expert-not-hosted");
+
+                    // F15-H (real routing, first slice): hosting the expert is necessary
+                    // but not sufficient — it must also have been SELECTED for this
+                    // request's token by the (placeholder) router. Without this, any
+                    // miner hosting any expert could submit for a shard the router never
+                    // routed to, defeating the entire point of MoE (only topK experts of
+                    // numExperts should ever do work for a given request).
+                    auto selected = SelectTopKExperts(tx.opoiRequestId, req.promptHash,
+                                                       manifest.numExperts, manifest.topKExperts);
+                    if (std::find(selected.begin(), selected.end(), d.expertId) == selected.end())
+                        return state.DoS(10, error("CheckOPoITransaction(): SHARD_RESULT expert %u not selected "
+                                                   "by router for request %s", d.expertId, tx.opoiRequestId),
+                                         REJECT_INVALID, "bad-txns-opoi-shard-expert-not-selected");
                 }
             }
         }

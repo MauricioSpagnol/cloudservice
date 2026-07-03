@@ -16,6 +16,8 @@
 #ifndef CSCOIN_OPOI_SHARD_H
 #define CSCOIN_OPOI_SHARD_H
 
+#include <algorithm>
+#include <array>
 #include <string>
 #include <vector>
 #include "uint256.h"
@@ -83,6 +85,49 @@ inline uint256 ComputeShardTopologyHash(const ModelManifest& m)
     CHashWriter ss(SER_GETHASH, 0);
     ss << m.archType << m.numLayers << m.numDenseShards << m.numExperts << m.topKExperts;
     return ss.GetHash();
+}
+
+// F15-H (real MoE routing, first slice): deterministically selects which
+// `topK` of `numExperts` are "active" for a given (requestId, promptHash).
+//
+// This stands in for a real router (a DenseShard boundary computing actual
+// top-k logits over model weights) — no such runtime exists yet on either
+// side of this codebase. It is still consensus-relevant: every node MUST
+// compute the identical selection, because it gates which EXPERT shard
+// submissions are valid (see F15-E's hosting gate, extended here to also
+// require the expert be selected, not merely hosted). cs-miner mirrors this
+// exact algorithm in Rust (expert_router.rs) so it only attempts shards that
+// will actually be accepted.
+//
+// Algorithm: hash (requestId || promptHash || "EXPERT"+i) for each candidate
+// expert i, sort ascending by the raw 32-byte digest (plain lexicographic
+// byte comparison — deliberately NOT uint256::operator<, whose internal byte
+// order is an implementation detail; a fixed-size byte array's ordering is
+// trivial to replicate identically in Rust), take the first topK.
+inline std::vector<uint32_t> SelectTopKExperts(const std::string& requestId, const uint256& promptHash,
+                                                uint32_t numExperts, uint32_t topK)
+{
+    std::vector<std::pair<std::array<unsigned char, 32>, uint32_t>> scored;
+    scored.reserve(numExperts);
+    for (uint32_t i = 0; i < numExperts; i++) {
+        CSHA256 hasher;
+        hasher.Write((const unsigned char*)requestId.data(), requestId.size());
+        hasher.Write(promptHash.begin(), 32);
+        std::string suffix = "EXPERT" + std::to_string(i);
+        hasher.Write((const unsigned char*)suffix.data(), suffix.size());
+        std::array<unsigned char, 32> digest;
+        hasher.Finalize(digest.data());
+        scored.push_back({digest, i});
+    }
+    typedef std::pair<std::array<unsigned char, 32>, uint32_t> ScoredExpert;
+    std::sort(scored.begin(), scored.end(),
+              [](const ScoredExpert& a, const ScoredExpert& b) { return a.first < b.first; });
+
+    std::vector<uint32_t> result;
+    uint32_t n = std::min(topK, numExperts);
+    result.reserve(n);
+    for (uint32_t i = 0; i < n; i++) result.push_back(scored[i].second);
+    return result;
 }
 
 #endif // CSCOIN_OPOI_SHARD_H
