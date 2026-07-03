@@ -152,6 +152,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     // OPoI
     { "stakeopoi",          2 },   // collateral_vout (integer)
     { "stakeopoi",          3 },   // hosted_expert_ids (array) — F15-E
+    { "stakeopoi",          6 },   // tier (integer) — F9-B
     { "submitopoirequest",  3 },   // max_tokens (integer)
     { "submitopoirequest",  4 },   // payment (integer/amount)
     { "listopoirequests",   0 },   // verbose (bool treated as int)

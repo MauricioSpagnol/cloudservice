@@ -719,9 +719,10 @@ static UniValue OPoIChallengeToUniValue(const OPoIChallenge& c)
 
 UniValue stakeopoi(const UniValue& params, bool fHelp)
 {
-    if (fHelp || params.size() < 3 || params.size() > 5)
+    if (fHelp || params.size() < 3 || params.size() > 8)
         throw std::runtime_error(
-            "stakeopoi \"miner_address\" \"collateral_txid\" collateral_vout ( hosted_expert_ids endpoint )\n"
+            "stakeopoi \"miner_address\" \"collateral_txid\" collateral_vout"
+            " ( hosted_expert_ids endpoint \"model_id\" tier \"pom_root\" )\n"
             "\nRegister an OPoI stake for a miner.\n"
             "\nThe referenced UTXO must be >= the network minimum stake (100 CS on mainnet).\n"
             "\nArguments:\n"
@@ -732,11 +733,20 @@ UniValue stakeopoi(const UniValue& params, bool fHelp)
             "5. endpoint            (string, optional) F15-H: \"host:port\" this miner's\n"
             "                       cs-miner HTTP API is reachable at, for coordinator\n"
             "                       shard relay. Omit if not reachable (e.g. behind NAT).\n"
+            "6. model_id            (string, optional) F9-B: model this miner declares hosting,\n"
+            "                       e.g. \"GEMMA_3_4B\" — F15-H peer discovery (model_fetch)\n"
+            "                       filters candidates by this field, so it must be set for a\n"
+            "                       miner to be found as a P2P source for that model_id.\n"
+            "7. tier                (numeric, optional) F9-B: 0/1/2/3\n"
+            "8. pom_root            (string, optional) F9-B: Merkle root of the GGUF this miner\n"
+            "                       proved hosting via Proof-of-Model. Not consensus-enforced\n"
+            "                       against anything yet (recorded only).\n"
             "\nResult:\n"
             "{ txid, miner_address }\n"
             "\nExamples:\n"
             + HelpExampleCli("stakeopoi", "\"t1MinerAddr...\" \"abc123...\" 0")
             + HelpExampleCli("stakeopoi", "\"t1MinerAddr...\" \"abc123...\" 0 \"[0,1]\" \"1.2.3.4:3500\"")
+            + HelpExampleCli("stakeopoi", "\"t1MinerAddr...\" \"abc123...\" 0 \"[]\" \"1.2.3.4:3500\" \"GEMMA_3_4B\" 1")
             + HelpExampleRpc("stakeopoi", "\"t1MinerAddr...\", \"abc123...\", 0")
         );
 
@@ -756,6 +766,10 @@ UniValue stakeopoi(const UniValue& params, bool fHelp)
             hostedExpertIds.push_back((uint32_t)arr[i].get_int64());
     }
     std::string endpoint = (params.size() > 4) ? params[4].get_str() : "";
+    std::string modelId  = (params.size() > 5) ? params[5].get_str() : "";
+    uint8_t     tier      = (params.size() > 6) ? (uint8_t)params[6].get_int64() : 0;
+    uint256     pomRoot;
+    if (params.size() > 7) pomRoot.SetHex(params[7].get_str());
 
     if (minerAddr.empty()) throw std::runtime_error("miner_address must not be empty");
     if (colTxid.IsNull())  throw std::runtime_error("collateral_txid is invalid");
@@ -787,6 +801,9 @@ UniValue stakeopoi(const UniValue& params, bool fHelp)
     mutTx.opoiPayment     = stakeAmount;
     mutTx.opoiHostedExpertIds = hostedExpertIds;
     mutTx.opoiEndpoint    = endpoint;
+    mutTx.opoiModelId     = modelId;
+    mutTx.opoiTier        = tier;
+    mutTx.opoiPomRoot     = pomRoot;
     mutTx.opoiSigTime     = (uint32_t)GetTime();
 
     std::string sigMsg = minerAddr + colTxid.GetHex() + strprintf("%u", colVout);
