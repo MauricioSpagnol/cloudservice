@@ -515,9 +515,15 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
         // deeper than nOPoIMaxPipelineDepth, an INTERACTIVE request cannot use it —
         // commit-reveal adds +1 block per sequential shard, so a deep pipeline would
         // blow past any reasonable interactive latency budget. BATCH has no such limit.
+        // MoE/HYBRID manifests are excluded: BuildModelExecutionGraph always gives
+        // them exactly one real shard now (whole-model per miner, see opoi_shard.h),
+        // so numDenseShards no longer reflects the real pipeline depth for them —
+        // gating on it here would reject MoE INTERACTIVE requests for a chain length
+        // (numDenseShards) that isn't actually executed.
         if (!fIsVerifying) {
             ModelManifest manifest;
             if (g_opoiCache.GetModelManifest(tx.opoiModel, manifest) && manifest.IsActive()
+                && !manifest.IsMoE()
                 && tx.opoiTaskClass == OPOI_TASKCLASS_INTERACTIVE
                 && (int)manifest.numDenseShards > Params().GetConsensus().nOPoIMaxPipelineDepth)
                 return state.DoS(10, error("CheckOPoITransaction(): REQUEST model %s pipeline too deep "
