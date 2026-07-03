@@ -1962,6 +1962,17 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
             return state.Invalid(error("AcceptToMemoryPool: inputs already spent"),
                                  REJECT_DUPLICATE, "bad-txns-inputs-spent");
 
+        // OPoI: reject txs spending locked collateral UTXOs
+        {
+            LOCK(g_opoiCache.cs);
+            for (const CTxIn& txin : tx.vin) {
+                if (g_opoiCache.mapLockedUTXOs.count(txin.prevout))
+                    return state.Invalid(error("AcceptToMemoryPool: tx %s tries to spend locked OPoI collateral %s:%u",
+                                              tx.GetHash().GetHex(), txin.prevout.hash.GetHex(), txin.prevout.n),
+                                         REJECT_INVALID, "bad-txns-spends-opoi-collateral");
+            }
+        }
+
         // are the joinsplits' and sapling spends' requirements met in tx(valid anchors/nullifiers)?
         if (!view.HaveShieldedRequirements(tx))
             return state.Invalid(error("AcceptToMemoryPool: shielded requirements not met"),
@@ -3196,8 +3207,9 @@ static DisconnectResult DisconnectBlock(const CBlock& block, CValidationState& s
         if (tx.IsCSAppTx())
             ProcessCSAppTransaction(tx, (uint32_t)pindex->nHeight, /*fUndo=*/true);
 
-        // Undo OPoI transactions
-        if (tx.IsOPoITx())
+        // Undo OPoI transactions (skip during VerifyDB — g_opoiCache is global and must not be
+        // corrupted by DisconnectBlock calls that only operate on a local coins view copy)
+        if (tx.IsOPoITx() && !fIsVerifying)
             ProcessOPoITransaction(tx, (uint32_t)pindex->nHeight, /*fUndo=*/true);
 
         // Check that all outputs are available and match the outputs in the block itself
@@ -3515,6 +3527,15 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         }
     }
 
+    // Check OPoI miner payments in the coinbase (skip during VerifyDB — cache may be in rebuild state)
+    if (!fIsVerifying && NetworkUpgradeActive(pindex->nHeight, chainparams.GetConsensus(), Consensus::UPGRADE_OPOI)) {
+        if (!CheckOPoIPayments(block.vtx, pindex->nHeight, chainparams.GetConsensus(), state))
+            return false; // state already set by CheckOPoIPayments
+        if (!CheckOPoIChallengerRewards(block.vtx, (uint32_t)pindex->nHeight,
+                                        chainparams.GetConsensus(), state))
+            return false; // state already set by CheckOPoIChallengerRewards
+    }
+
     unsigned int flags = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY;
 
     // DERSIG (BIP66) is also always enforced, but does not have a flag.
@@ -3582,6 +3603,16 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                 return state.DoS(100, error("ConnectBlock(): inputs missing/spent"),
                                  REJECT_INVALID, "bad-txns-inputs-missingorspent");
 
+            // OPoI: reject any tx that tries to spend a locked collateral UTXO
+            if (!fIsVerifying && NetworkUpgradeActive(pindex->nHeight, chainparams.GetConsensus(), Consensus::UPGRADE_OPOI)) {
+                for (const CTxIn& txin : tx.vin) {
+                    if (g_opoiCache.IsLockedUTXO(txin.prevout))
+                        return state.DoS(100, error("ConnectBlock(): tx %s tries to spend locked OPoI collateral %s:%u",
+                                                    hash.GetHex(), txin.prevout.hash.GetHex(), txin.prevout.n),
+                                         REJECT_INVALID, "bad-txns-spends-opoi-collateral");
+                }
+            }
+
             if (tx.IsFluxnodeTx()) {
                 int nTier = 0;
                 CAmount nCollateralAmount;
@@ -3631,9 +3662,9 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             if (tx.IsCSAppTx())
                 ProcessCSAppTransaction(tx, (uint32_t)pindex->nHeight);
 
-            // Process OPoI transactions — only on real connect, not TestBlockValidity (fJustCheck)
-            if (!fJustCheck && tx.IsOPoITx())
-                ProcessOPoITransaction(tx, (uint32_t)pindex->nHeight);
+            // Process OPoI transactions — only on real connect, not TestBlockValidity or VerifyDB
+            if (!fJustCheck && !fIsVerifying && tx.IsOPoITx())
+                ProcessOPoITransaction(tx, (uint32_t)pindex->nHeight, /*fUndo=*/false, &chainparams.GetConsensus());
             if (!view.HaveShieldedRequirements(tx))
                 return state.DoS(100, error("ConnectBlock(): JoinSplit requirements not met"),
                                  REJECT_INVALID, "bad-txns-joinsplit-requirements-not-met");
@@ -3677,6 +3708,26 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             if (nSigOps > MAX_BLOCK_SIGOPS)
                 return state.DoS(100, error("ConnectBlock(): too many sigops"),
                                  REJECT_INVALID, "bad-blk-sigops");
+        }
+
+        // OPoI: for STAKE txs verify the collateral UTXO exists and meets minStake
+        if (!fIsVerifying && !fJustCheck &&
+            tx.nVersion == OPOI_TX_VERSION && tx.nType == OPOI_STAKE_TX_TYPE &&
+            NetworkUpgradeActive(pindex->nHeight, chainparams.GetConsensus(), Consensus::UPGRADE_OPOI))
+        {
+            CCoins coins;
+            if (!view.GetCoins(tx.opoiCollateralIn.hash, coins) ||
+                tx.opoiCollateralIn.n >= coins.vout.size() ||
+                coins.vout[tx.opoiCollateralIn.n].IsNull())
+                return state.DoS(100, error("ConnectBlock(): STAKE collateral UTXO %s:%u not found or spent",
+                                            tx.opoiCollateralIn.hash.GetHex(), tx.opoiCollateralIn.n),
+                                 REJECT_INVALID, "bad-txns-opoi-stake-no-utxo");
+            if (coins.vout[tx.opoiCollateralIn.n].nValue < chainparams.GetConsensus().nOPoIMinStake)
+                return state.DoS(100, error("ConnectBlock(): STAKE collateral %s:%u value %s < minStake %s",
+                                            tx.opoiCollateralIn.hash.GetHex(), tx.opoiCollateralIn.n,
+                                            FormatMoney(coins.vout[tx.opoiCollateralIn.n].nValue),
+                                            FormatMoney(chainparams.GetConsensus().nOPoIMinStake)),
+                                 REJECT_INVALID, "bad-txns-opoi-stake-amount-too-low");
         }
 
         txdata.emplace_back(tx);
@@ -3883,9 +3934,12 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     int64_t nTime4 = GetTimeMicros(); nTimeCallbacks += nTime4 - nTime3;
     LogPrint("bench", "    - Callbacks: %.2fms [%.2fs]\n", 0.001 * (nTime4 - nTime3), nTimeCallbacks * 0.000001);
 
-    // OPoI Phase 3: slash miners with unanswered challenges and release cooled-down unstakes
-    if (NetworkUpgradeActive(pindex->nHeight, chainparams.GetConsensus(), Consensus::UPGRADE_OPOI))
+    // OPoI: per-block state transitions (slash, release, request expiry)
+    if (!fIsVerifying && NetworkUpgradeActive(pindex->nHeight, chainparams.GetConsensus(), Consensus::UPGRADE_OPOI)) {
         ProcessExpiredChallenges((uint32_t)pindex->nHeight, chainparams.GetConsensus());
+        ProcessExpiredRequests((uint32_t)pindex->nHeight, chainparams.GetConsensus());
+        ProcessModelVotingWindows((uint32_t)pindex->nHeight, chainparams.GetConsensus());
+    }
 
     return true;
 }

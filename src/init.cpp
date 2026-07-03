@@ -39,6 +39,7 @@
 #include "util.h"
 #include "utilmoneystr.h"
 #include "validationinterface.h"
+#include "opoi/opoi.h"
 #include "csnode/csnodeconfig.h"
 #include "csnode/csnode.h"
 #include "csnode/obfuscation.h"
@@ -78,6 +79,7 @@
 #endif
 
 #include "librustzcash.h"
+#include "opoi/opoi_vrf.h"
 
 using namespace std;
 
@@ -285,6 +287,7 @@ void Shutdown()
     delete pfluxParams;
     pfluxParams = NULL;
     globalVerifyHandle.reset();
+    OPoIVRFStop();
     ECC_Stop();
     LogPrintf("%s: done\n", __func__);
 }
@@ -1190,6 +1193,7 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     // Initialize elliptic curve code
     ECC_Start();
     globalVerifyHandle.reset(new ECCVerifyHandle());
+    OPoIVRFStart();
 
     // Sanity check
     if (!InitSanityCheck())
@@ -1597,6 +1601,10 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
                     break;
                 }
                 fIsVerifying = false;
+
+                // Rebuild OPoI in-memory cache after VerifyDB so cache state matches
+                // the current chain tip without interference from VerifyDB's DisconnectBlock calls.
+                RebuildOPoICache();
             } catch (const std::exception& e) {
                 if (fDebug) LogPrintf("%s\n", e.what());
                 strLoadError = _("Error opening block database");

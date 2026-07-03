@@ -462,7 +462,7 @@ UniValue CRPCTable::execute(const std::string &strMethod, const UniValue &params
 
 std::string HelpExampleCli(const std::string& methodname, const std::string& args)
 {
-    return "> flux-cli " + methodname + " " + args + "\n";
+    return "> cs-cli " + methodname + " " + args + "\n";
 }
 
 std::string HelpExampleRpc(const std::string& methodname, const std::string& args)
@@ -474,7 +474,7 @@ std::string HelpExampleRpc(const std::string& methodname, const std::string& arg
 string experimentalDisabledHelpMsg(const string& rpc, const string& enableArg)
 {
     return "\nWARNING: " + rpc + " is disabled.\n"
-        "To enable it, restart fluxd with the -experimentalfeatures and\n"
+        "To enable it, restart csd with the -experimentalfeatures and\n"
         "-" + enableArg + " commandline options, or add these two lines\n"
         "to the cs.conf file:\n\n"
         "experimentalfeatures=1\n"

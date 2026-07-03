@@ -184,6 +184,12 @@ public:
         consensus.nOPoIMinStake              = 100 * COIN;  // 100 CS minimum stake
         consensus.nOPoIChallengeWindowBlocks = 144;         // ~1 hour at 25s/block
         consensus.nOPoIUnstakeCooldownBlocks = 1440;        // ~10 hours cooldown
+        consensus.nOPoIRequestExpiryBlocks   = 2016;        // ~14 days PENDING before expiry
+
+        // F15-A2 — Model Manifest governance
+        consensus.nOPoIModelVoteWindowBlocks      = 4032;   // ~4 weeks voting window
+        consensus.nOPoIModelApprovalPct           = 66;     // 66% of active stake to approve
+        consensus.nOPoIModelActivationDelayBlocks = 2016;   // ~2 weeks to download weights via FOTON
 
         consensus.nZawyLWMAAveragingWindow = 60;
         consensus.eh_epoch_fade_length = 11;
@@ -368,6 +374,12 @@ public:
         consensus.nOPoIMinStake              = 10 * COIN;   // 10 CS on testnet
         consensus.nOPoIChallengeWindowBlocks = 20;          // ~8 minutes on testnet
         consensus.nOPoIUnstakeCooldownBlocks = 60;          // ~25 minutes on testnet
+        consensus.nOPoIRequestExpiryBlocks   = 200;         // ~83 minutes PENDING before expiry
+
+        // F15-A2 — Model Manifest governance (testnet — faster cycle)
+        consensus.nOPoIModelVoteWindowBlocks      = 200;
+        consensus.nOPoIModelApprovalPct           = 66;
+        consensus.nOPoIModelActivationDelayBlocks = 100;
 
         consensus.nZawyLWMAAveragingWindow = 60;
         consensus.eh_epoch_fade_length = 10;
@@ -528,6 +540,24 @@ public:
         consensus.nOPoIMinStake              = 1 * COIN;
         consensus.nOPoIChallengeWindowBlocks = 5;
         consensus.nOPoIUnstakeCooldownBlocks = 10;
+        consensus.nOPoIRequestExpiryBlocks   = 20;           // 20 blocks PENDING before expiry in regtest
+
+        // F15-A2 — Model Manifest governance (regtest — minimal, for fast unit testing)
+        consensus.nOPoIModelVoteWindowBlocks      = 5;
+        consensus.nOPoIModelApprovalPct           = 66;
+        consensus.nOPoIModelActivationDelayBlocks = 2;
+
+        // F10-D — VRF eligibility threshold (regtest: ~87% of outputs eligible, so a
+        // single test staker doesn't need dozens of retries to find an eligible request).
+        // Mainnet/testnet keep the calibrated default in consensus/params.h.
+        consensus.nOPoIVrfThreshold = "e000000000000000000000000000000000000000000000000000000000000000";
+        // F15-C — same permissive override, coordinator self-claim domain.
+        consensus.nOPoICoordinatorThreshold = "e000000000000000000000000000000000000000000000000000000000000000";
+        // F15-D — same permissive override, shard result submission domain.
+        consensus.nOPoIShardThreshold = "e000000000000000000000000000000000000000000000000000000000000000";
+        consensus.nOPoIShardMinSubmissions = 2; // regtest: 2 miners enough to test majority
+        // F15-G — small depth so toy models can actually exercise the rejection path
+        consensus.nOPoIMaxPipelineDepth = 3;
 
         consensus.nMinimumChainWork = uint256S("0x00");
 

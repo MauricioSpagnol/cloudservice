@@ -54,14 +54,15 @@
 #define V1_CSNODE_COLLAT_NEUTRON 100000
 #define V1_CSNODE_COLLAT_FOTON   500000
 
-/** CSNode Payout Percentages — miner 25%, nodes 75% (5:10:20:40 ratio)
+/** CSNode Payout Percentages — miner 25%, OPoI up to 10%, nodes 65% (5:10:20:30 ratio)
  * Percentages are applied directly; no external multiplier.
+ * FOTON reduced from 40% to 30% to fund the dedicated OPoI inference budget.
  */
 #define FLUXNODE_PERCENT_NULL        0.00
 #define V1_CSNODE_PERCENT_PROTON     0.05
 #define V1_CSNODE_PERCENT_ELETRON    0.10
 #define V1_CSNODE_PERCENT_NEUTRON    0.20
-#define V1_CSNODE_PERCENT_FOTON      0.40
+#define V1_CSNODE_PERCENT_FOTON      0.30
 
 class FluxnodeCache;
 class CFluxnodeTxBlockUndo;

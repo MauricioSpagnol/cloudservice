@@ -620,7 +620,7 @@ UniValue getaddressmempool(const UniValue& params, bool fHelp)
 
     if (!enabled) {
         throw JSONRPCError(RPC_MISC_ERROR, "Error: getaddressmempool is disabled. "
-            "Run './flux-cli help getaddressmempool' for instructions on how to enable this feature.");
+            "Run './cs-cli help getaddressmempool' for instructions on how to enable this feature.");
     }
 
     std::vector<std::pair<uint160, int>> addresses;
@@ -717,7 +717,7 @@ UniValue getaddressutxos(const UniValue& params, bool fHelp)
 
     if (!enabled) {
         throw JSONRPCError(RPC_MISC_ERROR, "Error: getaddressutxos is disabled. "
-            "Run './flux-cli help getaddressutxos' for instructions on how to enable this feature.");
+            "Run './cs-cli help getaddressutxos' for instructions on how to enable this feature.");
     }
 
     bool includeChainInfo = false;
@@ -886,7 +886,7 @@ UniValue getaddressdeltas(const UniValue& params, bool fHelp)
 
     if (!enabled) {
         throw JSONRPCError(RPC_MISC_ERROR, "Error: getaddressdeltas is disabled. "
-            "Run './flux-cli help getaddressdeltas' for instructions on how to enable this feature.");
+            "Run './cs-cli help getaddressdeltas' for instructions on how to enable this feature.");
     }
 
     int start = 0;
@@ -984,7 +984,7 @@ UniValue getaddressbalance(const UniValue& params, bool fHelp)
 
     if (!enabled) {
         throw JSONRPCError(RPC_MISC_ERROR, "Error: getaddressbalance is disabled. "
-            "Run './flux-cli help getaddressbalance' for instructions on how to enable this feature.");
+            "Run './cs-cli help getaddressbalance' for instructions on how to enable this feature.");
     }
 
     std::vector<std::pair<uint160, int>> addresses;
@@ -1046,7 +1046,7 @@ UniValue getaddresstxids(const UniValue& params, bool fHelp)
 
     if (!enabled) {
         throw JSONRPCError(RPC_MISC_ERROR, "Error: getaddresstxids is disabled. "
-            "Run './flux-cli help getaddresstxids' for instructions on how to enable this feature.");
+            "Run './cs-cli help getaddresstxids' for instructions on how to enable this feature.");
     }
 
     int start = 0;
@@ -1106,7 +1106,7 @@ UniValue getspentinfo(const UniValue& params, bool fHelp)
 
     if (!enabled) {
         throw JSONRPCError(RPC_MISC_ERROR, "Error: getspentinfo is disabled. "
-            "Run './flux-cli help getspentinfo' for instructions on how to enable this feature.");
+            "Run './cs-cli help getspentinfo' for instructions on how to enable this feature.");
     }
 
     UniValue txidValue = find_value(params[0].get_obj(), "txid");

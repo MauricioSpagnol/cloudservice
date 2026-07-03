@@ -33,6 +33,7 @@
 #include "utilmoneystr.h"
 #include "validationinterface.h"
 
+#include "opoi/opoi.h"
 #include "sodium.h"
 
 #include <boost/thread.hpp>
@@ -538,6 +539,52 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
             txNew.vout.resize(newSize);
             txNew.vout[newSize -1].nValue = nAmount;
             txNew.vout[newSize -1].scriptPubKey = GetScriptForDestination(marketingFundDestination);
+        }
+
+        // OPoI: add coinbase outputs for RESPONSE txs and challenger rewards.
+        // Budget: up to nOPoISubsidyPct (10%) of blockValue — carved from the
+        // remaining PoW share (vout[0]). Unused budget stays with the PoW miner.
+        if (NetworkUpgradeActive(nHeight, chainparams.GetConsensus(), Consensus::UPGRADE_OPOI)) {
+            const CAmount blockSubsidy = GetBlockSubsidy(nHeight, chainparams.GetConsensus());
+            const CAmount opoiBudget   = static_cast<CAmount>(blockSubsidy * chainparams.GetConsensus().nOPoISubsidyPct);
+            CAmount totalOPoIPayment   = 0;
+
+            for (size_t i = 1; i < pblock->vtx.size(); ++i) {
+                const CTransaction& vtx = pblock->vtx[i];
+                if (vtx.nVersion != OPOI_TX_VERSION || vtx.nType != OPOI_RESPONSE_TX_TYPE)
+                    continue;
+                OPoIRequest req;
+                if (!g_opoiCache.GetRequest(vtx.opoiRequestId, req) || req.payment <= 0)
+                    continue;
+                CTxDestination minerDest = DecodeDestination(vtx.opoiMinerAddress);
+                if (!IsValidDestination(minerDest))
+                    continue;
+                // Enforce 10% OPoI budget cap (halving-aware)
+                if (totalOPoIPayment + req.payment > opoiBudget)
+                    continue;
+                // Safety: never exceed remaining coinbase vout[0]
+                if (totalOPoIPayment + req.payment > txNew.vout[0].nValue)
+                    continue;
+                txNew.vout.push_back(CTxOut(req.payment, GetScriptForDestination(minerDest)));
+                totalOPoIPayment += req.payment;
+            }
+            txNew.vout[0].nValue -= totalOPoIPayment;
+
+            // OPoI: add coinbase outputs for challenger rewards (challenges expiring at nHeight)
+            auto challengerRewards = GetChallengerRewardsAtHeight(nHeight, chainparams.GetConsensus());
+            CAmount totalChallengerRewards = 0;
+            for (const auto& reward : challengerRewards) {
+                if (totalChallengerRewards + reward.rewardAmount > txNew.vout[0].nValue)
+                    continue;
+                CTxDestination dest = DecodeDestination(reward.challengerAddress);
+                if (!IsValidDestination(dest))
+                    continue;
+                txNew.vout.push_back(CTxOut(reward.rewardAmount, GetScriptForDestination(dest)));
+                totalChallengerRewards += reward.rewardAmount;
+                LogPrintf("OPoI: challenger reward %s → %s at height %d\n",
+                          FormatMoney(reward.rewardAmount), reward.challengerAddress, nHeight);
+            }
+            txNew.vout[0].nValue -= totalChallengerRewards;
         }
 
         // Add fees

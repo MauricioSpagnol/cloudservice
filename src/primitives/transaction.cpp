@@ -202,7 +202,7 @@ std::string CTxOut::ToString() const
     return strprintf("CTxOut(nValue=%d.%08d, scriptPubKey=%s)", nValue / COIN, nValue % COIN, HexStr(scriptPubKey).substr(0, 30));
 }
 
-CMutableTransaction::CMutableTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION), fOverwintered(false), nVersionGroupId(0), nExpiryHeight(0), nLockTime(0), valueBalance(0), csappLockedAmount(0), opoiMaxTokens(0), opoiPayment(0), opoiSigTime(0), opoiCollateralIn() {}
+CMutableTransaction::CMutableTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION), fOverwintered(false), nVersionGroupId(0), nExpiryHeight(0), nLockTime(0), valueBalance(0), csappLockedAmount(0), opoiMaxTokens(0), opoiTokenCount(0), opoiTaskType(0), opoiPayment(0), opoiFeePerToken(0), opoiSigTime(0), opoiCollateralIn(), opoiChallengePhase(0), opoiChallengerCollateralIn(), opoiResponsePhase(0), opoiTier(0), opoiPromptTokenCount(0), opoiIsCanary(0), opoiFotonVerifyResult(0), opoiFotonCollateralIn() {}
 CMutableTransaction::CMutableTransaction(const CTransaction& tx) : nVersion(tx.nVersion), fOverwintered(tx.fOverwintered), nVersionGroupId(tx.nVersionGroupId), nExpiryHeight(tx.nExpiryHeight),
                                                                    vin(tx.vin), vout(tx.vout), nLockTime(tx.nLockTime),
                                                                    valueBalance(tx.valueBalance), vShieldedSpend(tx.vShieldedSpend), vShieldedOutput(tx.vShieldedOutput),
@@ -217,9 +217,44 @@ CMutableTransaction::CMutableTransaction(const CTransaction& tx) : nVersion(tx.n
                                                                    opoiRequestId(tx.opoiRequestId), opoiRequester(tx.opoiRequester),
                                                                    opoiMinerAddress(tx.opoiMinerAddress), opoiModel(tx.opoiModel),
                                                                    opoiPromptHash(tx.opoiPromptHash), opoiResponseHash(tx.opoiResponseHash),
-                                                                   opoiMaxTokens(tx.opoiMaxTokens), opoiPayment(tx.opoiPayment),
+                                                                   opoiCommitment(tx.opoiCommitment),
+                                                                   opoiMaxTokens(tx.opoiMaxTokens), opoiTokenCount(tx.opoiTokenCount),
+                                                                   opoiTaskType(tx.opoiTaskType),
+                                                                   opoiTaskClass(tx.opoiTaskClass),
+                                                                   opoiPayment(tx.opoiPayment), opoiFeePerToken(tx.opoiFeePerToken),
                                                                    opoiSigTime(tx.opoiSigTime), opoiSig(tx.opoiSig),
-                                                                   opoiCollateralIn(tx.opoiCollateralIn)
+                                                                   opoiVrfProof(tx.opoiVrfProof),
+                                                                   opoiCollateralIn(tx.opoiCollateralIn),
+                                                                   opoiChallengePhase(tx.opoiChallengePhase),
+                                                                   opoiCommitHash(tx.opoiCommitHash),
+                                                                   opoiProofData(tx.opoiProofData),
+                                                                   opoiChallengeNonce(tx.opoiChallengeNonce),
+                                                                   opoiChallengerCollateralIn(tx.opoiChallengerCollateralIn),
+                                                                   opoiResponsePhase(tx.opoiResponsePhase),
+                                                                   opoiResponseCommitHash(tx.opoiResponseCommitHash),
+                                                                   opoiResponseNonce(tx.opoiResponseNonce),
+                                                                   opoiVrfOutput(tx.opoiVrfOutput),
+                                                                   opoiModelId(tx.opoiModelId),
+                                                                   opoiTier(tx.opoiTier),
+                                                                   opoiPomRoot(tx.opoiPomRoot),
+                                                                   opoiHostedExpertIds(tx.opoiHostedExpertIds),
+                                                                   opoiPromptTokenCount(tx.opoiPromptTokenCount),
+                                                                   opoiIsCanary(tx.opoiIsCanary),
+                                                                   opoiTestSuite(tx.opoiTestSuite),
+                                                                   opoiFotonAddress(tx.opoiFotonAddress),
+                                                                   opoiFotonVerifyResult(tx.opoiFotonVerifyResult),
+                                                                   opoiFotonCollateralIn(tx.opoiFotonCollateralIn),
+                                                                   opoiModelArchType(tx.opoiModelArchType),
+                                                                   opoiModelTotalParams(tx.opoiModelTotalParams),
+                                                                   opoiModelActiveParamsPerToken(tx.opoiModelActiveParamsPerToken),
+                                                                   opoiModelNumLayers(tx.opoiModelNumLayers),
+                                                                   opoiModelNumDenseShards(tx.opoiModelNumDenseShards),
+                                                                   opoiModelNumExperts(tx.opoiModelNumExperts),
+                                                                   opoiModelTopKExperts(tx.opoiModelTopKExperts),
+                                                                   opoiModelExpertPomRoots(tx.opoiModelExpertPomRoots),
+                                                                   opoiModelMinRewardPerToken(tx.opoiModelMinRewardPerToken),
+                                                                   opoiModelVoteApprove(tx.opoiModelVoteApprove),
+                                                                   opoiShardIndex(tx.opoiShardIndex)
 {
 }
 
@@ -254,9 +289,19 @@ CTransaction::CTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION
                                collateralIn(), collateralPubkey(), pubKey(), sigTime(0), ip(), sig(), benchmarkTier(0), benchmarkSig(), benchmarkSigTime(0), nUpdateType(0),
                                nFluxTxVersion(0), P2SHRedeemScript(), csappDeploymentId(), csappOwner(), csappSpecJson(), csappIp(), csappLockedAmount(0), csappSig(),
                                opoiRequestId(), opoiRequester(), opoiMinerAddress(), opoiModel(),
-                               opoiPromptHash(), opoiResponseHash(),
-                               opoiMaxTokens(0), opoiPayment(0), opoiSigTime(0), opoiSig(),
-                               opoiCollateralIn()  { }
+                               opoiPromptHash(), opoiResponseHash(), opoiCommitment(),
+                               opoiMaxTokens(0), opoiTokenCount(0), opoiTaskType(0), opoiTaskClass(0),
+                               opoiPayment(0), opoiFeePerToken(0), opoiSigTime(0), opoiSig(), opoiVrfProof(),
+                               opoiCollateralIn(), opoiChallengePhase(0), opoiCommitHash(), opoiProofData(),
+                               opoiChallengeNonce(), opoiChallengerCollateralIn(), opoiResponsePhase(0),
+                               opoiResponseCommitHash(), opoiResponseNonce(), opoiVrfOutput(), opoiModelId(),
+                               opoiTier(0), opoiPomRoot(), opoiHostedExpertIds(), opoiPromptTokenCount(0), opoiIsCanary(0),
+                               opoiTestSuite(), opoiFotonAddress(), opoiFotonVerifyResult(0),
+                               opoiFotonCollateralIn(),
+                               opoiModelArchType(0), opoiModelTotalParams(0), opoiModelActiveParamsPerToken(0),
+                               opoiModelNumLayers(0), opoiModelNumDenseShards(0), opoiModelNumExperts(0), opoiModelTopKExperts(0),
+                               opoiModelExpertPomRoots(), opoiModelMinRewardPerToken(0), opoiModelVoteApprove(0),
+                               opoiShardIndex(0)  { }
 
 CTransaction::CTransaction(const CMutableTransaction &tx) : nVersion(tx.nVersion), fOverwintered(tx.fOverwintered), nVersionGroupId(tx.nVersionGroupId), nExpiryHeight(tx.nExpiryHeight),
                                                             vin(tx.vin), vout(tx.vout), nLockTime(tx.nLockTime),
@@ -272,9 +317,44 @@ CTransaction::CTransaction(const CMutableTransaction &tx) : nVersion(tx.nVersion
                                                             opoiRequestId(tx.opoiRequestId), opoiRequester(tx.opoiRequester),
                                                             opoiMinerAddress(tx.opoiMinerAddress), opoiModel(tx.opoiModel),
                                                             opoiPromptHash(tx.opoiPromptHash), opoiResponseHash(tx.opoiResponseHash),
-                                                            opoiMaxTokens(tx.opoiMaxTokens), opoiPayment(tx.opoiPayment),
+                                                            opoiCommitment(tx.opoiCommitment),
+                                                            opoiMaxTokens(tx.opoiMaxTokens), opoiTokenCount(tx.opoiTokenCount),
+                                                            opoiTaskType(tx.opoiTaskType),
+                                                            opoiTaskClass(tx.opoiTaskClass),
+                                                            opoiPayment(tx.opoiPayment), opoiFeePerToken(tx.opoiFeePerToken),
                                                             opoiSigTime(tx.opoiSigTime), opoiSig(tx.opoiSig),
-                                                            opoiCollateralIn(tx.opoiCollateralIn)
+                                                            opoiVrfProof(tx.opoiVrfProof),
+                                                            opoiCollateralIn(tx.opoiCollateralIn),
+                                                            opoiChallengePhase(tx.opoiChallengePhase),
+                                                            opoiCommitHash(tx.opoiCommitHash),
+                                                            opoiProofData(tx.opoiProofData),
+                                                            opoiChallengeNonce(tx.opoiChallengeNonce),
+                                                            opoiChallengerCollateralIn(tx.opoiChallengerCollateralIn),
+                                                            opoiResponsePhase(tx.opoiResponsePhase),
+                                                            opoiResponseCommitHash(tx.opoiResponseCommitHash),
+                                                            opoiResponseNonce(tx.opoiResponseNonce),
+                                                            opoiVrfOutput(tx.opoiVrfOutput),
+                                                            opoiModelId(tx.opoiModelId),
+                                                            opoiTier(tx.opoiTier),
+                                                            opoiPomRoot(tx.opoiPomRoot),
+                                                            opoiHostedExpertIds(tx.opoiHostedExpertIds),
+                                                            opoiPromptTokenCount(tx.opoiPromptTokenCount),
+                                                            opoiIsCanary(tx.opoiIsCanary),
+                                                            opoiTestSuite(tx.opoiTestSuite),
+                                                            opoiFotonAddress(tx.opoiFotonAddress),
+                                                            opoiFotonVerifyResult(tx.opoiFotonVerifyResult),
+                                                            opoiFotonCollateralIn(tx.opoiFotonCollateralIn),
+                                                            opoiModelArchType(tx.opoiModelArchType),
+                                                            opoiModelTotalParams(tx.opoiModelTotalParams),
+                                                            opoiModelActiveParamsPerToken(tx.opoiModelActiveParamsPerToken),
+                                                            opoiModelNumLayers(tx.opoiModelNumLayers),
+                                                            opoiModelNumDenseShards(tx.opoiModelNumDenseShards),
+                                                            opoiModelNumExperts(tx.opoiModelNumExperts),
+                                                            opoiModelTopKExperts(tx.opoiModelTopKExperts),
+                                                            opoiModelExpertPomRoots(tx.opoiModelExpertPomRoots),
+                                                            opoiModelMinRewardPerToken(tx.opoiModelMinRewardPerToken),
+                                                            opoiModelVoteApprove(tx.opoiModelVoteApprove),
+                                                            opoiShardIndex(tx.opoiShardIndex)
 {
     UpdateHash();
 }
@@ -299,9 +379,44 @@ CTransaction::CTransaction(
                               opoiRequestId(tx.opoiRequestId), opoiRequester(tx.opoiRequester),
                               opoiMinerAddress(tx.opoiMinerAddress), opoiModel(tx.opoiModel),
                               opoiPromptHash(tx.opoiPromptHash), opoiResponseHash(tx.opoiResponseHash),
-                              opoiMaxTokens(tx.opoiMaxTokens), opoiPayment(tx.opoiPayment),
+                              opoiCommitment(tx.opoiCommitment),
+                              opoiMaxTokens(tx.opoiMaxTokens), opoiTokenCount(tx.opoiTokenCount),
+                              opoiTaskType(tx.opoiTaskType),
+                              opoiTaskClass(tx.opoiTaskClass),
+                              opoiPayment(tx.opoiPayment), opoiFeePerToken(tx.opoiFeePerToken),
                               opoiSigTime(tx.opoiSigTime), opoiSig(tx.opoiSig),
-                              opoiCollateralIn(tx.opoiCollateralIn)
+                              opoiVrfProof(tx.opoiVrfProof),
+                              opoiCollateralIn(tx.opoiCollateralIn),
+                              opoiChallengePhase(tx.opoiChallengePhase),
+                              opoiCommitHash(tx.opoiCommitHash),
+                              opoiProofData(tx.opoiProofData),
+                              opoiChallengeNonce(tx.opoiChallengeNonce),
+                              opoiChallengerCollateralIn(tx.opoiChallengerCollateralIn),
+                              opoiResponsePhase(tx.opoiResponsePhase),
+                              opoiResponseCommitHash(tx.opoiResponseCommitHash),
+                              opoiResponseNonce(tx.opoiResponseNonce),
+                              opoiVrfOutput(tx.opoiVrfOutput),
+                              opoiModelId(tx.opoiModelId),
+                              opoiTier(tx.opoiTier),
+                              opoiPomRoot(tx.opoiPomRoot),
+                              opoiHostedExpertIds(tx.opoiHostedExpertIds),
+                              opoiPromptTokenCount(tx.opoiPromptTokenCount),
+                              opoiIsCanary(tx.opoiIsCanary),
+                              opoiTestSuite(tx.opoiTestSuite),
+                              opoiFotonAddress(tx.opoiFotonAddress),
+                              opoiFotonVerifyResult(tx.opoiFotonVerifyResult),
+                              opoiFotonCollateralIn(tx.opoiFotonCollateralIn),
+                              opoiModelArchType(tx.opoiModelArchType),
+                              opoiModelTotalParams(tx.opoiModelTotalParams),
+                              opoiModelActiveParamsPerToken(tx.opoiModelActiveParamsPerToken),
+                              opoiModelNumLayers(tx.opoiModelNumLayers),
+                              opoiModelNumDenseShards(tx.opoiModelNumDenseShards),
+                              opoiModelNumExperts(tx.opoiModelNumExperts),
+                              opoiModelTopKExperts(tx.opoiModelTopKExperts),
+                              opoiModelExpertPomRoots(tx.opoiModelExpertPomRoots),
+                              opoiModelMinRewardPerToken(tx.opoiModelMinRewardPerToken),
+                              opoiModelVoteApprove(tx.opoiModelVoteApprove),
+                              opoiShardIndex(tx.opoiShardIndex)
 {
     assert(evilDeveloperFlag);
 }
@@ -323,9 +438,44 @@ CTransaction::CTransaction(CMutableTransaction &&tx) : nVersion(tx.nVersion), fO
                                                        opoiRequestId(std::move(tx.opoiRequestId)), opoiRequester(std::move(tx.opoiRequester)),
                                                        opoiMinerAddress(std::move(tx.opoiMinerAddress)), opoiModel(std::move(tx.opoiModel)),
                                                        opoiPromptHash(tx.opoiPromptHash), opoiResponseHash(tx.opoiResponseHash),
-                                                       opoiMaxTokens(tx.opoiMaxTokens), opoiPayment(tx.opoiPayment),
+                                                       opoiCommitment(tx.opoiCommitment),
+                                                       opoiMaxTokens(tx.opoiMaxTokens), opoiTokenCount(tx.opoiTokenCount),
+                                                       opoiTaskType(tx.opoiTaskType),
+                                                       opoiTaskClass(tx.opoiTaskClass),
+                                                       opoiPayment(tx.opoiPayment), opoiFeePerToken(tx.opoiFeePerToken),
                                                        opoiSigTime(tx.opoiSigTime), opoiSig(std::move(tx.opoiSig)),
-                                                       opoiCollateralIn(tx.opoiCollateralIn)
+                                                       opoiVrfProof(std::move(tx.opoiVrfProof)),
+                                                       opoiCollateralIn(tx.opoiCollateralIn),
+                                                       opoiChallengePhase(tx.opoiChallengePhase),
+                                                       opoiCommitHash(std::move(tx.opoiCommitHash)),
+                                                       opoiProofData(std::move(tx.opoiProofData)),
+                                                       opoiChallengeNonce(std::move(tx.opoiChallengeNonce)),
+                                                       opoiChallengerCollateralIn(tx.opoiChallengerCollateralIn),
+                                                       opoiResponsePhase(tx.opoiResponsePhase),
+                                                       opoiResponseCommitHash(std::move(tx.opoiResponseCommitHash)),
+                                                       opoiResponseNonce(std::move(tx.opoiResponseNonce)),
+                                                       opoiVrfOutput(std::move(tx.opoiVrfOutput)),
+                                                       opoiModelId(std::move(tx.opoiModelId)),
+                                                       opoiTier(tx.opoiTier),
+                                                       opoiPomRoot(tx.opoiPomRoot),
+                                                       opoiHostedExpertIds(std::move(tx.opoiHostedExpertIds)),
+                                                       opoiPromptTokenCount(tx.opoiPromptTokenCount),
+                                                       opoiIsCanary(tx.opoiIsCanary),
+                                                       opoiTestSuite(tx.opoiTestSuite),
+                                                       opoiFotonAddress(std::move(tx.opoiFotonAddress)),
+                                                       opoiFotonVerifyResult(tx.opoiFotonVerifyResult),
+                                                       opoiFotonCollateralIn(tx.opoiFotonCollateralIn),
+                                                       opoiModelArchType(tx.opoiModelArchType),
+                                                       opoiModelTotalParams(tx.opoiModelTotalParams),
+                                                       opoiModelActiveParamsPerToken(tx.opoiModelActiveParamsPerToken),
+                                                       opoiModelNumLayers(tx.opoiModelNumLayers),
+                                                       opoiModelNumDenseShards(tx.opoiModelNumDenseShards),
+                                                       opoiModelNumExperts(tx.opoiModelNumExperts),
+                                                       opoiModelTopKExperts(tx.opoiModelTopKExperts),
+                                                       opoiModelExpertPomRoots(std::move(tx.opoiModelExpertPomRoots)),
+                                                       opoiModelMinRewardPerToken(tx.opoiModelMinRewardPerToken),
+                                                       opoiModelVoteApprove(tx.opoiModelVoteApprove),
+                                                       opoiShardIndex(tx.opoiShardIndex)
 {
     UpdateHash();
 }
@@ -379,11 +529,47 @@ CTransaction& CTransaction::operator=(const CTransaction &tx) {
     *const_cast<std::string*>(&opoiModel) = tx.opoiModel;
     *const_cast<uint256*>(&opoiPromptHash) = tx.opoiPromptHash;
     *const_cast<uint256*>(&opoiResponseHash) = tx.opoiResponseHash;
+    *const_cast<uint256*>(&opoiCommitment) = tx.opoiCommitment;
     *const_cast<uint32_t*>(&opoiMaxTokens) = tx.opoiMaxTokens;
+    *const_cast<uint32_t*>(&opoiTokenCount) = tx.opoiTokenCount;
+    *const_cast<int8_t*>(&opoiTaskType) = tx.opoiTaskType;
+    *const_cast<uint8_t*>(&opoiTaskClass) = tx.opoiTaskClass;
     *const_cast<CAmount*>(&opoiPayment) = tx.opoiPayment;
+    *const_cast<CAmount*>(&opoiFeePerToken) = tx.opoiFeePerToken;
     *const_cast<uint32_t*>(&opoiSigTime) = tx.opoiSigTime;
     *const_cast<std::vector<unsigned char>*>(&opoiSig) = tx.opoiSig;
+    *const_cast<std::vector<unsigned char>*>(&opoiVrfProof) = tx.opoiVrfProof;
     *const_cast<COutPoint*>(&opoiCollateralIn) = tx.opoiCollateralIn;
+    *const_cast<uint8_t*>(&opoiChallengePhase) = tx.opoiChallengePhase;
+    *const_cast<std::vector<uint8_t>*>(&opoiCommitHash) = tx.opoiCommitHash;
+    *const_cast<std::vector<uint8_t>*>(&opoiProofData) = tx.opoiProofData;
+    *const_cast<std::vector<uint8_t>*>(&opoiChallengeNonce) = tx.opoiChallengeNonce;
+    *const_cast<COutPoint*>(&opoiChallengerCollateralIn) = tx.opoiChallengerCollateralIn;
+    *const_cast<uint8_t*>(&opoiResponsePhase) = tx.opoiResponsePhase;
+    *const_cast<std::vector<uint8_t>*>(&opoiResponseCommitHash) = tx.opoiResponseCommitHash;
+    *const_cast<std::vector<uint8_t>*>(&opoiResponseNonce) = tx.opoiResponseNonce;
+    *const_cast<std::vector<uint8_t>*>(&opoiVrfOutput) = tx.opoiVrfOutput;
+    *const_cast<std::string*>(&opoiModelId) = tx.opoiModelId;
+    *const_cast<uint8_t*>(&opoiTier) = tx.opoiTier;
+    *const_cast<uint256*>(&opoiPomRoot) = tx.opoiPomRoot;
+    *const_cast<std::vector<uint32_t>*>(&opoiHostedExpertIds) = tx.opoiHostedExpertIds;
+    *const_cast<uint32_t*>(&opoiPromptTokenCount) = tx.opoiPromptTokenCount;
+    *const_cast<uint8_t*>(&opoiIsCanary) = tx.opoiIsCanary;
+    *const_cast<uint256*>(&opoiTestSuite) = tx.opoiTestSuite;
+    *const_cast<std::string*>(&opoiFotonAddress) = tx.opoiFotonAddress;
+    *const_cast<uint8_t*>(&opoiFotonVerifyResult) = tx.opoiFotonVerifyResult;
+    *const_cast<COutPoint*>(&opoiFotonCollateralIn) = tx.opoiFotonCollateralIn;
+    *const_cast<uint8_t*>(&opoiModelArchType) = tx.opoiModelArchType;
+    *const_cast<uint64_t*>(&opoiModelTotalParams) = tx.opoiModelTotalParams;
+    *const_cast<uint64_t*>(&opoiModelActiveParamsPerToken) = tx.opoiModelActiveParamsPerToken;
+    *const_cast<uint32_t*>(&opoiModelNumLayers) = tx.opoiModelNumLayers;
+    *const_cast<uint32_t*>(&opoiModelNumDenseShards) = tx.opoiModelNumDenseShards;
+    *const_cast<uint32_t*>(&opoiModelNumExperts) = tx.opoiModelNumExperts;
+    *const_cast<uint32_t*>(&opoiModelTopKExperts) = tx.opoiModelTopKExperts;
+    *const_cast<std::vector<uint256>*>(&opoiModelExpertPomRoots) = tx.opoiModelExpertPomRoots;
+    *const_cast<CAmount*>(&opoiModelMinRewardPerToken) = tx.opoiModelMinRewardPerToken;
+    *const_cast<uint8_t*>(&opoiModelVoteApprove) = tx.opoiModelVoteApprove;
+    *const_cast<uint32_t*>(&opoiShardIndex) = tx.opoiShardIndex;
 
     return *this;
 }

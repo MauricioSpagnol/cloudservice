@@ -65,6 +65,16 @@ static const int8_t  OPOI_RESPONSE_TX_TYPE  = 2; // miner commits proof of infer
 static const int8_t  OPOI_STAKE_TX_TYPE     = 3; // miner locks collateral to participate
 static const int8_t  OPOI_UNSTAKE_TX_TYPE   = 4; // miner begins cooldown to reclaim collateral
 static const int8_t  OPOI_CHALLENGE_TX_TYPE = 5; // anyone disputes a RESPONSE within challenge window
+static const int8_t  OPOI_FOTON_VERIFY_TX_TYPE = 6; // FOTON verifier submits sandbox result
+static const int8_t  OPOI_MODEL_REGISTER_TX_TYPE = 7; // F15-A: propose a Model Manifest (dense/MoE/hybrid)
+static const int8_t  OPOI_MODEL_VOTE_TX_TYPE     = 8; // F15-A2: stake-weighted vote on a proposed model
+static const int8_t  OPOI_COORDINATOR_CLAIM_TX_TYPE = 9; // F15-C: VRF self-claim of shard coordinator role
+static const int8_t  OPOI_SHARD_RESULT_TX_TYPE      = 10; // F15-D: miner publishes a DenseShard/ExpertShard boundary output
+// Moved here (from opoi/opoi.h) because CTransaction::SerializationOp below is a template
+// whose body references OPOI_TASK_VERIFIABLE — two-phase lookup requires it to be visible
+// in every translation unit that parses this header, not just ones that also include opoi.h.
+static const int8_t  OPOI_TASK_OPEN       = 0; // Text/creative — no deterministic verifier
+static const int8_t  OPOI_TASK_VERIFIABLE = 1; // Code/math/SQL — verified by FOTON sandbox
 
 /**
  * A shielded input to a transaction. It contains data that describes a Spend transfer.
@@ -636,13 +646,66 @@ public:
     const std::string opoiMinerAddress;   // miner addr (RESPONSE / STAKE / UNSTAKE)
     const std::string opoiModel;          // Model name, e.g. "gemma3:4b" (REQUEST only)
     const uint256     opoiPromptHash;     // SHA-256 of the prompt (REQUEST only)
-    const uint256     opoiResponseHash;   // SHA-256 of the response (RESPONSE) / claimed hash (CHALLENGE)
-    const uint32_t    opoiMaxTokens;      // Max tokens (REQUEST only)
+    const uint256     opoiResponseHash;   // SHA-256 of the response text (RESPONSE) / claimed hash (CHALLENGE)
+    const uint256     opoiCommitment;     // model_fixed_forward(requestHash || responseHash) — RESPONSE only
+                                          // Anti-equivocation: proves miner committed to this response hash
+                                          // before seeing other responses. Does NOT prove LLM was executed.
+    const uint32_t    opoiMaxTokens;      // Max tokens requested (REQUEST only)
+    const uint32_t    opoiTokenCount;     // Actual tokens generated (RESPONSE only)
+    const int8_t      opoiTaskType;       // 0=OPEN (text/creative), 1=VERIFIABLE (code/math/SQL)
+    // F15-G: orthogonal to opoiTaskType — how deep a pipeline this request tolerates
+    const uint8_t     opoiTaskClass;      // 0=INTERACTIVE (tight latency budget), 1=BATCH
     const CAmount     opoiPayment;        // Reward (REQUEST) / stake amount (STAKE)
+    const CAmount     opoiFeePerToken;    // Per-token fee: total = opoiPayment + opoiTokenCount * opoiFeePerToken
     const uint32_t    opoiSigTime;        // Signature timestamp
-    const std::vector<unsigned char> opoiSig; // Signature by actor
+    const std::vector<unsigned char> opoiSig;      // Signature by actor
+    const std::vector<unsigned char> opoiVrfProof; // ECVRF proof (RFC 9381) using staking key (RESPONSE only)
     // Phase 3: escrow
     const COutPoint   opoiCollateralIn;   // Collateral UTXO reference (STAKE only)
+    // F8-C: Challenge commit-reveal (anti front-run)
+    const uint8_t              opoiChallengePhase;          // 0=COMMIT, 1=REVEAL
+    const std::vector<uint8_t> opoiCommitHash;              // SHA256(proofData||nonce) in COMMIT
+    const std::vector<uint8_t> opoiProofData;               // fraud_proof in REVEAL
+    const std::vector<uint8_t> opoiChallengeNonce;          // secret nonce in REVEAL
+    // F10-A: Challenger collateral (CHALLENGE only)
+    const COutPoint            opoiChallengerCollateralIn;  // challenger's pledged UTXO
+    // F10-B: Response commit-reveal (anti-copy)
+    const uint8_t              opoiResponsePhase;           // 0=COMMIT, 1=REVEAL
+    const std::vector<uint8_t> opoiResponseCommitHash;      // SHA256(responseText||nonce) in COMMIT
+    const std::vector<uint8_t> opoiResponseNonce;           // secret nonce in REVEAL
+    // F10-D: ECVRF output (RESPONSE only)
+    const std::vector<uint8_t> opoiVrfOutput;               // VRF output (32 bytes, RFC 9381)
+    // F9-B: Model tier and Proof-of-Model (STAKE only)
+    const std::string          opoiModelId;                 // model identifier e.g. "GEMMA_3_4B"
+    const uint8_t              opoiTier;                    // 0=light/1=default/2=high/3=veryhigh
+    const uint256              opoiPomRoot;                 // Merkle root of GGUF weights
+    // F15-E: which MoE experts this stake hosts (STAKE only; empty if dense-only miner)
+    const std::vector<uint32_t> opoiHostedExpertIds;
+    // F11-A: Prompt token count for fee calculation (REQUEST only)
+    const uint32_t             opoiPromptTokenCount;        // estimated tokens in prompt
+    // F9-F / F14-B: Canary flag + VERIFIABLE test suite (REQUEST only)
+    const uint8_t              opoiIsCanary;                // 1=auto-generated canary audit request
+    const uint256              opoiTestSuite;               // SHA256 of test suite (VERIFIABLE only)
+    // F14-C: FOTON verification result (FOTON_VERIFY type only)
+    const std::string          opoiFotonAddress;            // FOTON verifier's address
+    const uint8_t              opoiFotonVerifyResult;       // 0=PASS, 1=FAIL, 2=TIMEOUT
+    const COutPoint            opoiFotonCollateralIn;       // FOTON's locked collateral UTXO
+    // F15-A: Model Manifest registration (MODEL_REGISTER only) — opoiModelId/opoiPomRoot/opoiRequester reused
+    const uint8_t              opoiModelArchType;           // 0=DENSE, 1=MOE, 2=HYBRID
+    const uint64_t             opoiModelTotalParams;
+    const uint64_t             opoiModelActiveParamsPerToken;
+    const uint32_t             opoiModelNumLayers;
+    const uint32_t             opoiModelNumDenseShards;     // F15-B: pipeline stages for numLayers
+    const uint32_t             opoiModelNumExperts;         // 0 if DENSE
+    const uint32_t             opoiModelTopKExperts;        // 0 if DENSE
+    const std::vector<uint256> opoiModelExpertPomRoots;     // one per expert (empty if DENSE)
+    const CAmount              opoiModelMinRewardPerToken;
+    // F15-A2: Model vote (MODEL_VOTE only) — opoiModelId/opoiRequester reused (voter address)
+    const uint8_t              opoiModelVoteApprove;        // 0=reject, 1=approve
+    // F15-D: shard boundary result (SHARD_RESULT only) — opoiRequestId/opoiMinerAddress/
+    // opoiVrfProof reused; opoiResponseHash doubles as boundaryOutputHash, opoiCommitment
+    // doubles as routerLogitsHash (zero if this shard isn't a MoE router boundary)
+    const uint32_t             opoiShardIndex;
 
 
     /** Construct a CTransaction that qualifies as IsNull() */
@@ -771,20 +834,89 @@ public:
                 READWRITE(*const_cast<uint256*>(&opoiPromptHash));
                 READWRITE(*const_cast<uint32_t*>(&opoiMaxTokens));
                 READWRITE(*const_cast<CAmount*>(&opoiPayment));
+                READWRITE(*const_cast<CAmount*>(&opoiFeePerToken));
+                READWRITE(*const_cast<int8_t*>(&opoiTaskType));
+                READWRITE(*const_cast<uint8_t*>(&opoiTaskClass));
+                READWRITE(*const_cast<uint32_t*>(&opoiPromptTokenCount));
+                READWRITE(*const_cast<uint8_t*>(&opoiIsCanary));
+                if (opoiTaskType == OPOI_TASK_VERIFIABLE)
+                    READWRITE(*const_cast<uint256*>(&opoiTestSuite));
             } else if (nType == OPOI_RESPONSE_TX_TYPE) {
                 READWRITE(*const_cast<std::string*>(&opoiRequestId));
                 READWRITE(*const_cast<std::string*>(&opoiMinerAddress));
-                READWRITE(*const_cast<uint256*>(&opoiResponseHash));
+                READWRITE(*const_cast<uint8_t*>(&opoiResponsePhase));
+                if (opoiResponsePhase == 0) {
+                    // COMMIT: only the commit hash (hides response content)
+                    READWRITE(*const_cast<std::vector<uint8_t>*>(&opoiResponseCommitHash));
+                } else {
+                    // REVEAL: response + commitment + token count
+                    READWRITE(*const_cast<uint256*>(&opoiResponseHash));
+                    READWRITE(*const_cast<uint256*>(&opoiCommitment));
+                    READWRITE(*const_cast<uint32_t*>(&opoiTokenCount));
+                    READWRITE(*const_cast<std::vector<uint8_t>*>(&opoiResponseNonce));
+                    if (!(s.GetType() & SER_GETHASH)) {
+                        READWRITE(*const_cast<std::vector<uint8_t>*>(&opoiVrfProof));
+                        READWRITE(*const_cast<std::vector<uint8_t>*>(&opoiVrfOutput));
+                    }
+                }
             } else if (nType == OPOI_STAKE_TX_TYPE) {
                 READWRITE(*const_cast<std::string*>(&opoiMinerAddress));
                 READWRITE(*const_cast<COutPoint*>(&opoiCollateralIn));
                 READWRITE(*const_cast<CAmount*>(&opoiPayment));
+                READWRITE(*const_cast<std::string*>(&opoiModelId));
+                READWRITE(*const_cast<uint8_t*>(&opoiTier));
+                READWRITE(*const_cast<uint256*>(&opoiPomRoot));
+                READWRITE(*const_cast<std::vector<uint32_t>*>(&opoiHostedExpertIds));
             } else if (nType == OPOI_UNSTAKE_TX_TYPE) {
                 READWRITE(*const_cast<std::string*>(&opoiMinerAddress));
             } else if (nType == OPOI_CHALLENGE_TX_TYPE) {
                 READWRITE(*const_cast<std::string*>(&opoiRequestId));
                 READWRITE(*const_cast<std::string*>(&opoiRequester));
-                READWRITE(*const_cast<uint256*>(&opoiResponseHash));
+                READWRITE(*const_cast<uint8_t*>(&opoiChallengePhase));
+                READWRITE(*const_cast<COutPoint*>(&opoiChallengerCollateralIn));
+                if (opoiChallengePhase == 0) {
+                    // COMMIT: only the commit hash
+                    READWRITE(*const_cast<std::vector<uint8_t>*>(&opoiCommitHash));
+                } else {
+                    // REVEAL: fraud proof + nonce
+                    READWRITE(*const_cast<std::vector<uint8_t>*>(&opoiProofData));
+                    READWRITE(*const_cast<std::vector<uint8_t>*>(&opoiChallengeNonce));
+                }
+            } else if (nType == OPOI_FOTON_VERIFY_TX_TYPE) {
+                READWRITE(*const_cast<std::string*>(&opoiRequestId));
+                READWRITE(*const_cast<std::string*>(&opoiFotonAddress));
+                READWRITE(*const_cast<uint8_t*>(&opoiFotonVerifyResult));
+                READWRITE(*const_cast<COutPoint*>(&opoiFotonCollateralIn));
+            } else if (nType == OPOI_MODEL_REGISTER_TX_TYPE) {
+                READWRITE(*const_cast<std::string*>(&opoiModelId));
+                READWRITE(*const_cast<std::string*>(&opoiRequester));       // proposer
+                READWRITE(*const_cast<uint8_t*>(&opoiModelArchType));
+                READWRITE(*const_cast<uint64_t*>(&opoiModelTotalParams));
+                READWRITE(*const_cast<uint64_t*>(&opoiModelActiveParamsPerToken));
+                READWRITE(*const_cast<uint32_t*>(&opoiModelNumLayers));
+                READWRITE(*const_cast<uint32_t*>(&opoiModelNumDenseShards));
+                READWRITE(*const_cast<uint32_t*>(&opoiModelNumExperts));
+                READWRITE(*const_cast<uint32_t*>(&opoiModelTopKExperts));
+                READWRITE(*const_cast<uint256*>(&opoiPomRoot));            // backbone POM root
+                READWRITE(*const_cast<std::vector<uint256>*>(&opoiModelExpertPomRoots));
+                READWRITE(*const_cast<CAmount*>(&opoiModelMinRewardPerToken));
+            } else if (nType == OPOI_MODEL_VOTE_TX_TYPE) {
+                READWRITE(*const_cast<std::string*>(&opoiModelId));
+                READWRITE(*const_cast<std::string*>(&opoiRequester));       // voter
+                READWRITE(*const_cast<uint8_t*>(&opoiModelVoteApprove));
+            } else if (nType == OPOI_COORDINATOR_CLAIM_TX_TYPE) {
+                READWRITE(*const_cast<std::string*>(&opoiRequestId));
+                READWRITE(*const_cast<std::string*>(&opoiMinerAddress));    // claimant
+                if (!(s.GetType() & SER_GETHASH))
+                    READWRITE(*const_cast<std::vector<unsigned char>*>(&opoiVrfProof));
+            } else if (nType == OPOI_SHARD_RESULT_TX_TYPE) {
+                READWRITE(*const_cast<std::string*>(&opoiRequestId));
+                READWRITE(*const_cast<uint32_t*>(&opoiShardIndex));
+                READWRITE(*const_cast<std::string*>(&opoiMinerAddress));
+                READWRITE(*const_cast<uint256*>(&opoiResponseHash));   // boundaryOutputHash
+                READWRITE(*const_cast<uint256*>(&opoiCommitment));     // routerLogitsHash (zero if N/A)
+                if (!(s.GetType() & SER_GETHASH))
+                    READWRITE(*const_cast<std::vector<unsigned char>*>(&opoiVrfProof));
             }
             if (!(s.GetType() & SER_GETHASH))
                 READWRITE(*const_cast<std::vector<unsigned char>*>(&opoiSig));
@@ -852,6 +984,22 @@ public:
 
     bool IsOPoIChallenge() const {
         return IsOPoITx() && nType == OPOI_CHALLENGE_TX_TYPE;
+    }
+
+    bool IsOPoIModelRegister() const {
+        return IsOPoITx() && nType == OPOI_MODEL_REGISTER_TX_TYPE;
+    }
+
+    bool IsOPoIModelVote() const {
+        return IsOPoITx() && nType == OPOI_MODEL_VOTE_TX_TYPE;
+    }
+
+    bool IsOPoICoordinatorClaim() const {
+        return IsOPoITx() && nType == OPOI_COORDINATOR_CLAIM_TX_TYPE;
+    }
+
+    bool IsOPoIShardResult() const {
+        return IsOPoITx() && nType == OPOI_SHARD_RESULT_TX_TYPE;
     }
 
     bool IsFluxnodeUpgradeTx() const {
@@ -988,11 +1136,57 @@ struct CMutableTransaction
     std::string opoiModel;
     uint256     opoiPromptHash;
     uint256     opoiResponseHash;
+    uint256     opoiCommitment;   // Anti-equivocation: model_fixed_forward(requestHash || responseHash)
     uint32_t    opoiMaxTokens;
+    uint32_t    opoiTokenCount;   // Actual tokens generated (RESPONSE only)
+    int8_t      opoiTaskType;     // 0=OPEN, 1=VERIFIABLE
+    uint8_t     opoiTaskClass     = 0; // F15-G: 0=INTERACTIVE, 1=BATCH
     CAmount     opoiPayment;
+    CAmount     opoiFeePerToken;  // Per-token fee component (REQUEST only)
     uint32_t    opoiSigTime;
     std::vector<unsigned char> opoiSig;
+    std::vector<unsigned char> opoiVrfProof; // ECVRF proof (RFC 9381) — RESPONSE only
     COutPoint   opoiCollateralIn;  // Phase 3: collateral UTXO (STAKE only)
+    // F8-C
+    uint8_t              opoiChallengePhase        = 0;
+    std::vector<uint8_t> opoiCommitHash;
+    std::vector<uint8_t> opoiProofData;
+    std::vector<uint8_t> opoiChallengeNonce;
+    // F10-A
+    COutPoint            opoiChallengerCollateralIn;
+    // F10-B
+    uint8_t              opoiResponsePhase         = 0;
+    std::vector<uint8_t> opoiResponseCommitHash;
+    std::vector<uint8_t> opoiResponseNonce;
+    // F10-D
+    std::vector<uint8_t> opoiVrfOutput;
+    // F9-B
+    std::string          opoiModelId;
+    uint8_t              opoiTier                  = 0;
+    uint256              opoiPomRoot;
+    // F15-E
+    std::vector<uint32_t> opoiHostedExpertIds;
+    // F11-A
+    uint32_t             opoiPromptTokenCount      = 0;
+    // F9-F / F14-B
+    uint8_t              opoiIsCanary              = 0;
+    uint256              opoiTestSuite;
+    // F14-C
+    std::string          opoiFotonAddress;
+    uint8_t              opoiFotonVerifyResult     = 0;
+    COutPoint            opoiFotonCollateralIn;
+    // F15-A / F15-A2
+    uint8_t              opoiModelArchType             = 0;
+    uint64_t             opoiModelTotalParams          = 0;
+    uint64_t             opoiModelActiveParamsPerToken = 0;
+    uint32_t             opoiModelNumLayers            = 0;
+    uint32_t             opoiModelNumDenseShards       = 0;
+    uint32_t             opoiModelNumExperts           = 0;
+    uint32_t             opoiModelTopKExperts          = 0;
+    std::vector<uint256> opoiModelExpertPomRoots;
+    CAmount              opoiModelMinRewardPerToken    = 0;
+    uint8_t              opoiModelVoteApprove          = 0;
+    uint32_t             opoiShardIndex                = 0;
 
     CMutableTransaction();
     CMutableTransaction(const CTransaction& tx);
@@ -1104,17 +1298,93 @@ struct CMutableTransaction
             return;
         } else if (nVersion == OPOI_TX_VERSION) {
             READWRITE(nType);
-            READWRITE(opoiRequestId);
             READWRITE(opoiSigTime);
             if (nType == OPOI_REQUEST_TX_TYPE) {
+                READWRITE(opoiRequestId);
                 READWRITE(opoiRequester);
                 READWRITE(opoiModel);
                 READWRITE(opoiPromptHash);
                 READWRITE(opoiMaxTokens);
                 READWRITE(opoiPayment);
+                READWRITE(opoiFeePerToken);
+                READWRITE(opoiTaskType);
+                READWRITE(opoiTaskClass);
+                READWRITE(opoiPromptTokenCount);
+                READWRITE(opoiIsCanary);
+                if (opoiTaskType == OPOI_TASK_VERIFIABLE)
+                    READWRITE(opoiTestSuite);
             } else if (nType == OPOI_RESPONSE_TX_TYPE) {
+                READWRITE(opoiRequestId);
+                READWRITE(opoiMinerAddress);
+                READWRITE(opoiResponsePhase);
+                if (opoiResponsePhase == 0) {
+                    READWRITE(opoiResponseCommitHash);
+                } else {
+                    READWRITE(opoiResponseHash);
+                    READWRITE(opoiCommitment);
+                    READWRITE(opoiTokenCount);
+                    READWRITE(opoiResponseNonce);
+                    if (!(s.GetType() & SER_GETHASH)) {
+                        READWRITE(opoiVrfProof);
+                        READWRITE(opoiVrfOutput);
+                    }
+                }
+            } else if (nType == OPOI_STAKE_TX_TYPE) {
+                READWRITE(opoiMinerAddress);
+                READWRITE(opoiCollateralIn);
+                READWRITE(opoiPayment);
+                READWRITE(opoiModelId);
+                READWRITE(opoiTier);
+                READWRITE(opoiPomRoot);
+                READWRITE(opoiHostedExpertIds);
+            } else if (nType == OPOI_UNSTAKE_TX_TYPE) {
+                READWRITE(opoiMinerAddress);
+            } else if (nType == OPOI_CHALLENGE_TX_TYPE) {
+                READWRITE(opoiRequestId);
+                READWRITE(opoiRequester);
+                READWRITE(opoiChallengePhase);
+                READWRITE(opoiChallengerCollateralIn);
+                if (opoiChallengePhase == 0) {
+                    READWRITE(opoiCommitHash);
+                } else {
+                    READWRITE(opoiProofData);
+                    READWRITE(opoiChallengeNonce);
+                }
+            } else if (nType == OPOI_FOTON_VERIFY_TX_TYPE) {
+                READWRITE(opoiRequestId);
+                READWRITE(opoiFotonAddress);
+                READWRITE(opoiFotonVerifyResult);
+                READWRITE(opoiFotonCollateralIn);
+            } else if (nType == OPOI_MODEL_REGISTER_TX_TYPE) {
+                READWRITE(opoiModelId);
+                READWRITE(opoiRequester);
+                READWRITE(opoiModelArchType);
+                READWRITE(opoiModelTotalParams);
+                READWRITE(opoiModelActiveParamsPerToken);
+                READWRITE(opoiModelNumLayers);
+                READWRITE(opoiModelNumDenseShards);
+                READWRITE(opoiModelNumExperts);
+                READWRITE(opoiModelTopKExperts);
+                READWRITE(opoiPomRoot);
+                READWRITE(opoiModelExpertPomRoots);
+                READWRITE(opoiModelMinRewardPerToken);
+            } else if (nType == OPOI_MODEL_VOTE_TX_TYPE) {
+                READWRITE(opoiModelId);
+                READWRITE(opoiRequester);
+                READWRITE(opoiModelVoteApprove);
+            } else if (nType == OPOI_COORDINATOR_CLAIM_TX_TYPE) {
+                READWRITE(opoiRequestId);
+                READWRITE(opoiMinerAddress);
+                if (!(s.GetType() & SER_GETHASH))
+                    READWRITE(opoiVrfProof);
+            } else if (nType == OPOI_SHARD_RESULT_TX_TYPE) {
+                READWRITE(opoiRequestId);
+                READWRITE(opoiShardIndex);
                 READWRITE(opoiMinerAddress);
                 READWRITE(opoiResponseHash);
+                READWRITE(opoiCommitment);
+                if (!(s.GetType() & SER_GETHASH))
+                    READWRITE(opoiVrfProof);
             }
             if (!(s.GetType() & SER_GETHASH))
                 READWRITE(opoiSig);

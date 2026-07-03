@@ -139,6 +139,50 @@ struct Params {
     int     nOPoIChallengeWindowBlocks = 144; // blocks after RESPONSE during which CHALLENGE is valid
     int     nOPoIUnstakeCooldownBlocks = 1440;// blocks after UNSTAKE before collateral is released
 
+    /** OPoI Phase 5 — challenger reward **/
+    int     nOPoIChallengerRewardPct   = 10;  // % of staked amount paid to challenger on successful slash
+
+    /** OPoI Phase 6 — request expiry **/
+    int     nOPoIRequestExpiryBlocks   = 2016;// blocks a PENDING request stays valid (mainnet ~2 weeks)
+
+    /** OPoI subsidy allocation — dedicated inference budget **/
+    double  nOPoISubsidyPct            = 0.10;// 10% of block subsidy reserved for OPoI miners (cap per block)
+
+    /** OPoI v3 — fee per token (F11-A) **/
+    // Default baseFee = payment in REQUEST; totalPayment = baseFee + tokenCount * feePerToken
+    // feePerToken is specified per-request; this is the network default cap (0 = no default)
+    int64_t nOPoIDefaultFeePerToken    = 0;   // zatoshis per token (regtest/testnet may set > 0)
+
+    /** OPoI v3 — FOTON verifiers (F14-C) **/
+    // Minimum number of FOTON verifiers for VERIFIABLE tasks — must be odd ≥ 3
+    int     nOPoIMinFotonVerifiers     = 3;
+
+    /** OPoI v3 — ECVRF threshold (F10-D) **/
+    // Fixed VRF threshold: eligible = VRF_output < threshold
+    // Value = 2^256 * 3 / 1000 ≈ selects ~3 miners per request (assumes ~1000 active miners)
+    // Stored as hex string for arith_uint256 comparison in CheckOPoITransaction
+    std::string nOPoIVrfThreshold      = "004C4B40000000000000000000000000000000000000000000000000000000000";
+
+    /** F15-A2 — Model Manifest governance (register new dense/MoE/hybrid models via stake vote) **/
+    int     nOPoIModelVoteWindowBlocks      = 200;  // how long a proposed model stays open to voting
+    int     nOPoIModelApprovalPct           = 66;   // % of total ACTIVE stake needed to approve
+    int     nOPoIModelActivationDelayBlocks = 100;  // grace period after approval before minable
+
+    /** F15-C — Shard coordinator VRF self-claim (same mechanism as nOPoIVrfThreshold,
+     *  different domain-separated seed: SHA256(prevBlockHash || requestId || "COORD")).
+     *  Calibrated so ~3 coordinators self-select per request on average. **/
+    std::string nOPoICoordinatorThreshold   = "004C4B40000000000000000000000000000000000000000000000000000000000";
+
+    /** F15-D — shard boundary result: how many independent submissions before a
+     *  shard's majority output is considered resolved. Same VRF-eligibility
+     *  mechanism (domain-separated "SHARD"+shardIndex) governs who may submit. **/
+    std::string nOPoIShardThreshold         = "004C4B40000000000000000000000000000000000000000000000000000000000";
+    int         nOPoIShardMinSubmissions    = 3;    // R in the design doc — miners per shard
+
+    /** F15-G — latency budget: max sequential DenseShards a task_class=INTERACTIVE
+     *  request's model may have. Deeper models must be requested as BATCH. **/
+    int         nOPoIMaxPipelineDepth       = 6;
+
 };
 } // namespace Consensus
 

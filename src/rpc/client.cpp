@@ -151,10 +151,17 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "getchaintips", 0 },
     // OPoI
     { "stakeopoi",          2 },   // collateral_vout (integer)
+    { "stakeopoi",          3 },   // hosted_expert_ids (array) — F15-E
     { "submitopoirequest",  3 },   // max_tokens (integer)
     { "submitopoirequest",  4 },   // payment (integer/amount)
     { "listopoirequests",   0 },   // verbose (bool treated as int)
-    { "listopoiresponses",  0 }
+    { "listopoiresponses",  0 },
+    // F15-A/A2
+    { "registermodelopoi",  0 },   // manifest_json (object)
+    { "votemodelopoi",      2 },   // approve (bool)
+    // F15-D
+    { "submitshardresult",  1 },   // shard_index (integer)
+    { "getshardresult",     1 }    // shard_index (integer)
 };
 
 class CRPCConvertTable

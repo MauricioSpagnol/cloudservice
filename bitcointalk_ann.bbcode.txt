@@ -1,0 +1,145 @@
+[center]
+[img]https://i.imgur.com/HArBhSx.png[/img]
+
+[size=24pt][b]Cloud Service (CS) | Layer 1 | PoW | ZelHash (GPU) | Decentralized Cloud[/b][/size]
+
+[color=#1e90ff]═══════════════════════════════════════════════════════════════════[/color]
+[/center]
+
+[center][b][size=14pt]
+[[url=https://cscloudservice.com]Website[/url]]  [[url=https://github.com/MauricioSpagnol/cloudservice]GitHub[/url]]  [[url=https://wallet.cscloudservice.com]Wallet[/url]]  [[url=https://discord.gg/7VpuvgCyuq]Discord[/url]]
+[/size][/b][/center]
+
+[color=#1e90ff]─────────────────────────────────────────────────────────────────[/color]
+
+[b][size=14pt]◆ ABSTRACT[/size][/b]
+
+Cloud Service is a new Layer 1 Proof-of-Work blockchain whose founding mission is stated in its genesis block:
+
+[quote]"01/May/2026 — 94% of Global Cloud Controlled by Big Tech as Computing Demand Soars. Now It Belongs to Everyone."[/quote]
+
+Cloud Service is built on the Flux/Zcash protocol codebase — not a naive Bitcoin clone. It inherits Equihash-based PoW with GPU-friendly ZelHash, Sapling shielded transactions, DigiShield + LWMA difficulty adjustment, and a tiered node infrastructure layer. The network is designed to underpin a decentralized public cloud: miners secure the ledger, nodes provide compute capacity, and the protocol funds its own ecosystem without relying on an ICO, pre-sale, or external venture capital.
+
+[color=#1e90ff]─────────────────────────────────────────────────────────────────[/color]
+
+[b][size=14pt]◆ TECHNICAL SPECIFICATIONS[/size][/b]
+
+[table][tr][td][b]Crypto Name[/b][/td][td]Cloud Service[/td][/tr]
+[tr][td][b]Ticker[/b][/td][td]CS[/td][/tr]
+[tr][td][b]Blockchain[/b][/td][td]Public, Layer 1[/td][/tr]
+[tr][td][b]Consensus[/b][/td][td]Proof of Work (PoW)[/td][/tr]
+[tr][td][b]Mining Algorithm[/b][/td][td]ZelHash — Equihash(125, 4) — GPU-friendly, ASIC-resistant[/td][/tr]
+[tr][td][b]Block Time[/b][/td][td]2 minutes[/td][/tr]
+[tr][td][b]Block Reward[/b][/td][td]150 CS (after slow-start ramp, blocks 2–20,000)[/td][/tr]
+[tr][td][b]Halving Interval[/b][/td][td]655,350 blocks (~2.5 years)[/td][/tr]
+[tr][td][b]Emission Schedule[/b][/td][td]150 CS → 75 CS → 37.5 CS (permanent, no supply cap)[/td][/tr]
+[tr][td][b]Coinbase Maturity[/b][/td][td]100 blocks[/td][/tr]
+[tr][td][b]Difficulty Adjustment[/b][/td][td]DigiShield (17-block window) + LWMA (60-block window)[/td][/tr]
+[tr][td][b]Privacy[/b][/td][td]Sapling shielded transactions (zk-SNARKs)[/td][/tr]
+[tr][td][b]P2P Port[/b][/td][td]26125 (mainnet) / 26128 (testnet)[/td][/tr]
+[tr][td][b]RPC Port[/b][/td][td]26124 (mainnet)[/td][/tr]
+[tr][td][b]Address Prefix[/b][/td][td]t1… (transparent) / csa… (shielded)[/td][/tr]
+[tr][td][b]Genesis Block[/b][/td][td]069c0f4ff0427ee02edb625106bdf0e7fd4e28845dee020a493e9d8fd47c09c3[/td][/tr]
+[tr][td][b]Protocol Base[/b][/td][td]Flux / Zcash codebase[/td][/tr]
+[tr][td][b]BIP44 Coin Type[/b][/td][td]19999[/td][/tr]
+[tr][td][b]Magic Bytes[/b][/td][td]0xC5 0x53 0x01 0x01[/td][/tr][/table]
+
+[color=#1e90ff]─────────────────────────────────────────────────────────────────[/color]
+
+[b][size=14pt]◆ EMISSION SCHEDULE DETAIL[/size][/b]
+
+[list]
+[li][b]Block 1:[/b] 13,020,000 CS — initial infrastructure allocation (see fund disclosure below)[/li]
+[li][b]Blocks 2–10,000:[/b] Slow-start ramp (linearly increasing from ~0 to 150 CS)[/li]
+[li][b]Blocks 10,001–20,000:[/b] Slow-start ramp continuation (linearly approaching 150 CS)[/li]
+[li][b]Blocks 20,001–655,350:[/b] 150 CS per block[/li]
+[li][b]Halving 1 (block ~675,350):[/b] 75 CS per block[/li]
+[li][b]Halving 2 (block ~1,330,700):[/b] 37.5 CS per block — [b]permanently stabilized[/b][/li]
+[li][b]No further halvings after round 2.[/b] Emission continues permanently at 37.5 CS/block with no end date.[/li]
+[/list]
+
+[b]Rationale for stable emission:[/b] The 150 CS block reward is split across miners and multiple tiers of infrastructure nodes. After two halvings the reward stabilizes at 37.5 CS so that node operators retain a predictable long-term incentive without the revenue cliff that indefinite halving creates. Natural deflation occurs through lost wallets and transaction fees.
+
+[color=#1e90ff]─────────────────────────────────────────────────────────────────[/color]
+
+[b][size=14pt]◆ WHAT IS DIFFERENT FROM BITCOIN / FLUX?[/size][/b]
+
+[b]Why not just use Bitcoin?[/b]
+Bitcoin's 10-minute blocks, SHA-256 ASIC dominance, and absence of a native node infrastructure layer make it unsuitable as the base layer for a decentralized cloud network. Cloud Service inherits the battle-tested Flux/Zcash protocol and makes targeted changes:
+
+[list=1]
+[li][b]ZelHash (Equihash 125,4):[/b] GPU-optimized PoW algorithm. Keeps mining accessible to commodity hardware and distributes hash power geographically.[/li]
+[li][b]2-minute block time:[/b] Faster finality for cloud workload settlements versus Bitcoin's 10-minute and Zcash's 75-second intervals.[/li]
+[li][b]Stabilized emission (no cliff after halving 2):[/b] Prevents the node-operator revenue collapse that undermines long-lived infrastructure networks.[/li]
+[li][b]New genesis chain:[/b] Cloud Service is not a merge-mine or airdrop derivative. It is a standalone new chain with its own genesis block, magic bytes (0xC5 0x53), and P2P ports.[/li]
+[li][b]CS-specific DNS seeds and network identity:[/b] Fully independent P2P network (seed.cscloudservice.com).[/li]
+[li][b]Sapling privacy layer inherited:[/b] Shielded transactions available from genesis, providing optional privacy for compute service payments.[/li]
+[li][b]Tiered node infrastructure:[/b] P2SH-secured node registration allows operators to contribute compute resources and earn a share of the block reward.[/li]
+[/list]
+
+[color=#1e90ff]─────────────────────────────────────────────────────────────────[/color]
+
+[b][size=14pt][color=#ff4444]◆ FULL FUND DISCLOSURE (No Hidden Allocations)[/color][/size][/b]
+
+The protocol contains scheduled on-chain fund disbursements to specific addresses. These are hard-coded in the consensus layer and fully auditable in the source code. All amounts and destination addresses are public:
+
+[table][tr][td][b]Fund[/b][/td][td][b]Amount[/b][/td][td][b]Block Height[/b][/td][td][b]Purpose[/b][/td][/tr]
+[tr][td]Block 1 Allocation[/td][td]13,020,000 CS[/td][td]1[/td][td]Initial infrastructure bootstrap[/td][/tr]
+[tr][td]Exchange Fund[/td][td]100,000,000 CS[/td][td]100,000[/td][td]CEX listing & liquidity[/td][/tr]
+[tr][td]Foundation Fund[/td][td]10,000,000 CS[/td][td]101,000[/td][td]Non-profit foundation[/td][/tr]
+[tr][td]Swap Pool[/td][td]20,000,000 CS × 10 installments[/td][td]Every 21,600 blocks from block 102,000[/td][td]DEX liquidity / ecosystem swaps[/td][/tr]
+[tr][td]Dev Fund[/td][td]5,000,000 CS × 100 installments[/td][td]Every 21,600 blocks from block 150,000[/td][td]Core development (~8.3 years)[/td][/tr]
+[tr][td]Marketing Fund[/td][td]5,000,000 CS × 100 installments[/td][td]Every 21,600 blocks from block 150,001[/td][td]Ecosystem growth (~8.3 years)[/td][/tr][/table]
+
+
+[b]These disbursements are enforced by consensus rules and verifiable by any full node.[/b]
+
+[color=#1e90ff]─────────────────────────────────────────────────────────────────[/color]
+
+[b][size=14pt]◆ SOURCE CODE & OFFICIAL LINKS[/size][/b]
+
+[list]
+[li][b]GitHub (Source Code):[/b] [url=https://github.com/MauricioSpagnol/cloudservice]https://github.com/MauricioSpagnol/cloudservice[/url][/li]
+[li][b]Website:[/b] [url=https://cscloudservice.com]https://cscloudservice.com[/url][/li]
+[li][b]Wallet:[/b] [url=https://wallet.cscloudservice.com]https://wallet.cscloudservice.com[/url][/li]
+[li][b]Mining Pool:[/b] [url=https://miningtothelastblock.top]https://miningtothelastblock.top[/url][/li]
+[li][b]DEX[/b]
+[url=https://raydium.io/swap/?inputMint=sol&outputMint=4DPNajyRLd4KRkyCpEnRnCqg9HEMZcsPzX5w3PiCeuWd]https://raydium.io/swap/?inputMint=sol&outputMint=4DPNajyRLd4KRkyCpEnRnCqg9HEMZcsPzX5w3PiCeuWd[/url][/li]
+
+[/list]
+
+[color=#1e90ff]─────────────────────────────────────────────────────────────────[/color]
+
+[b][size=14pt]◆ HOW TO PARTICIPATE — BUILD & RUN A NODE[/size][/b]
+
+Full documentation: [url=https://docs.cscloudservice.com]https://docs.cscloudservice.com[/url]
+
+[color=#1e90ff]─────────────────────────────────────────────────────────────────[/color]
+
+[b][size=14pt]◆ MINING[/size][/b]
+
+Cloud Service uses [b]ZelHash (Equihash 125,4)[/b] — GPU mining. ASIC miners will not work on this network.
+
+[b]Recommended miners:[/b]
+[list]
+[li]lolMiner[/li]
+[li]MiniZ[/li]
+[li]NVIDIA: T-Rex (check ZelHash support)[/li]
+[/list]
+
+[b]Pool mining:[/b] [url=https://miningtothelastblock.top]https://miningtothelastblock.top[/url]
+
+[color=#1e90ff]─────────────────────────────────────────────────────────────────[/color]
+
+[b][size=14pt]◆ COMMUNITY[/size][/b]
+
+[list]
+[li][b]Bitcointalk:[/b] This thread[/li]
+[li][b]Discord:[/b] [url=https://discord.gg/7VpuvgCyuq]https://discord.gg/7VpuvgCyuq[/url][/li]
+[/list]
+
+[color=#1e90ff]─────────────────────────────────────────────────────────────────[/color]
+
+[center][size=10pt][i]The Cloud Service source code is open-source and distributed under the MIT License.
+All fund allocations listed above are hardcoded in consensus and publicly verifiable.
+This is not financial advice. Mining and running nodes carries risk.[/i][/size][/center]
