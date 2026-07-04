@@ -880,6 +880,20 @@ public:
             } else if (nType == OPOI_CHALLENGE_TX_TYPE) {
                 READWRITE(*const_cast<std::string*>(&opoiRequestId));
                 READWRITE(*const_cast<std::string*>(&opoiRequester));
+                // F13-A bug fix (2026-07-04): opoiResponseHash (the claimed
+                // correct response hash — what CheckOPoITransaction actually
+                // validates via IsNull(), regardless of phase) was never
+                // serialized here at all — challengeopoi's CHALLENGE tx
+                // stayed valid only in the creating node's own in-memory
+                // object; the moment it round-tripped through real
+                // serialize/deserialize (mined into a block and relayed to
+                // a peer — never exercised by any single-node regtest
+                // session before this one), the peer saw a null hash and
+                // rejected the whole block. Same bug class as the
+                // opoiResponsePhase fix from 2026-07-02, now found in
+                // CHALLENGE instead of RESPONSE — first genuine multi-node
+                // test caught it.
+                READWRITE(*const_cast<uint256*>(&opoiResponseHash));
                 READWRITE(*const_cast<uint8_t*>(&opoiChallengePhase));
                 READWRITE(*const_cast<COutPoint*>(&opoiChallengerCollateralIn));
                 if (opoiChallengePhase == 0) {
@@ -1354,6 +1368,7 @@ struct CMutableTransaction
             } else if (nType == OPOI_CHALLENGE_TX_TYPE) {
                 READWRITE(opoiRequestId);
                 READWRITE(opoiRequester);
+                READWRITE(opoiResponseHash);   // F13-A bug fix — see const template above
                 READWRITE(opoiChallengePhase);
                 READWRITE(opoiChallengerCollateralIn);
                 if (opoiChallengePhase == 0) {

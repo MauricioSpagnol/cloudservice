@@ -1,0 +1,34 @@
+Modern glibc (>= 2.36, e.g. Ubuntu 22.04+) provides arc4random()/arc4random_buf()
+but not the legacy BSD arc4random_addrandom()/arc4random_stir() reseed hooks.
+evutil_secure_rng_add_bytes() calls arc4random_addrandom() unconditionally,
+regardless of which PRNG backend the rest of this file selected — this breaks
+the final link of anything linking libevent (undefined reference) on any libc
+missing just that one legacy symbol.
+
+glibc's arc4random()/arc4random_buf() already reseed themselves internally
+(from the kernel CSPRNG) without needing external entropy hints, so making
+this a no-op when EVENT__HAVE_ARC4RANDOM is set (i.e. we're using the
+system's real arc4random family, not libevent's own bundled fallback further
+down in this same file, which still has its own working arc4random_addrandom)
+is safe: this call was always just a hint, its absence does not weaken the
+actual randomness source used for anything else in the codebase.
+
+--- a/evutil_rand.c
++++ b/evutil_rand.c
+@@ -195,8 +195,16 @@
+ void
+ evutil_secure_rng_add_bytes(const char *buf, size_t n)
+ {
++#ifdef EVENT__HAVE_ARC4RANDOM
++	/* Using the system arc4random() family: it already self-reseeds
++	 * internally, and modern glibc doesn't expose the legacy
++	 * arc4random_addrandom() hook this call would otherwise need. */
++	(void)buf;
++	(void)n;
++#else
+ 	arc4random_addrandom((unsigned char*)buf,
+ 	    n>(size_t)INT_MAX ? INT_MAX : (int)n);
++#endif
+ }
+
+ void
