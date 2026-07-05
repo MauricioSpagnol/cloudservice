@@ -186,6 +186,10 @@ public:
         consensus.nOPoIUnstakeCooldownBlocks = 1440;        // ~10 hours cooldown
         consensus.nOPoIRequestExpiryBlocks   = 2016;        // ~14 days PENDING before expiry
 
+        // F14-C — Auditors (verify VERIFIABLE-task responses against a test suite)
+        consensus.nOPoIMinAuditors           = 3;           // odd ≥ 3, majority always decisive
+        consensus.nOPoIAuditorMinCollateral  = 50 * COIN;   // 50 CS minimum collateral
+
         // F15-A2 — Model Manifest governance
         consensus.nOPoIModelVoteWindowBlocks      = 4032;   // ~4 weeks voting window
         consensus.nOPoIModelApprovalPct           = 66;     // 66% of active stake to approve
@@ -376,6 +380,10 @@ public:
         consensus.nOPoIUnstakeCooldownBlocks = 60;          // ~25 minutes on testnet
         consensus.nOPoIRequestExpiryBlocks   = 200;         // ~83 minutes PENDING before expiry
 
+        // F14-C — Auditors (testnet — lower collateral for easier testing)
+        consensus.nOPoIMinAuditors           = 3;
+        consensus.nOPoIAuditorMinCollateral  = 5 * COIN;
+
         // F15-A2 — Model Manifest governance (testnet — faster cycle)
         consensus.nOPoIModelVoteWindowBlocks      = 200;
         consensus.nOPoIModelApprovalPct           = 66;
@@ -541,6 +549,10 @@ public:
         consensus.nOPoIChallengeWindowBlocks = 5;
         consensus.nOPoIUnstakeCooldownBlocks = 10;
         consensus.nOPoIRequestExpiryBlocks   = 20;           // 20 blocks PENDING before expiry in regtest
+
+        // F14-C — Auditors (regtest — quorum of 1 so a single-node test can resolve it)
+        consensus.nOPoIMinAuditors           = 1;
+        consensus.nOPoIAuditorMinCollateral  = 1 * COIN;
 
         // F15-A2 — Model Manifest governance (regtest — minimal, for fast unit testing)
         consensus.nOPoIModelVoteWindowBlocks      = 5;

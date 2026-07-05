@@ -45,6 +45,8 @@ static UniValue OPoIRequestToUniValue(const OPoIRequest& r)
     obj.pushKV("fee_per_token", ValueFromAmount(r.feePerToken));
     obj.pushKV("task_type",     r.taskType == OPOI_TASK_VERIFIABLE ? "VERIFIABLE" : "OPEN");
     obj.pushKV("task_class",    r.taskClass == OPOI_TASKCLASS_BATCH ? "BATCH" : "INTERACTIVE");
+    if (r.taskType == OPOI_TASK_VERIFIABLE)
+        obj.pushKV("test_suite", r.testSuite.GetHex());
     obj.pushKV("block_height",  (int)r.blockHeight);
     obj.pushKV("sig_time",      (int)r.sigTime);
     obj.pushKV("tx_hash",       r.txHash.GetHex());
@@ -237,10 +239,11 @@ UniValue getopoirequest(const UniValue& params, bool fHelp)
 // submitopoirequest "request_id" "model" "prompt_hash_hex" max_tokens payment "requester_address" ( fee_per_token task_type )
 UniValue submitopoirequest(const UniValue& params, bool fHelp)
 {
-    if (fHelp || params.size() < 6 || params.size() > 9)
+    if (fHelp || params.size() < 6 || params.size() > 10)
         throw std::runtime_error(
             "submitopoirequest \"request_id\" \"model\" \"prompt_hash_hex\""
-            " max_tokens payment \"requester_address\" ( fee_per_token task_type task_class )\n"
+            " max_tokens payment \"requester_address\""
+            " ( fee_per_token task_type task_class test_suite_hex )\n"
             "\nBroadcast an AI inference request transaction.\n"
             "\nThe actual prompt text is NOT stored on-chain — only its SHA-256 hash.\n"
             "Send the prompt directly to the miner's HTTP API after broadcasting.\n"
@@ -259,6 +262,9 @@ UniValue submitopoirequest(const UniValue& params, bool fHelp)
             "                     F15-G: if model's dense pipeline is deeper than\n"
             "                     nOPoIMaxPipelineDepth, INTERACTIVE is rejected —\n"
             "                     use BATCH for models with a deep shard pipeline.\n"
+            "10. test_suite_hex   (string, required if task_type=VERIFIABLE) SHA-256\n"
+            "                     of the test suite an Auditor will check the response\n"
+            "                     against (F14-C)\n"
             "\nTotal miner payment = payment + actual_token_count * fee_per_token\n"
             "\nResult:\n"
             "\"txid\"  (string) Transaction ID\n"
@@ -294,6 +300,15 @@ UniValue submitopoirequest(const UniValue& params, bool fHelp)
         if (tc == "BATCH") taskClass = OPOI_TASKCLASS_BATCH;
         else if (tc != "INTERACTIVE") throw std::runtime_error("task_class must be INTERACTIVE or BATCH");
     }
+    uint256 testSuite;
+    if (params.size() > 9) {
+        testSuite.SetHex(params[9].get_str());
+        if (testSuite.IsNull())
+            throw std::runtime_error("test_suite_hex is invalid or all-zero");
+    }
+    // Friendly pre-check mirroring CheckOPoITransaction's consensus rule (F14-B).
+    if (taskType == OPOI_TASK_VERIFIABLE && testSuite.IsNull())
+        throw std::runtime_error("task_type=VERIFIABLE requires a non-empty test_suite_hex");
 
     if (requestId.empty()) throw std::runtime_error("request_id must not be empty");
     if (model.empty())     throw std::runtime_error("model must not be empty");
@@ -329,11 +344,13 @@ UniValue submitopoirequest(const UniValue& params, bool fHelp)
     mutTx.opoiFeePerToken= feePerToken;
     mutTx.opoiTaskType   = taskType;
     mutTx.opoiTaskClass  = taskClass;
+    mutTx.opoiTestSuite  = testSuite;
     mutTx.opoiSigTime    = (uint32_t)GetTime();
 
-    // Sign: requestId + requester + model + promptHashHex + maxTokens + payment + feePerToken + taskType + taskClass
+    // Sign: requestId + requester + model + promptHashHex + maxTokens + payment + feePerToken + taskType + taskClass + testSuiteHex
     std::string sigMsg = requestId + requester + model + phHex +
-                         strprintf("%u%d%d%d%d", maxTok, payment, feePerToken, (int)taskType, (int)taskClass);
+                         strprintf("%u%d%d%d%d", maxTok, payment, feePerToken, (int)taskType, (int)taskClass) +
+                         testSuite.GetHex();
     std::string errMsg;
     if (!SignWithAddress(requester, sigMsg, mutTx.opoiSig, errMsg))
         throw JSONRPCError(RPC_WALLET_ERROR, "Failed to sign: " + errMsg);
@@ -351,6 +368,8 @@ UniValue submitopoirequest(const UniValue& params, bool fHelp)
     ret.pushKV("request_id",   requestId);
     ret.pushKV("task_type",    taskType == OPOI_TASK_VERIFIABLE ? "VERIFIABLE" : "OPEN");
     ret.pushKV("task_class",   taskClass == OPOI_TASKCLASS_BATCH ? "BATCH" : "INTERACTIVE");
+    if (taskType == OPOI_TASK_VERIFIABLE)
+        ret.pushKV("test_suite", testSuite.GetHex());
     ret.pushKV("fee_per_token",ValueFromAmount(feePerToken));
     return ret;
 }
@@ -1741,6 +1760,153 @@ UniValue getshardresult(const UniValue& params, bool fHelp)
     return ret;
 }
 
+// ── submitauditorverification (F14-C) ──────────────────────────────────────────
+
+UniValue submitauditorverification(const UniValue& params, bool fHelp)
+{
+    if (fHelp || params.size() != 5)
+        throw std::runtime_error(
+            "submitauditorverification \"auditor_address\" \"request_id\" \"result\""
+            " \"collateral_txid\" collateral_vout\n"
+            "\nSubmit an Auditor's verdict on a VERIFIABLE request's RESPONSE (F14-B),\n"
+            "checked against the REQUEST's test suite. Permissionless — any address\n"
+            "that locks the required collateral may audit, no OPoI stake required.\n"
+            "\nSandbox execution (F14-E) is not yet implemented — the caller decides\n"
+            "PASS/FAIL/TIMEOUT themselves for now.\n"
+            "\nOnce nOPoIMinAuditors verdicts are in for a request, the majority result\n"
+            "is resolved (ProcessAuditorVerifications): Auditors matching the majority\n"
+            "get their collateral unlocked, the minority stay locked forever (slashed).\n"
+            "The underlying RESPONSE is only paid if the majority is PASS.\n"
+            "\nArguments:\n"
+            "1. auditor_address  (string, required) Address casting this verdict\n"
+            "2. request_id       (string, required) The VERIFIABLE request being audited\n"
+            "3. result           (string, required) PASS, FAIL, or TIMEOUT\n"
+            "4. collateral_txid  (string, required) TXID of the Auditor's collateral UTXO\n"
+            "5. collateral_vout  (numeric, required) Output index of the collateral UTXO\n"
+            "\nResult:\n"
+            "{ txid, request_id, auditor_address, result }\n"
+            "\nExamples:\n"
+            + HelpExampleCli("submitauditorverification", "\"t1Auditor...\" \"uuid\" \"PASS\" \"abc123...\" 0")
+        );
+
+#ifdef ENABLE_WALLET
+    EnsureWalletIsUnlocked();
+#endif
+
+    std::string auditorAddr = params[0].get_str();
+    std::string requestId   = params[1].get_str();
+    std::string resultStr   = params[2].get_str();
+    uint256     colTxid;
+    colTxid.SetHex(params[3].get_str());
+    uint32_t    colVout     = (uint32_t)params[4].get_int();
+
+    if (auditorAddr.empty()) throw std::runtime_error("auditor_address must not be empty");
+    if (requestId.empty())   throw std::runtime_error("request_id must not be empty");
+    if (colTxid.IsNull())    throw std::runtime_error("collateral_txid is invalid");
+
+    uint8_t result;
+    if (resultStr == "PASS") result = AUDITOR_VERIFY_PASS;
+    else if (resultStr == "FAIL") result = AUDITOR_VERIFY_FAIL;
+    else if (resultStr == "TIMEOUT") result = AUDITOR_VERIFY_TIMEOUT;
+    else throw std::runtime_error("result must be PASS, FAIL, or TIMEOUT");
+
+    OPoIRequest req;
+    if (!g_opoiCache.GetRequest(requestId, req))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "unknown request_id: " + requestId);
+    if (!req.IsVerifiable())
+        throw JSONRPCError(RPC_INVALID_PARAMETER, requestId + " is not a VERIFIABLE task — nothing for an Auditor to check");
+
+    // Look up the UTXO to get its value (same pattern as stakeopoi).
+    COutPoint colOut(colTxid, colVout);
+    CCoins coins;
+    CAmount collateralAmount = 0;
+    {
+        LOCK(cs_main);
+        CCoinsViewCache view(pcoinsTip);
+        if (!view.GetCoins(colTxid, coins) || colVout >= coins.vout.size() || coins.vout[colVout].IsNull())
+            throw std::runtime_error("collateral UTXO not found in the UTXO set");
+        collateralAmount = coins.vout[colVout].nValue;
+    }
+    CAmount minCollateral = Params().GetConsensus().nOPoIAuditorMinCollateral;
+    if (collateralAmount < minCollateral)
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            strprintf("Collateral value %.4f CS is below minimum %.4f CS",
+                      (double)collateralAmount / COIN, (double)minCollateral / COIN));
+
+    CMutableTransaction mutTx;
+    mutTx.nVersion              = OPOI_TX_VERSION;
+    mutTx.nType                 = OPOI_AUDITOR_VERIFY_TX_TYPE;
+    mutTx.opoiRequestId          = requestId;
+    mutTx.opoiAuditorAddress     = auditorAddr;
+    mutTx.opoiAuditorVerifyResult= result;
+    mutTx.opoiAuditorCollateralIn= colOut;
+    mutTx.opoiSigTime            = (uint32_t)GetTime();
+
+    std::string sigMsg = auditorAddr + requestId + colTxid.GetHex() + strprintf("%u", colVout);
+    std::string errMsg;
+    if (!SignWithAddress(auditorAddr, sigMsg, mutTx.opoiSig, errMsg))
+        throw JSONRPCError(RPC_WALLET_ERROR, "Failed to sign: " + errMsg);
+
+    CTransaction tx(mutTx);
+#ifdef ENABLE_WALLET
+    CReserveKey reservekey(pwalletMain);
+    CWalletTx walletTx(pwalletMain, tx);
+    if (!pwalletMain->CommitTransaction(walletTx, reservekey))
+        throw JSONRPCError(RPC_WALLET_ERROR, "CommitTransaction failed for submitauditorverification");
+#endif
+
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("txid",             tx.GetHash().GetHex());
+    ret.pushKV("request_id",       requestId);
+    ret.pushKV("auditor_address",  auditorAddr);
+    ret.pushKV("result",           resultStr);
+    return ret;
+}
+
+UniValue getauditorverifications(const UniValue& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw std::runtime_error(
+            "getauditorverifications \"request_id\"\n"
+            "\nList all Auditor verdicts for a request and the resolved majority.\n"
+            "\nArguments:\n"
+            "1. request_id  (string, required)\n"
+            "\nExamples:\n"
+            + HelpExampleCli("getauditorverifications", "\"uuid\"")
+        );
+
+    std::string requestId = params[0].get_str();
+    int minAuditors = Params().GetConsensus().nOPoIMinAuditors;
+
+    UniValue verifs(UniValue::VARR);
+    for (const auto& fv : g_opoiCache.GetAuditorVerifications(requestId)) {
+        UniValue obj(UniValue::VOBJ);
+        obj.pushKV("auditor_address", fv.auditorAddress);
+        std::string resultStr = fv.result == AUDITOR_VERIFY_PASS ? "PASS"
+                               : fv.result == AUDITOR_VERIFY_FAIL ? "FAIL" : "TIMEOUT";
+        obj.pushKV("result",          resultStr);
+        obj.pushKV("block_height",    (int)fv.blockHeight);
+        obj.pushKV("tx_hash",         fv.txHash.GetHex());
+        std::string statusStr = fv.status == OPOI_AUDITOR_STATUS_PENDING  ? "PENDING"
+                               : fv.status == OPOI_AUDITOR_STATUS_COMPLETE ? "COMPLETE" : "SLASHED";
+        obj.pushKV("status",          statusStr);
+        verifs.push_back(obj);
+    }
+
+    int majority = g_opoiCache.GetAuditorMajorityResult(requestId, minAuditors);
+    std::string majorityStr = majority < 0 ? ""
+                            : majority == AUDITOR_VERIFY_PASS ? "PASS"
+                            : majority == AUDITOR_VERIFY_FAIL ? "FAIL" : "TIMEOUT";
+
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("request_id",     requestId);
+    ret.pushKV("verifications",  verifs);
+    ret.pushKV("resolved",       majority >= 0);
+    ret.pushKV("majority_result",majorityStr);
+    ret.pushKV("min_auditors",   minAuditors);
+    return ret;
+}
+
 // ── Registration ──────────────────────────────────────────────────────────────
 
 static const CRPCCommand commands[] =
@@ -1770,6 +1936,9 @@ static const CRPCCommand commands[] =
     // F15-D — shard boundary result
     { "opoi",   "submitshardresult",      &submitshardresult,      false },
     { "opoi",   "getshardresult",         &getshardresult,         false },
+    // F14-C — Auditor verification (VERIFIABLE-task payment gate)
+    { "opoi",   "submitauditorverification", &submitauditorverification, false },
+    { "opoi",   "getauditorverifications",   &getauditorverifications,   false },
     { "hidden", "rebuilopoidb",       &rebuilopoidb,        false },
     { "hidden", "opoivrfselftest",    &opoivrfselftest,     false },
     { "hidden", "opoivrfverifyraw",   &opoivrfverifyraw,    false },

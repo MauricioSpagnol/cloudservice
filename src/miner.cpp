@@ -556,6 +556,12 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
                 OPoIRequest req;
                 if (!g_opoiCache.GetRequest(vtx.opoiRequestId, req) || req.payment <= 0)
                     continue;
+                // F14-C: a VERIFIABLE request's RESPONSE can never be paid in this
+                // same block (an Auditor can only vote after it's already
+                // confirmed on-chain) — handled entirely by the deferred pass
+                // below (GetVerifiablePaymentsForBlock), mirroring CheckOPoIPayments.
+                if (req.IsVerifiable())
+                    continue;
                 CTxDestination minerDest = DecodeDestination(vtx.opoiMinerAddress);
                 if (!IsValidDestination(minerDest))
                     continue;
@@ -588,6 +594,23 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
                         continue;
                     txNew.vout.push_back(CTxOut(kv.second, GetScriptForDestination(minerDest)));
                     totalOPoIPayment += kv.second;
+                }
+            }
+
+            // F14-C: VERIFIABLE-request RESPONSE payments that just resolved an
+            // Auditor PASS majority (deferred — see the `continue` above and
+            // GetVerifiablePaymentsForBlock; mirrors CheckOPoIPayments exactly).
+            {
+                for (const auto& p : GetVerifiablePaymentsForBlock(pblock->vtx, chainparams.GetConsensus())) {
+                    CTxDestination minerDest = DecodeDestination(p.minerAddress);
+                    if (!IsValidDestination(minerDest))
+                        continue;
+                    if (totalOPoIPayment + p.amount > opoiBudget)
+                        continue;
+                    if (totalOPoIPayment + p.amount > txNew.vout[0].nValue)
+                        continue;
+                    txNew.vout.push_back(CTxOut(p.amount, GetScriptForDestination(minerDest)));
+                    totalOPoIPayment += p.amount;
                 }
             }
             txNew.vout[0].nValue -= totalOPoIPayment;

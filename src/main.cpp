@@ -3940,6 +3940,8 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         ProcessExpiredRequests((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessModelVotingWindows((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessShardPayments(block.vtx, chainparams.GetConsensus());
+        ProcessVerifiableResponsePayments(block.vtx, chainparams.GetConsensus());
+        ProcessAuditorVerifications((uint32_t)pindex->nHeight, chainparams.GetConsensus());
     }
 
     return true;

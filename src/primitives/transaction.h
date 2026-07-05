@@ -65,7 +65,7 @@ static const int8_t  OPOI_RESPONSE_TX_TYPE  = 2; // miner commits proof of infer
 static const int8_t  OPOI_STAKE_TX_TYPE     = 3; // miner locks collateral to participate
 static const int8_t  OPOI_UNSTAKE_TX_TYPE   = 4; // miner begins cooldown to reclaim collateral
 static const int8_t  OPOI_CHALLENGE_TX_TYPE = 5; // anyone disputes a RESPONSE within challenge window
-static const int8_t  OPOI_FOTON_VERIFY_TX_TYPE = 6; // FOTON verifier submits sandbox result
+static const int8_t  OPOI_AUDITOR_VERIFY_TX_TYPE = 6; // Auditor submits sandbox verification result
 static const int8_t  OPOI_MODEL_REGISTER_TX_TYPE = 7; // F15-A: propose a Model Manifest (dense/MoE/hybrid)
 static const int8_t  OPOI_MODEL_VOTE_TX_TYPE     = 8; // F15-A2: stake-weighted vote on a proposed model
 static const int8_t  OPOI_COORDINATOR_CLAIM_TX_TYPE = 9; // F15-C: VRF self-claim of shard coordinator role
@@ -74,7 +74,7 @@ static const int8_t  OPOI_SHARD_RESULT_TX_TYPE      = 10; // F15-D: miner publis
 // whose body references OPOI_TASK_VERIFIABLE — two-phase lookup requires it to be visible
 // in every translation unit that parses this header, not just ones that also include opoi.h.
 static const int8_t  OPOI_TASK_OPEN       = 0; // Text/creative — no deterministic verifier
-static const int8_t  OPOI_TASK_VERIFIABLE = 1; // Code/math/SQL — verified by FOTON sandbox
+static const int8_t  OPOI_TASK_VERIFIABLE = 1; // Code/math/SQL — verified by an Auditor sandbox
 
 /**
  * A shielded input to a transaction. It contains data that describes a Spend transfer.
@@ -690,10 +690,10 @@ public:
     // F9-F / F14-B: Canary flag + VERIFIABLE test suite (REQUEST only)
     const uint8_t              opoiIsCanary;                // 1=auto-generated canary audit request
     const uint256              opoiTestSuite;               // SHA256 of test suite (VERIFIABLE only)
-    // F14-C: FOTON verification result (FOTON_VERIFY type only)
-    const std::string          opoiFotonAddress;            // FOTON verifier's address
-    const uint8_t              opoiFotonVerifyResult;       // 0=PASS, 1=FAIL, 2=TIMEOUT
-    const COutPoint            opoiFotonCollateralIn;       // FOTON's locked collateral UTXO
+    // F14-C: Auditor verification result (AUDITOR_VERIFY type only)
+    const std::string          opoiAuditorAddress;            // Auditor's address
+    const uint8_t              opoiAuditorVerifyResult;       // 0=PASS, 1=FAIL, 2=TIMEOUT
+    const COutPoint            opoiAuditorCollateralIn;       // Auditor's locked collateral UTXO
     // F15-A: Model Manifest registration (MODEL_REGISTER only) — opoiModelId/opoiPomRoot/opoiRequester reused
     const uint8_t              opoiModelArchType;           // 0=DENSE, 1=MOE, 2=HYBRID
     const uint64_t             opoiModelTotalParams;
@@ -904,11 +904,11 @@ public:
                     READWRITE(*const_cast<std::vector<uint8_t>*>(&opoiProofData));
                     READWRITE(*const_cast<std::vector<uint8_t>*>(&opoiChallengeNonce));
                 }
-            } else if (nType == OPOI_FOTON_VERIFY_TX_TYPE) {
+            } else if (nType == OPOI_AUDITOR_VERIFY_TX_TYPE) {
                 READWRITE(*const_cast<std::string*>(&opoiRequestId));
-                READWRITE(*const_cast<std::string*>(&opoiFotonAddress));
-                READWRITE(*const_cast<uint8_t*>(&opoiFotonVerifyResult));
-                READWRITE(*const_cast<COutPoint*>(&opoiFotonCollateralIn));
+                READWRITE(*const_cast<std::string*>(&opoiAuditorAddress));
+                READWRITE(*const_cast<uint8_t*>(&opoiAuditorVerifyResult));
+                READWRITE(*const_cast<COutPoint*>(&opoiAuditorCollateralIn));
             } else if (nType == OPOI_MODEL_REGISTER_TX_TYPE) {
                 READWRITE(*const_cast<std::string*>(&opoiModelId));
                 READWRITE(*const_cast<std::string*>(&opoiRequester));       // proposer
@@ -1197,9 +1197,9 @@ struct CMutableTransaction
     uint8_t              opoiIsCanary              = 0;
     uint256              opoiTestSuite;
     // F14-C
-    std::string          opoiFotonAddress;
-    uint8_t              opoiFotonVerifyResult     = 0;
-    COutPoint            opoiFotonCollateralIn;
+    std::string          opoiAuditorAddress;
+    uint8_t              opoiAuditorVerifyResult     = 0;
+    COutPoint            opoiAuditorCollateralIn;
     // F15-A / F15-A2
     uint8_t              opoiModelArchType             = 0;
     uint64_t             opoiModelTotalParams          = 0;
@@ -1377,11 +1377,11 @@ struct CMutableTransaction
                     READWRITE(opoiProofData);
                     READWRITE(opoiChallengeNonce);
                 }
-            } else if (nType == OPOI_FOTON_VERIFY_TX_TYPE) {
+            } else if (nType == OPOI_AUDITOR_VERIFY_TX_TYPE) {
                 READWRITE(opoiRequestId);
-                READWRITE(opoiFotonAddress);
-                READWRITE(opoiFotonVerifyResult);
-                READWRITE(opoiFotonCollateralIn);
+                READWRITE(opoiAuditorAddress);
+                READWRITE(opoiAuditorVerifyResult);
+                READWRITE(opoiAuditorCollateralIn);
             } else if (nType == OPOI_MODEL_REGISTER_TX_TYPE) {
                 READWRITE(opoiModelId);
                 READWRITE(opoiRequester);

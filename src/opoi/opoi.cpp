@@ -136,6 +136,10 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
             auto it = g_opoiCache.mapRequests.find(tx.opoiRequestId);
             if (it != g_opoiCache.mapRequests.end())
                 it->second.status = OPOI_STATUS_PENDING;
+            // F14-C: undo "paid" bookkeeping for a VERIFIABLE response too (mirrors
+            // UnmarkShardPaid below) — if this reconnects differently, it must be
+            // payable again.
+            g_opoiCache.UnmarkResponsePaid(tx.opoiRequestId);
 
         } else if (tx.nType == OPOI_STAKE_TX_TYPE) {
             g_opoiCache.mapStakes.erase(tx.opoiMinerAddress);
@@ -183,6 +187,23 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
             // removing a submission can drop it back below majority, and the
             // coinbase that paid it is itself being disconnected right now.
             g_opoiCache.UnmarkShardPaid(tx.opoiRequestId, tx.opoiShardIndex);
+
+        } else if (tx.nType == OPOI_AUDITOR_VERIFY_TX_TYPE) {
+            auto it = g_opoiCache.mapAuditorVerifications.find(tx.opoiRequestId);
+            if (it != g_opoiCache.mapAuditorVerifications.end()) {
+                auto& verifs = it->second;
+                verifs.erase(std::remove_if(verifs.begin(), verifs.end(),
+                    [&](const AuditorVerification& v) { return v.auditorAddress == tx.opoiAuditorAddress; }),
+                    verifs.end());
+            }
+            // Release the lock this vote applied. NOTE (known v1 gap, same class
+            // already accepted for CHALLENGE slashing — see ProcessExpiredChallenges):
+            // if this vote had already been resolved as the SLASHED minority,
+            // this incorrectly unlocks collateral that was meant to stay burned
+            // forever. Only matters for a reorg deep enough to disconnect past a
+            // resolved verification — not handled in v1.
+            g_opoiCache.UnlockUTXO(tx.opoiAuditorCollateralIn);
+            g_opoiCache.UnmarkAuditorResolved(tx.opoiRequestId);
         }
         return true;
     }
@@ -199,6 +220,7 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         req.feePerToken = tx.opoiFeePerToken;
         req.taskType    = tx.opoiTaskType;
         req.taskClass   = tx.opoiTaskClass; // F15-G
+        req.testSuite   = tx.opoiTestSuite; // F14-B/C — was never copied before this fix
         req.blockHeight = blockHeight;
         req.sigTime     = tx.opoiSigTime;
         req.txHash      = tx.GetHash();
@@ -343,6 +365,19 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         LogPrintf("OPoI: SHARD_RESULT for %s shard %u by %s (hash=%s) at height %u\n",
                   tx.opoiRequestId, tx.opoiShardIndex, tx.opoiMinerAddress,
                   tx.opoiResponseHash.GetHex(), blockHeight);
+
+    } else if (tx.nType == OPOI_AUDITOR_VERIFY_TX_TYPE) {
+        AuditorVerification fv;
+        fv.requestId       = tx.opoiRequestId;
+        fv.auditorAddress  = tx.opoiAuditorAddress;
+        fv.result          = tx.opoiAuditorVerifyResult;
+        fv.auditorCollateral = tx.opoiAuditorCollateralIn;
+        fv.blockHeight     = blockHeight;
+        fv.txHash          = tx.GetHash();
+        fv.status          = OPOI_AUDITOR_STATUS_PENDING;
+        g_opoiCache.AddAuditorVerification(fv); // also locks the collateral
+        LogPrintf("OPoI: AUDITOR_VERIFY for %s by %s (result=%d) at height %u\n",
+                  tx.opoiRequestId, tx.opoiAuditorAddress, (int)tx.opoiAuditorVerifyResult, blockHeight);
     }
 
     return true;
@@ -370,6 +405,8 @@ void RebuildOPoICache()
                 ProcessExpiredRequests((uint32_t)pindex->nHeight, params);
                 ProcessModelVotingWindows((uint32_t)pindex->nHeight, params);
                 ProcessShardPayments(block.vtx, params);
+                ProcessVerifiableResponsePayments(block.vtx, params);
+                ProcessAuditorVerifications((uint32_t)pindex->nHeight, params);
             }
         }
         pindex = chainActive.Next(pindex);
@@ -517,6 +554,11 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
         if (tx.opoiPayment <= 0)
             return state.DoS(10, error("CheckOPoITransaction(): REQUEST payment must be positive"),
                              REJECT_INVALID, "bad-txns-opoi-zero-payment");
+        // F14-B: VERIFIABLE tasks (code/math/SQL) are checked by an Auditor against a
+        // test suite (F14-C) — without a test suite hash there is nothing to check.
+        if (tx.opoiTaskType == OPOI_TASK_VERIFIABLE && tx.opoiTestSuite.IsNull())
+            return state.DoS(10, error("CheckOPoITransaction(): VERIFIABLE REQUEST missing testSuite"),
+                             REJECT_INVALID, "bad-txns-opoi-request-verifiable-needs-test-suite");
         // F15-G: if opoiModel names an ACTIVE Model Manifest whose dense pipeline is
         // deeper than nOPoIMaxPipelineDepth, an INTERACTIVE request cannot use it —
         // commit-reveal adds +1 block per sequential shard, so a deep pipeline would
@@ -545,7 +587,8 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
             std::string sigMsg = tx.opoiRequestId + tx.opoiRequester + tx.opoiModel
                                + tx.opoiPromptHash.GetHex()
                                + strprintf("%u%d%d%d%d", tx.opoiMaxTokens, tx.opoiPayment,
-                                           tx.opoiFeePerToken, (int)tx.opoiTaskType, (int)tx.opoiTaskClass);
+                                           tx.opoiFeePerToken, (int)tx.opoiTaskType, (int)tx.opoiTaskClass)
+                               + tx.opoiTestSuite.GetHex();
             if (!VerifyOPoISig(tx.opoiRequester, sigMsg, tx.opoiSig))
                 return state.DoS(100, error("CheckOPoITransaction(): REQUEST invalid signature for %s",
                                             tx.opoiRequester),
@@ -933,6 +976,54 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
         break;
     }
 
+    case OPOI_AUDITOR_VERIFY_TX_TYPE: {
+        // F14-C: Auditor verifies a VERIFIABLE-task RESPONSE against the REQUEST's
+        // test suite (sandbox execution is off-chain, F14-E — this only records the
+        // verdict on-chain). Permissionless: any address that locks the required
+        // collateral may audit, no CSNode-tier or OPoI-stake requirement.
+        if (tx.opoiRequestId.empty())
+            return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY missing requestId"),
+                             REJECT_INVALID, "bad-txns-opoi-auditor-no-request-id");
+        if (tx.opoiAuditorAddress.empty())
+            return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY missing auditorAddress"),
+                             REJECT_INVALID, "bad-txns-opoi-auditor-no-address");
+        if (tx.opoiAuditorVerifyResult != AUDITOR_VERIFY_PASS &&
+            tx.opoiAuditorVerifyResult != AUDITOR_VERIFY_FAIL &&
+            tx.opoiAuditorVerifyResult != AUDITOR_VERIFY_TIMEOUT)
+            return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY invalid result %d",
+                                       (int)tx.opoiAuditorVerifyResult),
+                             REJECT_INVALID, "bad-txns-opoi-auditor-invalid-result");
+        if (tx.opoiAuditorCollateralIn.IsNull())
+            return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY missing collateralIn"),
+                             REJECT_INVALID, "bad-txns-opoi-auditor-no-collateral");
+        if (!fIsVerifying) {
+            // Only tasks the requester flagged VERIFIABLE (F14-B) get an on-chain
+            // verdict — an Auditor has nothing to check on an OPEN (prose) task.
+            OPoIRequest req;
+            if (!g_opoiCache.GetRequest(tx.opoiRequestId, req) || !req.IsVerifiable())
+                return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY for non-VERIFIABLE/unknown request %s",
+                                           tx.opoiRequestId),
+                                 REJECT_INVALID, "bad-txns-opoi-auditor-not-verifiable");
+            // Collateral must not already be locked by another stake/audit.
+            if (g_opoiCache.IsLockedUTXO(tx.opoiAuditorCollateralIn))
+                return state.DoS(100, error("CheckOPoITransaction(): AUDITOR_VERIFY collateral %s:%u already locked",
+                                            tx.opoiAuditorCollateralIn.hash.GetHex(), tx.opoiAuditorCollateralIn.n),
+                                 REJECT_INVALID, "bad-txns-opoi-auditor-collateral-locked");
+        }
+        // Verify the Auditor owns the collateral address — same shape as STAKE's
+        // ownership proof (opoi.cpp, OPOI_STAKE_TX_TYPE above).
+        {
+            std::string sigMsg = tx.opoiAuditorAddress + tx.opoiRequestId
+                               + tx.opoiAuditorCollateralIn.hash.GetHex()
+                               + strprintf("%u", tx.opoiAuditorCollateralIn.n);
+            if (!VerifyOPoISig(tx.opoiAuditorAddress, sigMsg, tx.opoiSig))
+                return state.DoS(100, error("CheckOPoITransaction(): AUDITOR_VERIFY invalid signature for %s",
+                                            tx.opoiAuditorAddress),
+                                 REJECT_INVALID, "bad-txns-opoi-auditor-bad-sig");
+        }
+        break;
+    }
+
     default:
         return state.DoS(10, error("CheckOPoITransaction(): invalid nType %d", tx.nType),
                          REJECT_INVALID, "bad-txns-opoi-invalid-type");
@@ -994,6 +1085,14 @@ bool CheckOPoIPayments(const std::vector<CTransaction>& vtx,
             continue;
         }
 
+        // F14-C: a VERIFIABLE request's RESPONSE can never be paid in this same
+        // block — an Auditor can only vote on it after it's already confirmed
+        // on-chain, and resolution (ProcessAuditorVerifications) itself only
+        // ever runs on a later block. Handled entirely by the deferred pass
+        // below (GetVerifiablePaymentsForBlock) instead.
+        if (req.IsVerifiable())
+            continue;
+
         // Total payment = baseFee + tokenCount * feePerToken
         CAmount totalPayment = req.payment;
         if (req.feePerToken > 0 && tx.opoiTokenCount > 0)
@@ -1049,6 +1148,33 @@ bool CheckOPoIPayments(const std::vector<CTransaction>& vtx,
                                  REJECT_INVALID, "bad-cb-opoi-missing-shard-payment");
             }
             totalPaymentsChecked += totalPayment;
+        }
+    }
+
+    // F14-C: VERIFIABLE-request RESPONSE payments, deferred until an Auditor
+    // PASS majority resolves (never in the RESPONSE's own confirming block —
+    // see the `continue` above). Uses the same pre-block cache snapshot as
+    // the loop above; no need to combine with this block's own txs the way
+    // GetShardPaymentsForBlock does, because resolution (ProcessAuditorVerifications)
+    // only ever completes on an *earlier* block than the one being validated here.
+    {
+        for (const auto& p : GetVerifiablePaymentsForBlock(vtx, params)) {
+            if (totalPaymentsChecked + p.amount > opoiBudget) {
+                LogPrint("opoi", "CheckOPoIPayments: verifiable payment %s to %s exceeds OPoI budget, skipping\n",
+                         FormatMoney(p.amount), p.minerAddress);
+                continue;
+            }
+            CTxDestination minerDest = DecodeDestination(p.minerAddress);
+            if (!IsValidDestination(minerDest))
+                return state.DoS(100, error("CheckOPoIPayments(): VERIFIABLE RESPONSE has invalid miner address %s",
+                                            p.minerAddress),
+                                 REJECT_INVALID, "bad-cb-opoi-invalid-verifiable-miner-addr");
+            if (!findAndClaimOutput(GetScriptForDestination(minerDest), p.amount)) {
+                return state.DoS(100, error("CheckOPoIPayments(): coinbase missing verifiable payment of %s to %s for request %s",
+                                            FormatMoney(p.amount), p.minerAddress, p.requestId),
+                                 REJECT_INVALID, "bad-cb-opoi-missing-verifiable-payment");
+            }
+            totalPaymentsChecked += p.amount;
         }
     }
 
@@ -1195,6 +1321,107 @@ void ProcessShardPayments(const std::vector<CTransaction>& vtx, const Consensus:
 {
     for (const auto& p : GetShardPaymentsForBlock(vtx, params))
         g_opoiCache.MarkShardPaid(p.requestId, p.shardIndex);
+}
+
+// ── GetVerifiablePaymentsForBlock / ProcessVerifiableResponsePayments (F14-C) ──
+// Mirrors GetShardPaymentsForBlock's combine-cache-with-this-block's-own-txs
+// pattern exactly (see ComputeAuditorMajority in opoi.h for why): without
+// this, a vote that itself completes quorum would be invisible to the
+// pre-apply callers (CreateNewBlock/CheckOPoIPayments) but visible to the
+// post-apply caller (ProcessVerifiableResponsePayments), letting the latter
+// mark a response "paid" that the block's own coinbase never actually paid.
+
+std::vector<OPoIResponsePayment> GetVerifiablePaymentsForBlock(const std::vector<CTransaction>& vtx,
+                                                                const Consensus::Params& params)
+{
+    std::vector<OPoIResponsePayment> out;
+    LOCK(g_opoiCache.cs);
+    for (const auto& resp : g_opoiCache.ListResponses()) {
+        if (g_opoiCache.IsResponsePaid(resp.requestId)) continue;
+
+        OPoIRequest req;
+        if (!g_opoiCache.GetRequest(resp.requestId, req) || !req.IsVerifiable() || req.payment <= 0)
+            continue; // OPEN responses are paid same-block, above
+
+        std::vector<AuditorVerification> verifs = g_opoiCache.GetAuditorVerifications(resp.requestId);
+        std::set<std::string> seen;
+        for (const auto& v : verifs) seen.insert(v.auditorAddress);
+        for (size_t i = 1; i < vtx.size(); ++i) {
+            const CTransaction& tx = vtx[i];
+            if (tx.nVersion != OPOI_TX_VERSION || tx.nType != OPOI_AUDITOR_VERIFY_TX_TYPE) continue;
+            if (tx.opoiRequestId != resp.requestId) continue;
+            if (!seen.insert(tx.opoiAuditorAddress).second) continue; // already in cache
+            AuditorVerification v;
+            v.auditorAddress = tx.opoiAuditorAddress;
+            v.result         = tx.opoiAuditorVerifyResult;
+            verifs.push_back(v);
+        }
+
+        if (ComputeAuditorMajority(verifs, params.nOPoIMinAuditors) != AUDITOR_VERIFY_PASS)
+            continue; // not resolved PASS yet
+
+        CAmount totalPayment = req.payment;
+        if (req.feePerToken > 0 && resp.tokenCount > 0)
+            totalPayment += (CAmount)resp.tokenCount * req.feePerToken;
+
+        out.push_back({resp.requestId, resp.minerAddress, totalPayment});
+    }
+    return out;
+}
+
+void ProcessVerifiableResponsePayments(const std::vector<CTransaction>& vtx, const Consensus::Params& params)
+{
+    for (const auto& p : GetVerifiablePaymentsForBlock(vtx, params))
+        g_opoiCache.MarkResponsePaid(p.requestId);
+}
+
+// ── ProcessAuditorVerifications ────────────────────────────────────────────────
+// F14-C: called from ConnectBlock/RebuildOPoICache after ProcessOPoITransaction
+// has applied this block's own AUDITOR_VERIFY txs. Event-driven (unlike the
+// window-based ProcessExpiredChallenges): resolves a requestId's verification
+// the moment it first reaches nOPoIMinAuditors quorum, same shape as shard
+// majority resolution (F15-D/F16) rather than a fixed-block timeout — there is
+// no real sandbox execution time to bound yet (F14-E).
+//
+// On resolution: Auditors matching the majority get their collateral unlocked
+// immediately; Auditors in the minority stay locked forever (burned), same
+// treatment as an unanswered CHALLENGE (ProcessExpiredChallenges) — no separate
+// reward is minted for correct votes or paid out from the slashed collateral
+// (see plan rationale: "treasury" elsewhere in this file never moves real
+// funds either, it just means nothing is paid).
+//
+// Known v1 limitation: if quorum is never reached, Auditors who already voted
+// stay locked indefinitely and the underlying RESPONSE payment never resolves
+// — same "never resolves = never pays" behavior the rest of OPoI already has.
+// A quorum-degradation policy mirroring F15-F (GetEffectiveShardMinSubmissions)
+// would be a reasonable follow-up, not implemented here.
+
+void ProcessAuditorVerifications(uint32_t blockHeight, const Consensus::Params& params)
+{
+    LOCK(g_opoiCache.cs);
+    for (auto& kv : g_opoiCache.mapAuditorVerifications) {
+        const std::string& requestId = kv.first;
+        if (g_opoiCache.IsAuditorResolved(requestId)) continue;
+
+        int majority = g_opoiCache.GetAuditorMajorityResult(requestId, params.nOPoIMinAuditors);
+        if (majority < 0) continue; // no quorum yet
+
+        for (auto& fv : kv.second) {
+            if ((int)fv.result == majority) {
+                g_opoiCache.UnlockUTXO(fv.auditorCollateral);
+                fv.status = OPOI_AUDITOR_STATUS_COMPLETE;
+            } else {
+                // Collateral stays locked permanently (burned) — same as an
+                // unanswered CHALLENGE (ProcessExpiredChallenges).
+                fv.status = OPOI_AUDITOR_STATUS_SLASHED;
+                LogPrintf("OPoI: SLASH auditor %s — verdict %d disagreed with majority %d for "
+                          "request %s at height %u — collateral %s:%u permanently locked\n",
+                          fv.auditorAddress, (int)fv.result, majority, requestId, blockHeight,
+                          fv.auditorCollateral.hash.GetHex(), fv.auditorCollateral.n);
+            }
+        }
+        g_opoiCache.MarkAuditorResolved(requestId);
+    }
 }
 
 // ── GetChallengerRewardsAtHeight ──────────────────────────────────────────────

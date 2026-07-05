@@ -166,7 +166,9 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "getshardresult",     1 },   // shard_index (integer)
     // F15-H cross-language test
     { "opoiselecttopkexperts", 2 }, // num_experts (integer)
-    { "opoiselecttopkexperts", 3 }  // top_k (integer)
+    { "opoiselecttopkexperts", 3 }, // top_k (integer)
+    // F14-C
+    { "submitauditorverification", 4 }  // collateral_vout (integer)
 };
 
 class CRPCConvertTable

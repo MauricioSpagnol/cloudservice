@@ -202,7 +202,7 @@ std::string CTxOut::ToString() const
     return strprintf("CTxOut(nValue=%d.%08d, scriptPubKey=%s)", nValue / COIN, nValue % COIN, HexStr(scriptPubKey).substr(0, 30));
 }
 
-CMutableTransaction::CMutableTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION), fOverwintered(false), nVersionGroupId(0), nExpiryHeight(0), nLockTime(0), valueBalance(0), csappLockedAmount(0), opoiMaxTokens(0), opoiTokenCount(0), opoiTaskType(0), opoiPayment(0), opoiFeePerToken(0), opoiSigTime(0), opoiCollateralIn(), opoiChallengePhase(0), opoiChallengerCollateralIn(), opoiResponsePhase(0), opoiTier(0), opoiPromptTokenCount(0), opoiIsCanary(0), opoiFotonVerifyResult(0), opoiFotonCollateralIn() {}
+CMutableTransaction::CMutableTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION), fOverwintered(false), nVersionGroupId(0), nExpiryHeight(0), nLockTime(0), valueBalance(0), csappLockedAmount(0), opoiMaxTokens(0), opoiTokenCount(0), opoiTaskType(0), opoiPayment(0), opoiFeePerToken(0), opoiSigTime(0), opoiCollateralIn(), opoiChallengePhase(0), opoiChallengerCollateralIn(), opoiResponsePhase(0), opoiTier(0), opoiPromptTokenCount(0), opoiIsCanary(0), opoiAuditorVerifyResult(0), opoiAuditorCollateralIn() {}
 CMutableTransaction::CMutableTransaction(const CTransaction& tx) : nVersion(tx.nVersion), fOverwintered(tx.fOverwintered), nVersionGroupId(tx.nVersionGroupId), nExpiryHeight(tx.nExpiryHeight),
                                                                    vin(tx.vin), vout(tx.vout), nLockTime(tx.nLockTime),
                                                                    valueBalance(tx.valueBalance), vShieldedSpend(tx.vShieldedSpend), vShieldedOutput(tx.vShieldedOutput),
@@ -242,9 +242,9 @@ CMutableTransaction::CMutableTransaction(const CTransaction& tx) : nVersion(tx.n
                                                                    opoiPromptTokenCount(tx.opoiPromptTokenCount),
                                                                    opoiIsCanary(tx.opoiIsCanary),
                                                                    opoiTestSuite(tx.opoiTestSuite),
-                                                                   opoiFotonAddress(tx.opoiFotonAddress),
-                                                                   opoiFotonVerifyResult(tx.opoiFotonVerifyResult),
-                                                                   opoiFotonCollateralIn(tx.opoiFotonCollateralIn),
+                                                                   opoiAuditorAddress(tx.opoiAuditorAddress),
+                                                                   opoiAuditorVerifyResult(tx.opoiAuditorVerifyResult),
+                                                                   opoiAuditorCollateralIn(tx.opoiAuditorCollateralIn),
                                                                    opoiModelArchType(tx.opoiModelArchType),
                                                                    opoiModelTotalParams(tx.opoiModelTotalParams),
                                                                    opoiModelActiveParamsPerToken(tx.opoiModelActiveParamsPerToken),
@@ -297,8 +297,8 @@ CTransaction::CTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION
                                opoiChallengeNonce(), opoiChallengerCollateralIn(), opoiResponsePhase(0),
                                opoiResponseCommitHash(), opoiResponseNonce(), opoiVrfOutput(), opoiModelId(),
                                opoiTier(0), opoiPomRoot(), opoiHostedExpertIds(), opoiEndpoint(), opoiPromptTokenCount(0), opoiIsCanary(0),
-                               opoiTestSuite(), opoiFotonAddress(), opoiFotonVerifyResult(0),
-                               opoiFotonCollateralIn(),
+                               opoiTestSuite(), opoiAuditorAddress(), opoiAuditorVerifyResult(0),
+                               opoiAuditorCollateralIn(),
                                opoiModelArchType(0), opoiModelTotalParams(0), opoiModelActiveParamsPerToken(0),
                                opoiModelNumLayers(0), opoiModelNumDenseShards(0), opoiModelNumExperts(0), opoiModelTopKExperts(0),
                                opoiModelExpertPomRoots(), opoiModelMinRewardPerToken(0), opoiModelVoteApprove(0),
@@ -343,9 +343,9 @@ CTransaction::CTransaction(const CMutableTransaction &tx) : nVersion(tx.nVersion
                                                             opoiPromptTokenCount(tx.opoiPromptTokenCount),
                                                             opoiIsCanary(tx.opoiIsCanary),
                                                             opoiTestSuite(tx.opoiTestSuite),
-                                                            opoiFotonAddress(tx.opoiFotonAddress),
-                                                            opoiFotonVerifyResult(tx.opoiFotonVerifyResult),
-                                                            opoiFotonCollateralIn(tx.opoiFotonCollateralIn),
+                                                            opoiAuditorAddress(tx.opoiAuditorAddress),
+                                                            opoiAuditorVerifyResult(tx.opoiAuditorVerifyResult),
+                                                            opoiAuditorCollateralIn(tx.opoiAuditorCollateralIn),
                                                             opoiModelArchType(tx.opoiModelArchType),
                                                             opoiModelTotalParams(tx.opoiModelTotalParams),
                                                             opoiModelActiveParamsPerToken(tx.opoiModelActiveParamsPerToken),
@@ -406,9 +406,9 @@ CTransaction::CTransaction(
                               opoiPromptTokenCount(tx.opoiPromptTokenCount),
                               opoiIsCanary(tx.opoiIsCanary),
                               opoiTestSuite(tx.opoiTestSuite),
-                              opoiFotonAddress(tx.opoiFotonAddress),
-                              opoiFotonVerifyResult(tx.opoiFotonVerifyResult),
-                              opoiFotonCollateralIn(tx.opoiFotonCollateralIn),
+                              opoiAuditorAddress(tx.opoiAuditorAddress),
+                              opoiAuditorVerifyResult(tx.opoiAuditorVerifyResult),
+                              opoiAuditorCollateralIn(tx.opoiAuditorCollateralIn),
                               opoiModelArchType(tx.opoiModelArchType),
                               opoiModelTotalParams(tx.opoiModelTotalParams),
                               opoiModelActiveParamsPerToken(tx.opoiModelActiveParamsPerToken),
@@ -466,9 +466,9 @@ CTransaction::CTransaction(CMutableTransaction &&tx) : nVersion(tx.nVersion), fO
                                                        opoiPromptTokenCount(tx.opoiPromptTokenCount),
                                                        opoiIsCanary(tx.opoiIsCanary),
                                                        opoiTestSuite(tx.opoiTestSuite),
-                                                       opoiFotonAddress(std::move(tx.opoiFotonAddress)),
-                                                       opoiFotonVerifyResult(tx.opoiFotonVerifyResult),
-                                                       opoiFotonCollateralIn(tx.opoiFotonCollateralIn),
+                                                       opoiAuditorAddress(std::move(tx.opoiAuditorAddress)),
+                                                       opoiAuditorVerifyResult(tx.opoiAuditorVerifyResult),
+                                                       opoiAuditorCollateralIn(tx.opoiAuditorCollateralIn),
                                                        opoiModelArchType(tx.opoiModelArchType),
                                                        opoiModelTotalParams(tx.opoiModelTotalParams),
                                                        opoiModelActiveParamsPerToken(tx.opoiModelActiveParamsPerToken),
@@ -561,9 +561,9 @@ CTransaction& CTransaction::operator=(const CTransaction &tx) {
     *const_cast<uint32_t*>(&opoiPromptTokenCount) = tx.opoiPromptTokenCount;
     *const_cast<uint8_t*>(&opoiIsCanary) = tx.opoiIsCanary;
     *const_cast<uint256*>(&opoiTestSuite) = tx.opoiTestSuite;
-    *const_cast<std::string*>(&opoiFotonAddress) = tx.opoiFotonAddress;
-    *const_cast<uint8_t*>(&opoiFotonVerifyResult) = tx.opoiFotonVerifyResult;
-    *const_cast<COutPoint*>(&opoiFotonCollateralIn) = tx.opoiFotonCollateralIn;
+    *const_cast<std::string*>(&opoiAuditorAddress) = tx.opoiAuditorAddress;
+    *const_cast<uint8_t*>(&opoiAuditorVerifyResult) = tx.opoiAuditorVerifyResult;
+    *const_cast<COutPoint*>(&opoiAuditorCollateralIn) = tx.opoiAuditorCollateralIn;
     *const_cast<uint8_t*>(&opoiModelArchType) = tx.opoiModelArchType;
     *const_cast<uint64_t*>(&opoiModelTotalParams) = tx.opoiModelTotalParams;
     *const_cast<uint64_t*>(&opoiModelActiveParamsPerToken) = tx.opoiModelActiveParamsPerToken;

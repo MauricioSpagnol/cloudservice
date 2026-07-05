@@ -153,9 +153,11 @@ struct Params {
     // feePerToken is specified per-request; this is the network default cap (0 = no default)
     int64_t nOPoIDefaultFeePerToken    = 0;   // zatoshis per token (regtest/testnet may set > 0)
 
-    /** OPoI v3 — FOTON verifiers (F14-C) **/
-    // Minimum number of FOTON verifiers for VERIFIABLE tasks — must be odd ≥ 3
-    int     nOPoIMinFotonVerifiers     = 3;
+    /** OPoI v3 — Auditors (F14-C): verify VERIFIABLE-task responses against a test suite **/
+    // Minimum number of Auditors for VERIFIABLE tasks — must be odd ≥ 3
+    int     nOPoIMinAuditors           = 3;
+    // Minimum collateral an Auditor must lock to submit a verification (zatoshis); set in chainparams
+    int64_t nOPoIAuditorMinCollateral  = 0;
 
     /** OPoI v3 — ECVRF threshold (F10-D) **/
     // Fixed VRF threshold: eligible = VRF_output < threshold

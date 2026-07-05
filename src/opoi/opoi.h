@@ -56,10 +56,10 @@ static const int8_t OPOI_CHALLENGE_EXPIRED = 3;
 static const uint8_t OPOI_TASKCLASS_INTERACTIVE = 0;
 static const uint8_t OPOI_TASKCLASS_BATCH       = 1;
 
-// FOTON verification result values
-static const uint8_t FOTON_VERIFY_PASS    = 0;
-static const uint8_t FOTON_VERIFY_FAIL    = 1;
-static const uint8_t FOTON_VERIFY_TIMEOUT = 2;
+// Auditor verification result values
+static const uint8_t AUDITOR_VERIFY_PASS    = 0;
+static const uint8_t AUDITOR_VERIFY_FAIL    = 1;
+static const uint8_t AUDITOR_VERIFY_TIMEOUT = 2;
 
 // Canary audit strike threshold before stake suspension (not slash)
 static const uint8_t OPOI_MAX_CANARY_STRIKES = 3;
@@ -359,17 +359,25 @@ struct OPoIShardPayment {
     CAmount     amount;
 };
 
-// ── F14-C: FOTON verification record ─────────────────────────────────────────
-
-static const int8_t OPOI_FOTON_STATUS_PENDING  = 0;
-static const int8_t OPOI_FOTON_STATUS_COMPLETE = 1;
-static const int8_t OPOI_FOTON_STATUS_SLASHED  = 2; // FOTON gave wrong answer vs majority
-
-struct FotonVerification {
+// F14-C: one payment owed to a miner for a VERIFIABLE request's RESPONSE that
+// just resolved an Auditor PASS majority. See GetVerifiablePaymentsForBlock.
+struct OPoIResponsePayment {
     std::string requestId;
-    std::string fotonAddress;
-    uint8_t     result;          // FOTON_VERIFY_PASS / FAIL / TIMEOUT
-    COutPoint   fotonCollateral; // FOTON's pledged UTXO (locked during verification)
+    std::string minerAddress;
+    CAmount     amount;
+};
+
+// ── F14-C: Auditor verification record ───────────────────────────────────────
+
+static const int8_t OPOI_AUDITOR_STATUS_PENDING  = 0;
+static const int8_t OPOI_AUDITOR_STATUS_COMPLETE = 1;
+static const int8_t OPOI_AUDITOR_STATUS_SLASHED  = 2; // Auditor gave wrong answer vs majority
+
+struct AuditorVerification {
+    std::string requestId;
+    std::string auditorAddress;
+    uint8_t     result;          // AUDITOR_VERIFY_PASS / FAIL / TIMEOUT
+    COutPoint   auditorCollateral; // Auditor's pledged UTXO (locked during verification)
     uint32_t    blockHeight;
     uint256     txHash;
     int8_t      status;          // PENDING / COMPLETE / SLASHED
@@ -377,18 +385,41 @@ struct FotonVerification {
     ADD_SERIALIZE_METHODS;
     template <typename Stream, typename Operation>
     inline void SerializationOp(Stream& s, Operation ser_action) {
-        READWRITE(requestId); READWRITE(fotonAddress); READWRITE(result);
-        READWRITE(fotonCollateral); READWRITE(blockHeight); READWRITE(txHash);
+        READWRITE(requestId); READWRITE(auditorAddress); READWRITE(result);
+        READWRITE(auditorCollateral); READWRITE(blockHeight); READWRITE(txHash);
         READWRITE(status);
     }
 
     void SetNull() {
-        requestId.clear(); fotonAddress.clear(); result = FOTON_VERIFY_PASS;
-        fotonCollateral.SetNull(); blockHeight = 0; txHash.SetNull();
-        status = OPOI_FOTON_STATUS_PENDING;
+        requestId.clear(); auditorAddress.clear(); result = AUDITOR_VERIFY_PASS;
+        auditorCollateral.SetNull(); blockHeight = 0; txHash.SetNull();
+        status = OPOI_AUDITOR_STATUS_PENDING;
     }
     bool IsNull() const { return requestId.empty(); }
 };
+
+// Pure majority computation over an arbitrary set of Auditor verifications —
+// no cache access, so it can run both against the persisted cache
+// (OPoICache::GetAuditorMajorityResult) and against a "cache + this block's
+// own not-yet-applied AUDITOR_VERIFY txs" combined view (F14-C payments — see
+// GetVerifiablePaymentsForBlock in opoi.cpp), mirroring ComputeShardMajority's
+// role for shard payments exactly (same reason: CreateNewBlock and
+// CheckOPoIPayments must agree using the pre-this-block cache, while
+// ProcessVerifiableResponsePayments runs after the cache already has this
+// block's votes applied — the same merge must produce the same answer either way).
+inline int ComputeAuditorMajority(const std::vector<AuditorVerification>& verifs, int minVerifiers) {
+    int revealed = 0, pass = 0, fail = 0, timeout = 0;
+    for (const auto& fv : verifs) {
+        if (fv.result == AUDITOR_VERIFY_PASS)         { pass++;    revealed++; }
+        else if (fv.result == AUDITOR_VERIFY_FAIL)    { fail++;    revealed++; }
+        else if (fv.result == AUDITOR_VERIFY_TIMEOUT) { timeout++; revealed++; }
+    }
+    if (revealed < minVerifiers) return -1; // no quorum yet
+    if (pass    > (revealed / 2)) return AUDITOR_VERIFY_PASS;
+    if (fail    > (revealed / 2)) return AUDITOR_VERIFY_FAIL;
+    if (timeout > (revealed / 2)) return AUDITOR_VERIFY_TIMEOUT;
+    return -1; // tie (shouldn't happen with odd minVerifiers)
+}
 
 // ── Thread-safe cache ─────────────────────────────────────────────────────────
 
@@ -409,9 +440,9 @@ public:
     // Phase 4: locked collateral UTXOs (miner cannot spend while staked or slashed)
     std::map<COutPoint, std::string> mapLockedUTXOs;    // collateral → ownerAddress
 
-    // F14-C: FOTON verification results
-    // Key = requestId, value = all FotonVerification records for that request
-    std::map<std::string, std::vector<FotonVerification>> mapFotonVerifications;
+    // F14-C: Auditor verification results
+    // Key = requestId, value = all AuditorVerification records for that request
+    std::map<std::string, std::vector<AuditorVerification>> mapAuditorVerifications;
 
     // F15-A: Model Manifests (dense/MoE/hybrid) — modelId → manifest
     std::map<std::string, ModelManifest> mapModelManifests;
@@ -429,10 +460,19 @@ public:
     // shard again in a later block.
     std::set<std::string> setPaidShards;
 
+    // F14-C: requestIds whose Auditor verification has already been resolved
+    // (majority reached, collateral released/slashed) — prevents re-resolving
+    // (and re-unlocking already-unlocked collateral) on a later block.
+    std::set<std::string> setResolvedAuditorVerifications;
+
+    // F14-C: requestIds whose VERIFIABLE RESPONSE has already been paid —
+    // see IsResponsePaid/MarkResponsePaid/UnmarkResponsePaid below.
+    std::set<std::string> setPaidResponses;
+
     // F12-A: Treasury stats (accumulated totals, reset on -reindex)
     CAmount treasurySlashTotal  = 0;
     CAmount treasuryExpiryTotal = 0;
-    CAmount treasuryFotonTotal  = 0;
+    CAmount treasuryAuditorTotal  = 0;
 
     OPoICache() = default;
 
@@ -440,11 +480,12 @@ public:
         LOCK(cs);
         mapRequests.clear(); mapResponses.clear(); mapResponseCommits.clear();
         mapStakes.clear(); mapChallenges.clear();
-        mapLockedUTXOs.clear(); mapFotonVerifications.clear();
+        mapLockedUTXOs.clear(); mapAuditorVerifications.clear();
         mapModelManifests.clear(); mapModelVotes.clear();
         mapCoordinatorClaims.clear(); mapShardResults.clear();
-        setPaidShards.clear();
-        treasurySlashTotal = 0; treasuryExpiryTotal = 0; treasuryFotonTotal = 0;
+        setPaidShards.clear(); setResolvedAuditorVerifications.clear();
+        setPaidResponses.clear();
+        treasurySlashTotal = 0; treasuryExpiryTotal = 0; treasuryAuditorTotal = 0;
     }
 
     // ── F15-D: shard boundary results ────────────────────────────────────────
@@ -502,6 +543,29 @@ public:
     void UnmarkShardPaid(const std::string& requestId, uint32_t shardIndex) {
         LOCK(cs);
         setPaidShards.erase(ShardKey(requestId, shardIndex));
+    }
+
+    // ── F14-C: VERIFIABLE-response payment "already paid" bookkeeping ────────
+    // A VERIFIABLE request's RESPONSE cannot be paid in its own confirming
+    // block — Auditors can only vote on it after it's already on-chain, and
+    // resolution (ProcessAuditorVerifications) itself only ever runs on a
+    // later block. So unlike an OPEN response (paid same-block, no bookkeeping
+    // needed), this is deferred/retried across blocks like shard payments —
+    // paid exactly once, whichever block first sees the request resolved PASS.
+
+    bool IsResponsePaid(const std::string& requestId) const {
+        LOCK(cs);
+        return setPaidResponses.count(requestId) > 0;
+    }
+
+    void MarkResponsePaid(const std::string& requestId) {
+        LOCK(cs);
+        setPaidResponses.insert(requestId);
+    }
+
+    void UnmarkResponsePaid(const std::string& requestId) {
+        LOCK(cs);
+        setPaidResponses.erase(requestId);
     }
 
     // ── F15-C: coordinator claims ────────────────────────────────────────────
@@ -779,52 +843,61 @@ public:
 
     size_t StakeCount() const { LOCK(cs); return mapStakes.size(); }
 
-    // ── F14-C: FOTON verification ─────────────────────────────────────────────
+    // ── F14-C: Auditor verification ───────────────────────────────────────────
 
-    bool AddFotonVerification(const FotonVerification& fv) {
+    bool AddAuditorVerification(const AuditorVerification& fv) {
         LOCK(cs);
-        mapFotonVerifications[fv.requestId].push_back(fv);
-        // Lock FOTON's collateral
-        if (!fv.fotonCollateral.IsNull())
-            mapLockedUTXOs[fv.fotonCollateral] = fv.fotonAddress;
+        auto& verifs = mapAuditorVerifications[fv.requestId];
+        for (const auto& existing : verifs)
+            if (existing.auditorAddress == fv.auditorAddress) return true; // one vote per Auditor
+        verifs.push_back(fv);
+        // Lock Auditor's collateral
+        if (!fv.auditorCollateral.IsNull())
+            mapLockedUTXOs[fv.auditorCollateral] = fv.auditorAddress;
         return true;
     }
 
-    // Returns all FotonVerification records for a request
-    std::vector<FotonVerification> GetFotonVerifications(const std::string& requestId) const {
+    // Returns all AuditorVerification records for a request
+    std::vector<AuditorVerification> GetAuditorVerifications(const std::string& requestId) const {
         LOCK(cs);
-        auto it = mapFotonVerifications.find(requestId);
-        if (it == mapFotonVerifications.end()) return {};
+        auto it = mapAuditorVerifications.find(requestId);
+        if (it == mapAuditorVerifications.end()) return {};
         return it->second;
     }
 
-    // Returns the majority FOTON result for a request, or -1 if no quorum yet
-    // Returns FOTON_VERIFY_PASS/FAIL/TIMEOUT or -1
-    int GetFotonMajorityResult(const std::string& requestId, int minVerifiers) const {
+    // Returns the majority Auditor result for a request, or -1 if no quorum yet
+    // Returns AUDITOR_VERIFY_PASS/FAIL/TIMEOUT or -1
+    int GetAuditorMajorityResult(const std::string& requestId, int minVerifiers) const {
         LOCK(cs);
-        auto it = mapFotonVerifications.find(requestId);
-        if (it == mapFotonVerifications.end()) return -1;
-        const auto& verifs = it->second;
-        int revealed = 0;
-        int pass = 0, fail = 0, timeout = 0;
-        for (const auto& fv : verifs) {
-            if (fv.result == FOTON_VERIFY_PASS)    { pass++;    revealed++; }
-            else if (fv.result == FOTON_VERIFY_FAIL) { fail++; revealed++; }
-            else if (fv.result == FOTON_VERIFY_TIMEOUT) { timeout++; revealed++; }
-        }
-        if (revealed < minVerifiers) return -1; // no quorum yet
-        if (pass    > (revealed / 2)) return FOTON_VERIFY_PASS;
-        if (fail    > (revealed / 2)) return FOTON_VERIFY_FAIL;
-        if (timeout > (revealed / 2)) return FOTON_VERIFY_TIMEOUT;
-        return -1; // tie (shouldn't happen with odd minVerifiers)
+        auto it = mapAuditorVerifications.find(requestId);
+        if (it == mapAuditorVerifications.end()) return -1;
+        return ComputeAuditorMajority(it->second, minVerifiers);
     }
 
-    std::vector<std::pair<std::string, std::vector<FotonVerification>>> ListAllFotonVerifications() const {
+    std::vector<std::pair<std::string, std::vector<AuditorVerification>>> ListAllAuditorVerifications() const {
         LOCK(cs);
-        std::vector<std::pair<std::string, std::vector<FotonVerification>>> result;
-        for (const auto& kv : mapFotonVerifications)
+        std::vector<std::pair<std::string, std::vector<AuditorVerification>>> result;
+        for (const auto& kv : mapAuditorVerifications)
             result.push_back(kv);
         return result;
+    }
+
+    // "Resolved" bookkeeping (mirrors setPaidShards): a requestId's Auditor
+    // verification is resolved exactly once, the first time its majority
+    // reaches quorum (see ProcessAuditorVerifications in opoi.cpp).
+    bool IsAuditorResolved(const std::string& requestId) const {
+        LOCK(cs);
+        return setResolvedAuditorVerifications.count(requestId) > 0;
+    }
+
+    void MarkAuditorResolved(const std::string& requestId) {
+        LOCK(cs);
+        setResolvedAuditorVerifications.insert(requestId);
+    }
+
+    void UnmarkAuditorResolved(const std::string& requestId) {
+        LOCK(cs);
+        setResolvedAuditorVerifications.erase(requestId);
     }
 
     // ── Phase 3: challenges ───────────────────────────────────────────────────
@@ -928,11 +1001,33 @@ int GetEffectiveShardMinSubmissions(const OPoIRequest& req, uint32_t shardIndex,
 std::vector<OPoIShardPayment> GetShardPaymentsForBlock(
     const std::vector<CTransaction>& vtx, const Consensus::Params& params);
 
+// F14-C: VERIFIABLE-request RESPONSE payments newly owed — every cached
+// response whose request IsVerifiable(), isn't in OPoICache::setPaidResponses
+// yet, and whose Auditor verifications (pre-block cache combined with this
+// block's own not-yet-applied AUDITOR_VERIFY txs, same idempotent merge
+// GetShardPaymentsForBlock uses — see ComputeAuditorMajority) resolve to a
+// PASS majority. Called by CreateNewBlock and CheckOPoIPayments, which must
+// see the same vtx to agree on the result.
+std::vector<OPoIResponsePayment> GetVerifiablePaymentsForBlock(
+    const std::vector<CTransaction>& vtx, const Consensus::Params& params);
+
 // Called from ConnectBlock/RebuildOPoICache after the per-tx apply loop —
 // marks every shard paid this block (per GetShardPaymentsForBlock) so it is
 // never paid again. Must run after ProcessOPoITransaction has applied this
 // block's own SHARD_RESULT txs, mirroring ProcessExpiredChallenges etc.
 void ProcessShardPayments(const std::vector<CTransaction>& vtx, const Consensus::Params& params);
+
+// F14-C: called from ConnectBlock/RebuildOPoICache after the per-tx apply loop
+// — marks every VERIFIABLE response paid this block (per
+// GetVerifiablePaymentsForBlock).
+void ProcessVerifiableResponsePayments(const std::vector<CTransaction>& vtx, const Consensus::Params& params);
+
+// F14-C: called from ConnectBlock/RebuildOPoICache after the per-tx apply loop —
+// resolves any requestId whose Auditor verifications just reached quorum
+// (unlock majority collateral, slash minority). See opoi.cpp for full rationale.
+// Order relative to ProcessVerifiableResponsePayments (above) doesn't matter —
+// GetVerifiablePaymentsForBlock recomputes the majority itself either way.
+void ProcessAuditorVerifications(uint32_t blockHeight, const Consensus::Params& params);
 
 // ── Phase 5: challenger rewards ───────────────────────────────────────────────
 
