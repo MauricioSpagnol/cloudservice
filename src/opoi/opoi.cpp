@@ -921,6 +921,29 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                                            "the commit window closed", tx.opoiRequestId),
                                  REJECT_INVALID, "bad-txns-opoi-response-reveal-too-early");
 
+            // Bug fix (2026-07-05): without this, a miner who already revealed
+            // (and got paid) for this requestId can broadcast a SECOND, distinct
+            // REVEAL tx — same requestId/minerAddress/responseHash/commitment/
+            // tokenCount/nonce, so it still matches the one stored COMMIT (never
+            // erased) and passes every check below unchanged, but a different txid
+            // (e.g. different sigTime) — and it gets accepted as a brand-new valid
+            // REVEAL, paying the same miner for the same requestId a second time.
+            // Confirmed live: after a REVEAL was mined and paid, resubmitting via
+            // submitopoiresponse with the same params produced a different txid and
+            // was accepted right up to this point before this fix existed. Simple
+            // reorg-then-remine of the *same* tx is not this bug — undo already
+            // clears this exact map entry, so re-mining it is a legitimate redo, not
+            // a duplicate. req.responseReveals is keyed by minerAddress, so an
+            // existing entry here can only mean this miner already revealed for
+            // this request before — and since only that miner's own key can ever
+            // produce a signature this check's caller (VerifyOPoISig below) will
+            // accept for them, there is no genuine-conflict case to preserve here,
+            // unlike the STAKE/UNSTAKE/CHALLENGE UTXO-lock redeliveries.
+            if (haveReq && req.responseReveals.count(tx.opoiMinerAddress))
+                return state.Invalid(error("CheckOPoITransaction(): RESPONSE REVEAL for %s by %s already known",
+                                           tx.opoiRequestId, tx.opoiMinerAddress),
+                                     REJECT_DUPLICATE, "bad-txns-opoi-response-reveal-already-known");
+
             std::string committedHash;
             if (!g_opoiCache.GetResponseCommit(tx.opoiRequestId, tx.opoiMinerAddress, committedHash))
                 return state.DoS(10, error("CheckOPoITransaction(): RESPONSE REVEAL for %s by %s with no "
