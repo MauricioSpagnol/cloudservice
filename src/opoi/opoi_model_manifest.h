@@ -93,11 +93,19 @@ struct ModelVoteRecord {
     bool        approve;
     CAmount     weight;
     uint32_t    blockHeight;
+    // Bug fix (2026-07-05): which tx applied this record — lets
+    // CheckOPoITransaction tell a harmless late P2P redelivery of the exact
+    // same already-applied vote (AlreadyHave()'s usual dedup can't catch it,
+    // same empty-vin/vout reason as STAKE/UNSTAKE/etc.) from a genuinely NEW
+    // re-vote arriving after the window closed — re-voting overwrites this
+    // record with a fresh txHash, so only a byte-identical resend matches.
+    uint256     txHash;
 
     ADD_SERIALIZE_METHODS;
     template <typename Stream, typename Operation>
     inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(voterAddress); READWRITE(approve); READWRITE(weight); READWRITE(blockHeight);
+        READWRITE(txHash);
     }
 };
 

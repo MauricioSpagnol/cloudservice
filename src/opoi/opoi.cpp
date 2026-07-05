@@ -584,6 +584,7 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         rec.voterAddress = tx.opoiRequester;
         rec.approve      = (tx.opoiModelVoteApprove != 0);
         rec.blockHeight  = blockHeight;
+        rec.txHash       = tx.GetHash();
         OPoIStake voterStake;
         rec.weight = g_opoiCache.GetStake(tx.opoiRequester, voterStake) && voterStake.IsActive()
                      ? voterStake.amount : 0;
@@ -1295,6 +1296,20 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
             return state.DoS(10, error("CheckOPoITransaction(): MODEL_VOTE missing voter"),
                              REJECT_INVALID, "bad-txns-opoi-model-vote-no-voter");
         if (!fIsVerifying) {
+            // Bug fix (2026-07-05): a harmless late P2P redelivery of this
+            // voter's own already-applied vote must not be judged against
+            // the window-closed/staker checks below — those describe
+            // whether a NEW vote may be cast, not whether an old one may be
+            // re-seen. Confirmed live: an already-mined MODEL_VOTE tx,
+            // re-accepted into mempool well after its voting window closed
+            // (see the OPoI-tx mempool-residency gap noted in
+            // ProcessOPoITransaction's REQUEST case), used to be rejected
+            // and DoS-penalized purely for arriving late a second time.
+            if (g_opoiCache.IsHarmlessModelVoteRedelivery(tx.opoiModelId, tx.opoiRequester, tx.GetHash()))
+                return state.Invalid(error("CheckOPoITransaction(): MODEL_VOTE %s by %s already known",
+                                           tx.GetHash().GetHex(), tx.opoiRequester),
+                                     REJECT_DUPLICATE, "bad-txns-opoi-model-vote-already-known");
+
             ModelManifest m;
             if (!g_opoiCache.GetModelManifest(tx.opoiModelId, m))
                 return state.DoS(10, error("CheckOPoITransaction(): MODEL_VOTE for unknown model %s",
@@ -1337,20 +1352,37 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                 return state.DoS(10, error("CheckOPoITransaction(): COORDINATOR_CLAIM for unknown request %s",
                                            tx.opoiRequestId),
                                  REJECT_INVALID, "bad-txns-opoi-coord-unknown-request");
-            // F15-C: VRF self-claim — "COORD" domain-separates this from RESPONSE
-            // eligibility so a response proof can never be replayed as a coordinator claim.
-            uint256 seedHash;
-            if (!GetOPoIRequestSeedHash(tx.opoiRequestId, seedHash))
-                return state.DoS(10, error("CheckOPoITransaction(): COORDINATOR_CLAIM cannot derive VRF seed for %s",
-                                           tx.opoiRequestId),
-                                 REJECT_INVALID, "bad-txns-opoi-coord-no-seed");
-            std::string reason;
-            if (!CheckVrfSortition(tx.opoiMinerAddress, tx.opoiRequestId, seedHash, "COORD", tx.opoiVrfProof,
-                                    Params().GetConsensus().nOPoICoordinatorThreshold, reason))
-                return state.DoS(reason == "vrf-invalid" ? 100 : 10,
-                                 error("CheckOPoITransaction(): COORDINATOR_CLAIM VRF check failed (%s) for %s",
-                                       reason, tx.opoiMinerAddress),
-                                 REJECT_INVALID, "bad-txns-opoi-coord-" + reason);
+            // Bug fix (2026-07-05): skip VRF re-verification entirely once
+            // this address is already a recorded accepted coordinator for
+            // this request. Eligibility for (request, miner, "COORD") is
+            // fixed forever the moment ANY valid claim from that address is
+            // accepted (this file's own comments already say so elsewhere,
+            // e.g. shard_worker.rs's mirror of this fact) — re-deriving it
+            // again is provably redundant, and doing so anyway was the
+            // actual mechanism behind a confirmed live bug: a late P2P
+            // redelivery of this exact already-mined CLAIM tx sometimes came
+            // back "vrf-invalid" on recheck, triggering an instant DoS(100)
+            // ban of the honest relaying peer for resending a tx that had
+            // already been accepted once. AddCoordinatorClaim's own apply
+            // already no-ops a duplicate minerAddress, so skipping here
+            // changes no on-chain outcome, only removes a spurious
+            // rejection path for a fact already established.
+            if (!g_opoiCache.IsClaimedCoordinator(tx.opoiRequestId, tx.opoiMinerAddress)) {
+                // F15-C: VRF self-claim — "COORD" domain-separates this from RESPONSE
+                // eligibility so a response proof can never be replayed as a coordinator claim.
+                uint256 seedHash;
+                if (!GetOPoIRequestSeedHash(tx.opoiRequestId, seedHash))
+                    return state.DoS(10, error("CheckOPoITransaction(): COORDINATOR_CLAIM cannot derive VRF seed for %s",
+                                               tx.opoiRequestId),
+                                     REJECT_INVALID, "bad-txns-opoi-coord-no-seed");
+                std::string reason;
+                if (!CheckVrfSortition(tx.opoiMinerAddress, tx.opoiRequestId, seedHash, "COORD", tx.opoiVrfProof,
+                                        Params().GetConsensus().nOPoICoordinatorThreshold, reason))
+                    return state.DoS(reason == "vrf-invalid" ? 100 : 10,
+                                     error("CheckOPoITransaction(): COORDINATOR_CLAIM VRF check failed (%s) for %s",
+                                           reason, tx.opoiMinerAddress),
+                                     REJECT_INVALID, "bad-txns-opoi-coord-" + reason);
+            }
         }
         // Verify claimant's signature
         {

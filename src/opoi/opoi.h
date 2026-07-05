@@ -797,6 +797,19 @@ public:
         return true;
     }
 
+    // Bug fix (2026-07-05): true only if this exact tx already applied as
+    // this voter's recorded vote — a genuinely new re-vote (different
+    // txHash) returns false, since re-voting must still go through the
+    // normal window-closed check.
+    bool IsHarmlessModelVoteRedelivery(const std::string& modelId, const std::string& voterAddress,
+                                       const uint256& txHash) const {
+        LOCK(cs);
+        auto it = mapModelVotes.find(modelId);
+        if (it == mapModelVotes.end()) return false;
+        auto voteIt = it->second.find(voterAddress);
+        return voteIt != it->second.end() && voteIt->second.txHash == txHash;
+    }
+
     // Weighted tally: returns {yesWeight, noWeight} across all recorded votes.
     void TallyModelVotes(const std::string& modelId, CAmount& yesWeight, CAmount& noWeight) const {
         LOCK(cs);
