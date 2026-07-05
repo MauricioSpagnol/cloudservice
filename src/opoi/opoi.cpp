@@ -863,6 +863,37 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
         if (tx.opoiPayment <= 0)
             return state.DoS(10, error("CheckOPoITransaction(): REQUEST payment must be positive"),
                              REJECT_INVALID, "bad-txns-opoi-zero-payment");
+        // Bug fix (2026-07-05): unlike every other OPoI tx type keyed by its
+        // own id (STAKE's collateral, MODEL_REGISTER's modelId,
+        // COORDINATOR_CLAIM's minerAddress, ...), REQUEST had NO check at
+        // all for "does this requestId already exist" — and AddRequest's
+        // apply is a plain map overwrite (mapRequests[req.requestId] = req),
+        // never additive. Confirmed live: a REQUEST tx, once fully
+        // FULFILLED, could have its ENTIRE lifecycle silently reset back to
+        // PENDING (response_commits/response_reveals/commit_window_closed
+        // all wiped) simply by re-mining the SAME already-confirmed tx —
+        // achievable via ordinary P2P propagation timing (a peer relaying a
+        // stale copy back after the miner that broadcast it already mined
+        // it), not even requiring malice, since AlreadyHave()'s dedup can't
+        // recognize an OPoI tx as already-known (empty vin/vout, same
+        // reason as every other fix this session). A harmless redelivery of
+        // the exact same tx is now a no-op duplicate; a genuinely different
+        // tx reusing an existing requestId (a real collision, whether by bug
+        // or by a client picking a non-unique id) is rejected outright —
+        // request_id is meant to be unique, so overwriting an existing one
+        // is never legitimate either way.
+        if (!fIsVerifying) {
+            OPoIRequest existingReq;
+            if (g_opoiCache.GetRequest(tx.opoiRequestId, existingReq)) {
+                if (existingReq.txHash == tx.GetHash())
+                    return state.Invalid(error("CheckOPoITransaction(): REQUEST %s already known",
+                                               tx.GetHash().GetHex()),
+                                         REJECT_DUPLICATE, "bad-txns-opoi-request-already-known");
+                return state.DoS(10, error("CheckOPoITransaction(): REQUEST id %s already exists",
+                                           tx.opoiRequestId),
+                                 REJECT_INVALID, "bad-txns-opoi-request-id-collision");
+            }
+        }
         // F14-B: VERIFIABLE tasks (code/math/SQL) are checked by an Auditor against a
         // test suite (F14-C) — without a test suite hash there is nothing to check.
         if (tx.opoiTaskType == OPOI_TASK_VERIFIABLE && tx.opoiTestSuite.IsNull())
