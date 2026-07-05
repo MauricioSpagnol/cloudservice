@@ -3961,6 +3961,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         ProcessChallengerRewardPayments(block.vtx, (uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessExpiredChallenges((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessExpiredRequests((uint32_t)pindex->nHeight, chainparams.GetConsensus());
+        g_opoiCache.PruneExpiredPendingDeliveries();
         ProcessResponseCommitWindows((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessModelVotingWindows((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessShardPayments(block.vtx, chainparams.GetConsensus());
@@ -7407,6 +7408,44 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 // peer might be an older or different implementation with
                 // a different signature key, etc.
                 Misbehaving(pfrom->GetId(), 10);
+            }
+        }
+    }
+
+    // OPoI relay (2026-07-05): flood-relay for pending deliveries (prompt
+    // text etc.) to a miner with no reachable HTTP endpoint — see
+    // opoi.h/PendingDelivery doc comment. Modeled directly on the "alert"
+    // branch just above (push-and-flood, hash-based dedup via CNode::setKnown)
+    // rather than the tx/block inv/getdata dance, since this is a small,
+    // bounded, ephemeral blob with no need for negotiation.
+    else if (strCommand == "opoidata")
+    {
+        COPoIDataMsg msg;
+        vRecv >> msg;
+
+        uint256 msgHash = msg.GetHash();
+        pfrom->setKnown.insert(msgHash);
+
+        if (!g_opoiCache.HasKnownOPoIDataHash(msgHash)) {
+            std::string reason;
+            if (ProcessOPoIDataMessage(msg, reason)) {
+                g_opoiCache.MarkOPoIDataHashKnown(msgHash);
+                LOCK(cs_vNodes);
+                BOOST_FOREACH(CNode* pnode, vNodes) {
+                    if (pnode->setKnown.insert(msgHash).second)
+                        pnode->PushMessage("opoidata", msg);
+                }
+            } else {
+                // Deliberately no Misbehaving penalty: unlike alert, a
+                // rejection here ("request-not-pending", "unknown-request")
+                // is routinely just mesh-propagation timing racing against
+                // the referenced REQUEST's own resolution/expiry — the exact
+                // "harmless P2P timing, not malice" class of false positive
+                // this same session already fixed for several other OPoI tx
+                // types (see IsHarmlessRedelivery/IsHarmlessUnstakeRedelivery
+                // above). Not consensus-critical either way — worst case is
+                // one dropped delivery, retried by the requester.
+                LogPrint("opoi", "opoidata rejected from peer=%d: %s\n", pfrom->id, reason);
             }
         }
     }

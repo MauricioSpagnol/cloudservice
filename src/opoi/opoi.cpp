@@ -124,6 +124,55 @@ static bool IsHarmlessRedelivery(const COutPoint& collateral, const uint256& txH
     return g_opoiCache.GetLockingTxHash(collateral, lockingTxHash) && lockingTxHash == txHash;
 }
 
+// ── OPoI relay (2026-07-05): P2P delivery for NAT'd/CGNAT'd miners ────────────
+// Shared by the "opoidata" P2P receive handler (main.cpp) and the
+// submitopoipendingdelivery RPC (rpc/opoi.cpp) — same validation either way.
+// Ties spam-prevention to real on-chain state for free: the signature must
+// recover to the REQUEST's own requester address, and the REQUEST must still
+// be PENDING — no requestId, wrong signer, or already-resolved request means
+// this is dropped before ever being stored or relayed, the same way
+// CheckOPoITransaction already validates RESPONSE/CHALLENGE signatures.
+bool ProcessOPoIDataMessage(const COPoIDataMsg& msg, std::string& reason)
+{
+    if (msg.destStakeAddress.empty() || msg.requestId.empty()) {
+        reason = "missing-fields";
+        return false;
+    }
+    if (msg.payloadHex.size() > OPOI_DELIVERY_MAX_PAYLOAD_HEX) {
+        reason = "payload-too-large";
+        return false;
+    }
+    if (msg.kind != OPOI_DELIVERY_PROMPT && msg.kind != OPOI_DELIVERY_SHARD_ASSIGN) {
+        reason = "bad-kind";
+        return false;
+    }
+
+    OPoIRequest req;
+    if (!g_opoiCache.GetRequest(msg.requestId, req)) {
+        reason = "unknown-request";
+        return false;
+    }
+    if (!req.IsPending()) {
+        reason = "request-not-pending";
+        return false;
+    }
+
+    std::string sigMsg = std::string("OPOIDATA") + msg.requestId + msg.destStakeAddress
+                        + strprintf("%u", msg.kind) + msg.payloadHex;
+    if (!VerifyOPoISig(req.requester, sigMsg, msg.sig)) {
+        reason = "bad-sig";
+        return false;
+    }
+
+    PendingDelivery d;
+    d.requestId  = msg.requestId;
+    d.kind       = msg.kind;
+    d.payloadHex = msg.payloadHex;
+    d.sigTime    = msg.sigTime;
+    g_opoiCache.AddPendingDelivery(msg.destStakeAddress, d);
+    return true;
+}
+
 // Stable VRF seed anchor for a request: the hash of the block the REQUEST
 // itself confirmed in. Unlike chainActive.Tip(), this never changes once the
 // request is mined, so proofs computed against it stay valid regardless of

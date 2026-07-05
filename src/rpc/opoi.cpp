@@ -18,6 +18,7 @@
 #include "key.h"
 #include "primitives/transaction.h"
 #include "main.h"
+#include "net.h"
 #include "util.h"
 #include "utilstrencodings.h"
 #include "utilmoneystr.h"
@@ -2191,6 +2192,118 @@ UniValue getauditorverifications(const UniValue& params, bool fHelp)
     return ret;
 }
 
+// ── OPoI relay (2026-07-05): P2P delivery for NAT'd/CGNAT'd miners ────────────
+// See PendingDelivery/COPoIDataMsg doc comments in opoi.h for the full design.
+
+UniValue submitopoipendingdelivery(const UniValue& params, bool fHelp)
+{
+    if (fHelp || params.size() != 3)
+        throw std::runtime_error(
+            "submitopoipendingdelivery \"request_id\" \"dest_stake_address\" \"payload_hex\"\n"
+            "\nOPoI relay: deliver off-chain data (e.g. prompt text) to a miner with no\n"
+            "reachable HTTP endpoint, via P2P flood-relay instead of POSTing directly to\n"
+            "the miner's declared endpoint (see /api/opoi/prompt). Signs as the\n"
+            "REQUEST's own requester (this node's wallet must hold that key) and floods\n"
+            "it to every connected peer; the destination miner's own node ends up with a\n"
+            "copy regardless of which node originated it (no addressed routing needed)\n"
+            "and the miner polls it via getopoipendingdeliveries on ITS OWN node.\n"
+            "\nArguments:\n"
+            "1. request_id          (string, required) UUID of the inference request\n"
+            "2. dest_stake_address  (string, required) The miner's stake/mining address\n"
+            "3. payload_hex         (string, required) Raw payload as hex (e.g. UTF-8\n"
+            "                       prompt text hex-encoded) — max 64KB encoded\n"
+            "\nResult:\n"
+            "{ delivered: true }\n"
+            "\nExamples:\n"
+            + HelpExampleCli("submitopoipendingdelivery", "\"uuid\" \"tmMinerAddr...\" \"68656c6c6f\"")
+        );
+
+#ifdef ENABLE_WALLET
+    EnsureWalletIsUnlocked();
+#endif
+
+    std::string requestId  = params[0].get_str();
+    std::string destAddr   = params[1].get_str();
+    std::string payloadHex = params[2].get_str();
+
+    if (requestId.empty()) throw std::runtime_error("request_id must not be empty");
+    if (destAddr.empty())  throw std::runtime_error("dest_stake_address must not be empty");
+    if (payloadHex.size() > OPOI_DELIVERY_MAX_PAYLOAD_HEX)
+        throw std::runtime_error("payload_hex exceeds max size");
+
+    OPoIRequest req;
+    if (!g_opoiCache.GetRequest(requestId, req))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "unknown request_id: " + requestId);
+    if (!req.IsPending())
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "request " + requestId + " is no longer PENDING");
+
+    COPoIDataMsg msg;
+    msg.destStakeAddress = destAddr;
+    msg.requestId        = requestId;
+    msg.kind             = OPOI_DELIVERY_PROMPT;
+    msg.payloadHex       = payloadHex;
+    msg.sigTime          = (uint32_t)GetTime();
+
+    std::string sigMsg = std::string("OPOIDATA") + requestId + destAddr
+                        + strprintf("%u", (unsigned)msg.kind) + payloadHex;
+    std::string errMsg;
+    if (!SignWithAddress(req.requester, sigMsg, msg.sig, errMsg))
+        throw JSONRPCError(RPC_WALLET_ERROR, "Failed to sign: " + errMsg);
+
+    std::string reason;
+    if (!ProcessOPoIDataMessage(msg, reason))
+        throw JSONRPCError(RPC_MISC_ERROR, "rejected: " + reason);
+
+    // Flood to every currently-connected peer — same code shape as the P2P
+    // receive handler in main.cpp's ProcessMessage "opoidata" branch.
+    uint256 msgHash = msg.GetHash();
+    g_opoiCache.MarkOPoIDataHashKnown(msgHash);
+    {
+        LOCK(cs_vNodes);
+        for (CNode* pnode : vNodes) {
+            if (pnode->setKnown.insert(msgHash).second)
+                pnode->PushMessage("opoidata", msg);
+        }
+    }
+
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("delivered", true);
+    return ret;
+}
+
+UniValue getopoipendingdeliveries(const UniValue& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw std::runtime_error(
+            "getopoipendingdeliveries \"stake_address\"\n"
+            "\nOPoI relay: read and DRAIN (removes them) every pending delivery queued\n"
+            "for this stake address on THIS node — see submitopoipendingdelivery. A\n"
+            "miner with no reachable HTTP endpoint polls this on its OWN trusted node\n"
+            "instead of exposing its own HTTP server; since deliveries are flooded to\n"
+            "every peer, this node has a copy regardless of who originated it.\n"
+            "\nArguments:\n"
+            "1. stake_address  (string, required) The miner's stake/mining address\n"
+            "\nResult:\n"
+            "[{ request_id, kind, payload_hex, sig_time }, ...]\n"
+            "\nExamples:\n"
+            + HelpExampleCli("getopoipendingdeliveries", "\"tmMinerAddr...\"")
+        );
+
+    std::string destAddr = params[0].get_str();
+    if (destAddr.empty()) throw std::runtime_error("stake_address must not be empty");
+
+    UniValue arr(UniValue::VARR);
+    for (const auto& d : g_opoiCache.GetAndDrainPendingDeliveries(destAddr)) {
+        UniValue obj(UniValue::VOBJ);
+        obj.pushKV("request_id",  d.requestId);
+        obj.pushKV("kind",        (int)d.kind);
+        obj.pushKV("payload_hex", d.payloadHex);
+        obj.pushKV("sig_time",    (int)d.sigTime);
+        arr.push_back(obj);
+    }
+    return arr;
+}
+
 // ── Registration ──────────────────────────────────────────────────────────────
 
 static const CRPCCommand commands[] =
@@ -2225,6 +2338,9 @@ static const CRPCCommand commands[] =
     // F14-C — Auditor verification (VERIFIABLE-task payment gate)
     { "opoi",   "submitauditorverification", &submitauditorverification, false },
     { "opoi",   "getauditorverifications",   &getauditorverifications,   false },
+    // OPoI relay — P2P delivery for NAT'd/CGNAT'd miners
+    { "opoi",   "submitopoipendingdelivery", &submitopoipendingdelivery, false },
+    { "opoi",   "getopoipendingdeliveries",  &getopoipendingdeliveries,  false },
     { "hidden", "rebuilopoidb",       &rebuilopoidb,        false },
     { "hidden", "opoivrfselftest",    &opoivrfselftest,     false },
     { "hidden", "opoivrfverifyraw",   &opoivrfverifyraw,    false },

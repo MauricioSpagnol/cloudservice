@@ -21,6 +21,7 @@
 #include <vector>
 #include <algorithm>
 #include "serialize.h"
+#include "hash.h"
 #include "uint256.h"
 #include "amount.h"
 #include "pubkey.h"
@@ -419,6 +420,66 @@ struct AuditorVerification {
     bool IsNull() const { return requestId.empty(); }
 };
 
+// ── OPoI relay (P2P delivery for NAT'd/CGNAT'd miners) ────────────────────────
+// Deliberately NOT consensus/blockchain data: never touched by
+// ProcessOPoITransaction/undo, never replayed by RebuildOPoICache. It's
+// best-effort P2P-layer plumbing so a miner that never declared a reachable
+// OPoIStake.endpoint can still receive a prompt in real time — instead of the
+// requester POSTing straight to the miner's HTTP API, they submit this to
+// THEIR OWN node (submitopoipendingdelivery RPC), which floods it exactly
+// like the existing alert system (see alert.h/alert.cpp) to every peer; the
+// destination miner's own cs-miner polls ITS OWN node's copy
+// (getopoipendingdeliveries RPC) — no addressed routing to a specific "home
+// node" needed, since flooding means every node ends up with a copy anyway.
+static const uint8_t OPOI_DELIVERY_PROMPT       = 0;
+static const uint8_t OPOI_DELIVERY_SHARD_ASSIGN = 1; // reserved, not consumed yet
+static const size_t  OPOI_DELIVERY_MAX_PAYLOAD_HEX = 131072; // 64KB of raw payload, hex-encoded
+
+struct PendingDelivery {
+    std::string requestId;
+    uint8_t     kind;
+    std::string payloadHex;
+    uint32_t    sigTime;
+
+    void SetNull() {
+        requestId.clear(); kind = OPOI_DELIVERY_PROMPT; payloadHex.clear(); sigTime = 0;
+    }
+};
+
+// The P2P wire message itself (and the RPC-submitted equivalent — both paths
+// share this one struct and the same validate/store/relay function in
+// opoi.cpp). Signed the same way every other OPoI signature is (VerifyOPoISig,
+// signmessage-compatible) so validation reuses the exact machinery
+// CheckOPoITransaction already relies on for RESPONSE/CHALLENGE signatures —
+// no new trust primitive.
+struct COPoIDataMsg {
+    std::string destStakeAddress;
+    std::string requestId;
+    uint8_t     kind;
+    std::string payloadHex;
+    uint32_t    sigTime;
+    std::vector<unsigned char> sig;
+
+    ADD_SERIALIZE_METHODS;
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(destStakeAddress); READWRITE(requestId); READWRITE(kind);
+        READWRITE(payloadHex); READWRITE(sigTime); READWRITE(sig);
+    }
+
+    uint256 GetHash() const { return SerializeHash(*this); }
+};
+
+// Validates a COPoIDataMsg (signature must recover to the named REQUEST's
+// requester, request must still be PENDING, payload size bounded) and, if
+// valid, stores it into g_opoiCache. Shared by the P2P receive handler
+// (main.cpp, "opoidata" command) and the submitopoipendingdelivery RPC —
+// same validation either way, only the entry point differs. Returns false
+// (with a short machine-readable reason) without storing anything on any
+// failure; callers use the return value to decide whether to flood-relay
+// onward (never relay something that failed validation).
+bool ProcessOPoIDataMessage(const COPoIDataMsg& msg, std::string& reason);
+
 // Pure majority computation over an arbitrary set of Auditor verifications —
 // no cache access, so it can run both against the persisted cache
 // (OPoICache::GetAuditorMajorityResult) and against a "cache + this block's
@@ -512,6 +573,15 @@ public:
     CAmount treasuryExpiryTotal = 0;
     CAmount treasuryAuditorTotal  = 0;
 
+    // OPoI relay: pending deliveries, keyed by destination stake address —
+    // see PendingDelivery/COPoIDataMsg above. Not consensus state.
+    std::map<std::string, std::vector<PendingDelivery>> mapPendingDeliveries;
+    // Dedup for the flood-relay itself (by COPoIDataMsg hash) — mirrors
+    // mapAlreadyAskedFor-style hash sets elsewhere, needed because a node's
+    // own local storage above is keyed by dest address (many messages per
+    // key), not by message hash.
+    std::set<uint256> setKnownOPoIDataHashes;
+
     OPoICache() = default;
 
     void SetNull() {
@@ -523,6 +593,7 @@ public:
         mapCoordinatorClaims.clear(); mapShardResults.clear();
         setPaidShards.clear(); setResolvedAuditorVerifications.clear();
         setPaidResponses.clear(); setPaidChallengerRewards.clear();
+        mapPendingDeliveries.clear(); setKnownOPoIDataHashes.clear();
         treasurySlashTotal = 0; treasuryExpiryTotal = 0; treasuryAuditorTotal = 0;
     }
 
@@ -976,6 +1047,64 @@ public:
     void MarkAuditorResolved(const std::string& requestId) {
         LOCK(cs);
         setResolvedAuditorVerifications.insert(requestId);
+    }
+
+    // ── OPoI relay: pending deliveries ────────────────────────────────────────
+
+    // Stores a delivery once, whether it arrived over P2P (opoidata message)
+    // or via the local submitopoipendingdelivery RPC — the caller
+    // (ProcessOPoIDataMessage in opoi.cpp) has already validated the
+    // signature and PENDING-request check before calling this. Dedup is by
+    // message hash, done by the caller via setKnownOPoIDataHashes before
+    // this is reached; this just appends.
+    void AddPendingDelivery(const std::string& destStakeAddress, const PendingDelivery& d) {
+        LOCK(cs);
+        mapPendingDeliveries[destStakeAddress].push_back(d);
+    }
+
+    // Read-and-drain: returns everything queued for this address and clears
+    // it. A poller calling this on its own node gets each delivery exactly
+    // once per poll (not "forever", unlike GetRequest-style lookups) — that's
+    // the right semantics here since PromptQueue insertion downstream is the
+    // actual durable record once picked up.
+    std::vector<PendingDelivery> GetAndDrainPendingDeliveries(const std::string& destStakeAddress) {
+        LOCK(cs);
+        auto it = mapPendingDeliveries.find(destStakeAddress);
+        if (it == mapPendingDeliveries.end()) return {};
+        std::vector<PendingDelivery> result = std::move(it->second);
+        mapPendingDeliveries.erase(it);
+        return result;
+    }
+
+    bool HasKnownOPoIDataHash(const uint256& hash) const {
+        LOCK(cs);
+        return setKnownOPoIDataHashes.count(hash) > 0;
+    }
+
+    void MarkOPoIDataHashKnown(const uint256& hash) {
+        LOCK(cs);
+        setKnownOPoIDataHashes.insert(hash);
+    }
+
+    // Called alongside ProcessExpiredRequests in ConnectBlock (main.cpp) — a
+    // pending delivery decays in lockstep with the REQUEST it's attached to,
+    // once that REQUEST is no longer PENDING. Not called from
+    // RebuildOPoICache's replay: this map is never populated by replay in the
+    // first place (it's P2P/RPC-layer data, not consensus state produced by
+    // ProcessOPoITransaction), so there is nothing to prune there.
+    void PruneExpiredPendingDeliveries() {
+        LOCK(cs);
+        for (auto it = mapPendingDeliveries.begin(); it != mapPendingDeliveries.end(); ) {
+            // Each destAddress's queue can mix requestIds in principle; filter
+            // per-entry rather than assuming a queue is single-request.
+            auto& vec = it->second;
+            vec.erase(std::remove_if(vec.begin(), vec.end(), [&](const PendingDelivery& d) {
+                auto rit = mapRequests.find(d.requestId);
+                return rit == mapRequests.end() || rit->second.status != OPOI_STATUS_PENDING;
+            }), vec.end());
+            if (vec.empty()) it = mapPendingDeliveries.erase(it);
+            else ++it;
+        }
     }
 
     void UnmarkAuditorResolved(const std::string& requestId) {
