@@ -981,6 +981,12 @@ public:
     std::set<JSOutPoint> setLockedSproutNotes;
     std::set<SaplingOutPoint> setLockedSaplingNotes;
 
+    // OPoI collateral currently locked by g_opoiCache that this wallet has
+    // auto-locked via LockCoin(), so coin selection (sendtoaddress etc.)
+    // never offers it up. Tracked separately from setLockedCoins so we only
+    // ever unlock what we ourselves locked, never a user's manual lockunspent.
+    std::set<COutPoint> setOPoILockedCoins;
+
     int64_t nTimeFirstKey;
 
     const CWalletTx* GetWalletTx(const uint256& hash) const;
@@ -1000,6 +1006,14 @@ public:
     void UnlockCoin(COutPoint& output);
     void UnlockAllCoins();
     void ListLockedCoins(std::vector<COutPoint>& vOutpts);
+
+    //! Mirror g_opoiCache.mapLockedUTXOs into this wallet's own lock-coin set,
+    //! so sendtoaddress/fundrawtransaction/listunspent never offer up a UTXO
+    //! that is actually staked (or slashed) OPoI collateral. Called once per
+    //! new best chain tip (see SetBestChain) since the underlying lock/unlock
+    //! is height-triggered (unstake cooldown, slash), not just tied to a
+    //! single wallet-visible transaction.
+    void SyncOPoILockedCoins();
 
     bool IsLockedNote(const JSOutPoint& outpt) const;
     void LockNote(const JSOutPoint& output);

@@ -6,6 +6,7 @@
 
 #include "wallet/wallet.h"
 
+#include "opoi/opoi.h"
 #include "asyncrpcqueue.h"
 #include "checkpoints.h"
 #include "coincontrol.h"
@@ -644,6 +645,40 @@ void CWallet::SetBestChain(const CBlockLocator& loc)
 {
     CWalletDB walletdb(strWalletFile);
     SetBestChainINTERNAL(walletdb, loc);
+    SyncOPoILockedCoins();
+}
+
+void CWallet::SyncOPoILockedCoins()
+{
+    std::set<COutPoint> current;
+    {
+        LOCK(g_opoiCache.cs);
+        for (const auto& kv : g_opoiCache.mapLockedUTXOs)
+            current.insert(kv.first);
+    }
+
+    LOCK(cs_wallet);
+    // Unlock anything we previously auto-locked that OPoI no longer locks
+    // (unstake cooldown elapsed, or the STAKE tx was undone by a reorg).
+    // Never touches setLockedCoins entries the user locked manually via
+    // lockunspent — those live in a separate set.
+    for (auto it = setOPoILockedCoins.begin(); it != setOPoILockedCoins.end(); ) {
+        if (!current.count(*it)) {
+            COutPoint out = *it;
+            UnlockCoin(out);
+            it = setOPoILockedCoins.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // Lock anything newly staked (or still slashed) that we haven't locked yet.
+    for (const COutPoint& outConst : current) {
+        if (!setOPoILockedCoins.count(outConst)) {
+            COutPoint out = outConst;
+            LockCoin(out);
+            setOPoILockedCoins.insert(outConst);
+        }
+    }
 }
 
 std::set<std::pair<libflux::PaymentAddress, uint256>> CWallet::GetNullifiersForAddresses(
@@ -1714,6 +1749,26 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransaction& tx, const CBlock* pbl
 
 void CWallet::SyncTransaction(const CTransaction& tx, const CBlock* pblock)
 {
+    // OPoI STAKE/UNSTAKE transactions have empty vin/vout by design (the
+    // collateral outpoint only exists in the tx's custom OPoI fields), so
+    // AddToWalletIfInvolvingMe below never sees them as "ours" and returns
+    // early. Resync our locked-coin mirror of g_opoiCache.mapLockedUTXOs
+    // whenever we're notified about an OPoI tx (immediate lock/unlock for
+    // STAKE/UNSTAKE, fired for both ConnectTip and DisconnectTip i.e. also
+    // on reorg-undo) — this is what keeps listunspent/coin selection from
+    // ever offering up staked or slashed collateral.
+    //
+    // Also resync on the coinbase tx specifically: every connected/
+    // disconnected block has exactly one, so this is a cheap once-per-block
+    // hook that catches the height-triggered cases (unstake cooldown
+    // elapsing, slash) which aren't tied to any particular transaction in
+    // that block. SetBestChain() only fires at most once an hour
+    // (DATABASE_WRITE_INTERVAL) and only alongside a new block, so it's far
+    // too slow to rely on alone for this.
+    if (tx.nVersion == OPOI_TX_VERSION || tx.IsCoinBase()) {
+        SyncOPoILockedCoins();
+    }
+
     LOCK(cs_wallet);
     if (!AddToWalletIfInvolvingMe(tx, pblock, true))
         return; // Not one of ours
