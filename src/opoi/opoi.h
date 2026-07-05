@@ -178,6 +178,13 @@ struct OPoIStake {
     uint256     txHash;
     int8_t      stakeStatus;      // ACTIVE / UNSTAKING / RELEASED / SLASHED / SUSPENDED
     uint32_t    unstakeHeight;    // block where UNSTAKE tx confirmed (0 if not unstaking)
+    // Bug fix (2026-07-05): txid of the UNSTAKE tx that put this staker into
+    // UNSTAKING, so CheckOPoITransaction can tell a harmless late P2P
+    // redelivery of that same tx (IsActiveStaker() now correctly false, since
+    // this very tx is what flipped it) from a genuinely different UNSTAKE
+    // racing in — same pattern as mapLockingTxHash above, for a check that
+    // isn't keyed by a locked UTXO.
+    uint256     unstakeTxHash;
     // F10-C: Reputation tracking
     uint32_t    responsesTotal;
     uint32_t    responsesChallenged;
@@ -199,7 +206,7 @@ struct OPoIStake {
         READWRITE(minerAddress); READWRITE(collateralIn); READWRITE(amount);
         READWRITE(modelId); READWRITE(tier); READWRITE(pomRoot);
         READWRITE(blockHeight); READWRITE(lastRenewalHeight); READWRITE(sigTime); READWRITE(txHash);
-        READWRITE(stakeStatus); READWRITE(unstakeHeight);
+        READWRITE(stakeStatus); READWRITE(unstakeHeight); READWRITE(unstakeTxHash);
         READWRITE(responsesTotal); READWRITE(responsesChallenged); READWRITE(responsesSlashed);
         READWRITE(canaryStrikes); READWRITE(minerPubKey); READWRITE(hostedExpertIds);
         READWRITE(endpoint);
@@ -213,7 +220,7 @@ struct OPoIStake {
         minerAddress.clear(); collateralIn.SetNull(); amount = 0;
         modelId.clear(); tier = 0; pomRoot.SetNull(); hostedExpertIds.clear(); endpoint.clear();
         blockHeight = 0; lastRenewalHeight = 0; sigTime = 0; txHash.SetNull();
-        stakeStatus = OPOI_STAKE_ACTIVE; unstakeHeight = 0;
+        stakeStatus = OPOI_STAKE_ACTIVE; unstakeHeight = 0; unstakeTxHash.SetNull();
         responsesTotal = 0; responsesChallenged = 0; responsesSlashed = 0;
         canaryStrikes = 0; minerPubKey = CPubKey();
     }
@@ -870,13 +877,25 @@ public:
                it->second.canaryStrikes < OPOI_MAX_CANARY_STRIKES;
     }
 
-    bool StartUnstake(const std::string& minerAddress, uint32_t height) {
+    bool StartUnstake(const std::string& minerAddress, uint32_t height, const uint256& txHashIn) {
         LOCK(cs);
         auto it = mapStakes.find(minerAddress);
         if (it == mapStakes.end() || !it->second.IsActive()) return false;
-        it->second.stakeStatus  = OPOI_STAKE_UNSTAKING;
+        it->second.stakeStatus   = OPOI_STAKE_UNSTAKING;
         it->second.unstakeHeight = height;
+        it->second.unstakeTxHash = txHashIn;
         return true;
+    }
+
+    // Bug fix (2026-07-05): same harmless-redelivery pattern as
+    // mapLockingTxHash, but for UNSTAKE — which has no locked-UTXO of its own
+    // to key off of. A stale P2P relay of an already-applied UNSTAKE tx would
+    // otherwise find IsActiveStaker() now false (this very tx flipped it) and
+    // get the full DoS(100) meant for a genuine conflict.
+    bool IsHarmlessUnstakeRedelivery(const std::string& minerAddress, const uint256& txHash) {
+        LOCK(cs);
+        auto it = mapStakes.find(minerAddress);
+        return it != mapStakes.end() && it->second.IsUnstaking() && it->second.unstakeTxHash == txHash;
     }
 
     bool ReleaseStake(const std::string& minerAddress) {

@@ -191,8 +191,9 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
             // Revert unstake: restore to ACTIVE
             auto it = g_opoiCache.mapStakes.find(tx.opoiMinerAddress);
             if (it != g_opoiCache.mapStakes.end()) {
-                it->second.stakeStatus  = OPOI_STAKE_ACTIVE;
+                it->second.stakeStatus   = OPOI_STAKE_ACTIVE;
                 it->second.unstakeHeight = 0;
+                it->second.unstakeTxHash.SetNull();
             }
 
         } else if (tx.nType == OPOI_CHALLENGE_TX_TYPE) {
@@ -384,7 +385,7 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
                   tx.opoiCollateralIn.hash.GetHex(), tx.opoiCollateralIn.n);
 
     } else if (tx.nType == OPOI_UNSTAKE_TX_TYPE) {
-        if (g_opoiCache.StartUnstake(tx.opoiMinerAddress, blockHeight))
+        if (g_opoiCache.StartUnstake(tx.opoiMinerAddress, blockHeight, tx.GetHash()))
             LogPrintf("OPoI: UNSTAKE requested by %s at height %u\n",
                       tx.opoiMinerAddress, blockHeight);
 
@@ -1014,10 +1015,15 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
         if (tx.opoiMinerAddress.empty())
             return state.DoS(10, error("CheckOPoITransaction(): UNSTAKE missing minerAddress"),
                              REJECT_INVALID, "bad-txns-opoi-unstake-no-miner");
-        if (!fIsVerifying && !g_opoiCache.IsActiveStaker(tx.opoiMinerAddress))
+        if (!fIsVerifying && !g_opoiCache.IsActiveStaker(tx.opoiMinerAddress)) {
+            if (g_opoiCache.IsHarmlessUnstakeRedelivery(tx.opoiMinerAddress, tx.GetHash()))
+                return state.Invalid(error("CheckOPoITransaction(): UNSTAKE %s already known",
+                                           tx.GetHash().GetHex()),
+                                     REJECT_DUPLICATE, "bad-txns-opoi-unstake-already-known");
             return state.DoS(100, error("CheckOPoITransaction(): UNSTAKE from non-active staker %s",
                                        tx.opoiMinerAddress),
                              REJECT_INVALID, "bad-txns-opoi-unstake-not-staked");
+        }
         // Verify miner's intent to unstake
         {
             std::string sigMsg = std::string("UNSTAKE") + tx.opoiMinerAddress;
