@@ -721,6 +721,11 @@ static UniValue OPoIStakeToUniValue(const OPoIStake& s)
     for (uint32_t e : s.hostedExpertIds) experts.push_back((int)e);
     obj.pushKV("hosted_expert_ids", experts);
     obj.pushKV("endpoint", s.endpoint);
+    // F10-C: on-chain reputation
+    obj.pushKV("reputation_score",      s.ReputationScore());
+    obj.pushKV("responses_total",       (int)s.responsesTotal);
+    obj.pushKV("responses_challenged",  (int)s.responsesChallenged);
+    obj.pushKV("responses_slashed",     (int)s.responsesSlashed);
     return obj;
 }
 

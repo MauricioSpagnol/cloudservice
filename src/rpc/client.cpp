@@ -155,6 +155,12 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "stakeopoi",          6 },   // tier (integer) — F9-B
     { "submitopoirequest",  3 },   // max_tokens (integer)
     { "submitopoirequest",  4 },   // payment (integer/amount)
+    // Bug fix (2026-07): token_count was never registered here, so any
+    // caller passing it (cs-cli, not raw JSON-RPC) got "JSON value is not
+    // an integer as expected" — get_int() on a value that stayed a raw
+    // string. Found while multi-node testing F12-A/F10-C, which both
+    // require token_count > 0 to reach a paid RESPONSE.
+    { "submitopoiresponse", 4 },   // token_count (integer)
     { "listopoirequests",   0 },   // verbose (bool treated as int)
     { "listopoiresponses",  0 },
     // F15-A/A2

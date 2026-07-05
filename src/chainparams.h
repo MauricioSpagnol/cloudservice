@@ -152,6 +152,13 @@ public:
     int64_t GetDevFundInterval() const { return nDevFundInterval; }
     int GetDevFundMaxTimes() const { return nDevFundMaxTimes; }
 
+    // F12-A: OPoI treasury share of a slashed miner's stake. Reuses the Dev
+    // Fund address (decided with the user 2026-07-05) rather than introducing
+    // a new address/custody model — "treasury" elsewhere in the OPoI code
+    // means "burn" (see opoi.cpp ProcessExpiredRequests), this is the one
+    // place it now names a real destination.
+    std::string GetOPoITreasuryAddress() const { return strDevFundAddress; }
+
     std::string GetMarketingFundAddress() const { return strMarketingFundAddress; }
     int64_t GetMarketingFundStartHeight() const { return nMarketingFundStartHeight; }
     CAmount GetMarketingFundAmount() const { return nMarketingFundAmount; }

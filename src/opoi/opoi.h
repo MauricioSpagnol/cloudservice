@@ -982,6 +982,14 @@ bool CheckOPoIPayments(const std::vector<CTransaction>& vtx,
                        const Consensus::Params& params,
                        CValidationState& state);
 
+// F11-B/C: called from ConnectBlock to cap how many REQUEST/RESPONSE txs a
+// single block may contain, regardless of fee/priority — bounds how much of
+// a block the OPoI subsystem can occupy. Purely a per-block tx-type count,
+// independent of any other OPoI validation.
+bool CheckOPoIBlockCaps(const std::vector<CTransaction>& vtx,
+                        const Consensus::Params& params,
+                        CValidationState& state);
+
 // F15-F: how many submissions a shard actually needs before its majority is
 // final — lowered from the configured nOPoIShardMinSubmissions when fewer
 // miners could ever possibly submit (e.g. an expert hosted by only 1-2
@@ -1060,6 +1068,11 @@ struct OPoIChallengerReward {
     std::string challengerAddress;
     CAmount     rewardAmount;
     std::string requestId;
+    // F12-A: the other half of the slashed miner's stake, owed to the OPoI
+    // treasury (GetOPoITreasuryAddress()) for this same proven CHALLENGE.
+    // Aggregated across all rewards in the block into a single coinbase
+    // output (see miner.cpp) rather than one output per requestId.
+    CAmount     treasuryAmount;
 };
 
 // Returns rewards owed for CHALLENGEs proven at blockHeight (REVEAL verified +

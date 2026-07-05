@@ -583,6 +583,11 @@ public:
         // F15-G — small depth so toy models can actually exercise the rejection path
         consensus.nOPoIMaxPipelineDepth = 3;
 
+        // F11-B/C — low caps so a manual test can actually hit and exercise the
+        // rejection path without mining dozens of throwaway REQUEST/RESPONSE txs.
+        consensus.nOPoIMaxRequestsPerBlock  = 3;
+        consensus.nOPoIMaxResponsesPerBlock = 5;
+
         consensus.nMinimumChainWork = uint256S("0x00");
 
         consensus.nZawyLWMAAveragingWindow = 60;

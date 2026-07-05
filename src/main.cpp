@@ -3527,6 +3527,14 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         }
     }
 
+    // F11-B/C: cap REQUEST/RESPONSE tx count per block — stateless (no cache
+    // dependency), so unlike the payment checks below it also applies during
+    // VerifyDB replay.
+    if (NetworkUpgradeActive(pindex->nHeight, chainparams.GetConsensus(), Consensus::UPGRADE_OPOI)) {
+        if (!CheckOPoIBlockCaps(block.vtx, chainparams.GetConsensus(), state))
+            return false; // state already set by CheckOPoIBlockCaps
+    }
+
     // Check OPoI miner payments in the coinbase (skip during VerifyDB — cache may be in rebuild state)
     if (!fIsVerifying && NetworkUpgradeActive(pindex->nHeight, chainparams.GetConsensus(), Consensus::UPGRADE_OPOI)) {
         if (!CheckOPoIPayments(block.vtx, pindex->nHeight, chainparams.GetConsensus(), state))
@@ -3936,8 +3944,22 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
 
     // OPoI: per-block state transitions (slash, release, request expiry)
     if (!fIsVerifying && NetworkUpgradeActive(pindex->nHeight, chainparams.GetConsensus(), Consensus::UPGRADE_OPOI)) {
-        ProcessExpiredChallenges((uint32_t)pindex->nHeight, chainparams.GetConsensus());
+        // Bug fix (2026-07): ProcessChallengerRewardPayments must run BEFORE
+        // ProcessExpiredChallenges, not after. GetChallengerRewardsAtHeight (which
+        // both CreateNewBlock and this call rely on) is a pure function of the
+        // pre-block cache + this block's own vtx — CreateNewBlock built this
+        // block's coinbase using the cache as it stood at the END of the PREVIOUS
+        // block. If ProcessExpiredChallenges ran first, it could flip a
+        // REVEALED_PENDING challenge to SLASHED right here (a pure height/quorum
+        // tick, no tx of its own in this block) — then ProcessChallengerRewardPayments
+        // would immediately see that fresh SLASHED status and permanently mark the
+        // reward "paid", even though THIS block's already-built coinbase (mined
+        // before either of these ran) never actually contained the payout. Net
+        // effect: the reward silently vanishes forever instead of being paid one
+        // block later. Running this call first means it only ever sees the exact
+        // state CreateNewBlock saw for this block, matching what was actually paid.
         ProcessChallengerRewardPayments(block.vtx, (uint32_t)pindex->nHeight, chainparams.GetConsensus());
+        ProcessExpiredChallenges((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessExpiredRequests((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessModelVotingWindows((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessShardPayments(block.vtx, chainparams.GetConsensus());

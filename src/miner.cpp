@@ -306,6 +306,12 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
         int nBlockSigOps = 100;
         bool fSortedByFee = (nBlockPrioritySize <= 0);
 
+        // F11-B/C: track REQUEST/RESPONSE count so the template itself never
+        // exceeds CheckOPoIBlockCaps — ConnectBlock enforces the cap regardless,
+        // this just avoids mining a block that would be rejected by our own peers.
+        int nOPoIRequestsIncluded = 0;
+        int nOPoIResponsesIncluded = 0;
+
         TxPriorityCompare comparer(fSortedByFee);
         std::make_heap(vecPriority.begin(), vecPriority.end(), comparer);
 
@@ -345,6 +351,19 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
             unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION);
             if (nBlockSize + nTxSize >= nBlockMaxSize)
                 continue;
+
+            // F11-B/C: don't let the template itself exceed CheckOPoIBlockCaps
+            if (tx.nVersion == OPOI_TX_VERSION) {
+                const Consensus::Params& opoiParams = chainparams.GetConsensus();
+                if (tx.nType == OPOI_REQUEST_TX_TYPE
+                    && opoiParams.nOPoIMaxRequestsPerBlock > 0
+                    && nOPoIRequestsIncluded >= opoiParams.nOPoIMaxRequestsPerBlock)
+                    continue;
+                if (tx.nType == OPOI_RESPONSE_TX_TYPE
+                    && opoiParams.nOPoIMaxResponsesPerBlock > 0
+                    && nOPoIResponsesIncluded >= opoiParams.nOPoIMaxResponsesPerBlock)
+                    continue;
+            }
 
             // Legacy limits on sigOps:
             unsigned int nTxSigOps = GetLegacySigOpCount(tx);
@@ -434,6 +453,10 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
             ++nBlockTx;
             nBlockSigOps += nTxSigOps;
             nFees += nTxFees;
+            if (tx.nVersion == OPOI_TX_VERSION) {
+                if (tx.nType == OPOI_REQUEST_TX_TYPE) ++nOPoIRequestsIncluded;
+                else if (tx.nType == OPOI_RESPONSE_TX_TYPE) ++nOPoIResponsesIncluded;
+            }
 
             if (fPrintPriority)
             {
@@ -565,14 +588,25 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
                 CTxDestination minerDest = DecodeDestination(vtx.opoiMinerAddress);
                 if (!IsValidDestination(minerDest))
                     continue;
+                // Bug fix (2026-07): this only ever paid req.payment (the base fee),
+                // never the per-token component — CheckOPoIPayments (the consensus
+                // check this must match) always required
+                // req.payment + tokenCount*feePerToken, so any RESPONSE to a
+                // feePerToken>0 REQUEST made every block mining it invalid. Never
+                // surfaced before because nothing forced feePerToken>0 in practice;
+                // F9-D's model-minimum-fee floor now does, so this had to be fixed
+                // for F9-D to be usable at all.
+                CAmount totalPayment = req.payment;
+                if (req.feePerToken > 0 && vtx.opoiTokenCount > 0)
+                    totalPayment += (CAmount)vtx.opoiTokenCount * req.feePerToken;
                 // Enforce 10% OPoI budget cap (halving-aware)
-                if (totalOPoIPayment + req.payment > opoiBudget)
+                if (totalOPoIPayment + totalPayment > opoiBudget)
                     continue;
                 // Safety: never exceed remaining coinbase vout[0]
-                if (totalOPoIPayment + req.payment > txNew.vout[0].nValue)
+                if (totalOPoIPayment + totalPayment > txNew.vout[0].nValue)
                     continue;
-                txNew.vout.push_back(CTxOut(req.payment, GetScriptForDestination(minerDest)));
-                totalOPoIPayment += req.payment;
+                txNew.vout.push_back(CTxOut(totalPayment, GetScriptForDestination(minerDest)));
+                totalOPoIPayment += totalPayment;
             }
 
             // F16: shard-routed payments (SHARD_RESULT) — same opoiBudget as
@@ -630,6 +664,21 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
                           FormatMoney(reward.rewardAmount), reward.challengerAddress, nHeight);
             }
             txNew.vout[0].nValue -= totalChallengerRewards;
+
+            // F12-A: treasury gets the other half of each slashed miner's stake —
+            // one aggregated output, not one per requestId (mirrors
+            // CheckOPoIChallengerRewards, which must agree on the same total).
+            CAmount totalTreasuryReward = 0;
+            for (const auto& reward : challengerRewards) totalTreasuryReward += reward.treasuryAmount;
+            if (totalTreasuryReward > 0 && totalTreasuryReward <= txNew.vout[0].nValue) {
+                CTxDestination treasuryDest = DecodeDestination(chainparams.GetOPoITreasuryAddress());
+                if (IsValidDestination(treasuryDest)) {
+                    txNew.vout.push_back(CTxOut(totalTreasuryReward, GetScriptForDestination(treasuryDest)));
+                    txNew.vout[0].nValue -= totalTreasuryReward;
+                    LogPrintf("OPoI: treasury reward %s at height %d\n",
+                              FormatMoney(totalTreasuryReward), nHeight);
+                }
+            }
         }
 
         // Add fees

@@ -140,7 +140,15 @@ struct Params {
     int     nOPoIUnstakeCooldownBlocks = 1440;// blocks after UNSTAKE before collateral is released
 
     /** OPoI Phase 5 — challenger reward **/
-    int     nOPoIChallengerRewardPct   = 10;  // % of staked amount paid to challenger on successful slash
+    // F12-A (2026-07): bumped 10 -> 50 — treasury now takes the other half of a
+    // slashed miner's stake (see nOPoITreasuryRewardPct) instead of the whole
+    // remainder being burned. Never overridden per-network (same as before).
+    int     nOPoIChallengerRewardPct   = 50;  // % of staked amount paid to challenger on successful slash
+
+    /** F12-A — treasury share of a slashed miner's stake on a proven CHALLENGE.
+     *  Paired with nOPoIChallengerRewardPct above: together they sum to 100 (the
+     *  two shares are carved out of the slashed miner's stakedAmount). **/
+    int     nOPoITreasuryRewardPct     = 50;  // % of staked amount paid to treasury on successful slash
 
     /** OPoI v3 — challenger collateral + commit-reveal (F10-A / F8-C) **/
     // Challenger's collateral must be >= (challenged miner's stake * nOPoIChallengerStakePct / 100).
@@ -191,6 +199,11 @@ struct Params {
     /** F15-G — latency budget: max sequential DenseShards a task_class=INTERACTIVE
      *  request's model may have. Deeper models must be requested as BATCH. **/
     int         nOPoIMaxPipelineDepth       = 6;
+
+    /** F11-B/C — per-block caps on REQUEST/RESPONSE tx count, to bound how much
+     *  of a block the OPoI subsystem can occupy regardless of fee/priority. **/
+    int         nOPoIMaxRequestsPerBlock    = 50;
+    int         nOPoIMaxResponsesPerBlock   = 100;
 
 };
 } // namespace Consensus

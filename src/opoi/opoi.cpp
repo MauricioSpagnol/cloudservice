@@ -284,6 +284,12 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         resp.sigTime       = tx.opoiSigTime;
         resp.txHash        = tx.GetHash();
         g_opoiCache.AddResponse(resp);
+        // F10-C: reputation tracking — count this responder's completed RESPONSE.
+        {
+            auto stakeIt = g_opoiCache.mapStakes.find(tx.opoiMinerAddress);
+            if (stakeIt != g_opoiCache.mapStakes.end())
+                ++stakeIt->second.responsesTotal;
+        }
         LogPrintf("OPoI: RESPONSE for %s by %s (tokens=%u) at height %u\n",
                   tx.opoiRequestId, tx.opoiMinerAddress, tx.opoiTokenCount, blockHeight);
 
@@ -302,6 +308,19 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         stake.txHash        = tx.GetHash();
         stake.stakeStatus   = OPOI_STAKE_ACTIVE;
         stake.unstakeHeight = 0;
+        // Bug fix (2026-07): OPoIStake has no default member initializers, so a
+        // plain `OPoIStake stake;` leaves every POD field not assigned above as
+        // indeterminate stack garbage — not zero. These four were always left
+        // uninitialized (a real, pre-existing bug), invisible until now because
+        // nothing ever read them (F9-E renewal, F9-F canary, F10-C reputation
+        // were all dead code). F10-C's new increments (++stakeIt->second.responsesTotal
+        // etc.) add 1 to garbage and stay garbage, which is exactly what surfaced
+        // this while testing F10-C.
+        stake.lastRenewalHeight    = 0;
+        stake.responsesTotal       = 0;
+        stake.responsesChallenged  = 0;
+        stake.responsesSlashed     = 0;
+        stake.canaryStrikes        = 0;
         // F10-D: recover the signer's pubkey so VRF eligibility can be verified later.
         // (Same sigMsg formula CheckOPoITransaction uses to verify this STAKE's signature.)
         {
@@ -335,6 +354,16 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         ch.challengeStatus      = OPOI_CHALLENGE_OPEN;
         g_opoiCache.AddChallenge(ch);
         g_opoiCache.LockUTXO(tx.opoiChallengerCollateralIn, tx.opoiRequester);
+        // F10-C: reputation tracking — count a CHALLENGE opened against the
+        // responder of this requestId (if a RESPONSE is even cached yet).
+        {
+            auto respIt = g_opoiCache.mapResponses.find(tx.opoiRequestId);
+            if (respIt != g_opoiCache.mapResponses.end()) {
+                auto stakeIt = g_opoiCache.mapStakes.find(respIt->second.minerAddress);
+                if (stakeIt != g_opoiCache.mapStakes.end())
+                    ++stakeIt->second.responsesChallenged;
+            }
+        }
         LogPrintf("OPoI: CHALLENGE COMMIT for request %s by %s at height %u — collateral %s:%u locked\n",
                   tx.opoiRequestId, tx.opoiRequester, blockHeight,
                   tx.opoiChallengerCollateralIn.hash.GetHex(), tx.opoiChallengerCollateralIn.n);
@@ -363,8 +392,10 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
                     auto respIt = g_opoiCache.mapResponses.find(tx.opoiRequestId);
                     if (respIt != g_opoiCache.mapResponses.end()) {
                         auto stakeIt = g_opoiCache.mapStakes.find(respIt->second.minerAddress);
-                        if (stakeIt != g_opoiCache.mapStakes.end() && stakeIt->second.IsActive())
+                        if (stakeIt != g_opoiCache.mapStakes.end() && stakeIt->second.IsActive()) {
                             stakeIt->second.stakeStatus = OPOI_STAKE_SLASHED;
+                            ++stakeIt->second.responsesSlashed; // F10-C
+                        }
                     }
                     g_opoiCache.UnlockUTXO(ch.challengerCollateral);
                     ch.challengeStatus = OPOI_CHALLENGE_SLASHED;
@@ -549,8 +580,10 @@ void ProcessExpiredChallenges(uint32_t blockHeight, const Consensus::Params& par
                 auto respIt = g_opoiCache.mapResponses.find(ch.requestId);
                 if (respIt != g_opoiCache.mapResponses.end()) {
                     auto stakeIt = g_opoiCache.mapStakes.find(respIt->second.minerAddress);
-                    if (stakeIt != g_opoiCache.mapStakes.end() && stakeIt->second.IsActive())
+                    if (stakeIt != g_opoiCache.mapStakes.end() && stakeIt->second.IsActive()) {
                         stakeIt->second.stakeStatus = OPOI_STAKE_SLASHED;
+                        ++stakeIt->second.responsesSlashed; // F10-C
+                    }
                 }
                 g_opoiCache.UnlockUTXO(ch.challengerCollateral);
                 ch.challengeStatus = OPOI_CHALLENGE_SLASHED;
@@ -697,6 +730,17 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                                            "(%u dense shards) for INTERACTIVE — use BATCH",
                                            manifest.modelId, manifest.numDenseShards),
                                  REJECT_INVALID, "bad-txns-opoi-request-pipeline-too-deep-for-interactive");
+            // F9-D: a Model Manifest can declare a minimum per-token reward it
+            // requires (minRewardPerToken) — a REQUEST offering less than that
+            // floor would never attract an honest staker for this model, and
+            // undercuts the price other requesters already agreed to respect.
+            if (g_opoiCache.GetModelManifest(tx.opoiModel, manifest) && manifest.IsActive()
+                && manifest.minRewardPerToken > 0 && tx.opoiFeePerToken < manifest.minRewardPerToken)
+                return state.DoS(10, error("CheckOPoITransaction(): REQUEST feePerToken %s below model %s "
+                                           "minimum %s",
+                                           FormatMoney(tx.opoiFeePerToken), manifest.modelId,
+                                           FormatMoney(manifest.minRewardPerToken)),
+                                 REJECT_INVALID, "bad-txns-opoi-request-fee-below-model-minimum");
         }
         // Verify requester's signature. Bug fix (2026-07-02): this previously omitted
         // feePerToken and taskType from the signed message (a mismatch with what
@@ -735,6 +779,20 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                 return state.DoS(10, error("CheckOPoITransaction(): RESPONSE for expired REQUEST %s",
                                             tx.opoiRequestId),
                                  REJECT_INVALID, "bad-txns-opoi-request-expired");
+            // F9-C: the responder's staked model must match the REQUEST's model —
+            // a miner staked for GEMMA_3_4B has no business answering a request
+            // that specifically asked for QWEN25_1_5B (different weights, different
+            // inference result entirely). Only enforced when both sides of the
+            // comparison are known; an empty req.model means the REQUEST itself
+            // wasn't found in cache (e.g. VerifyDB replay ordering) — nothing to
+            // compare against, so let the existing REQUEST-side checks be authoritative.
+            OPoIStake stake;
+            if (!req.model.empty() && g_opoiCache.GetStake(tx.opoiMinerAddress, stake)
+                && !stake.modelId.empty() && stake.modelId != req.model)
+                return state.DoS(10, error("CheckOPoITransaction(): RESPONSE miner %s staked for model %s, "
+                                           "REQUEST %s asked for model %s",
+                                           tx.opoiMinerAddress, stake.modelId, tx.opoiRequestId, req.model),
+                                 REJECT_INVALID, "bad-txns-opoi-response-model-mismatch");
         }
 
         // F10-B: bug fix (2026-07-02) — this switch previously ignored opoiResponsePhase
@@ -1209,6 +1267,35 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
     return true;
 }
 
+// ── CheckOPoIBlockCaps ────────────────────────────────────────────────────────
+// F11-B/C: bounds how many REQUEST/RESPONSE txs a single block may contain.
+// Stateless count over this block's own vtx — no cache lookup needed, since
+// the cap is about block occupancy, not any cross-block resource.
+
+bool CheckOPoIBlockCaps(const std::vector<CTransaction>& vtx,
+                        const Consensus::Params& params,
+                        CValidationState& state)
+{
+    int nRequests = 0, nResponses = 0;
+    for (const CTransaction& tx : vtx) {
+        if (tx.nVersion != OPOI_TX_VERSION) continue;
+        if (tx.nType == OPOI_REQUEST_TX_TYPE) ++nRequests;
+        else if (tx.nType == OPOI_RESPONSE_TX_TYPE) ++nResponses;
+    }
+
+    if (params.nOPoIMaxRequestsPerBlock > 0 && nRequests > params.nOPoIMaxRequestsPerBlock)
+        return state.DoS(10, error("CheckOPoIBlockCaps(): %d REQUEST txs exceeds cap %d",
+                                   nRequests, params.nOPoIMaxRequestsPerBlock),
+                         REJECT_INVALID, "bad-cb-opoi-too-many-requests");
+
+    if (params.nOPoIMaxResponsesPerBlock > 0 && nResponses > params.nOPoIMaxResponsesPerBlock)
+        return state.DoS(10, error("CheckOPoIBlockCaps(): %d RESPONSE txs exceeds cap %d",
+                                   nResponses, params.nOPoIMaxResponsesPerBlock),
+                         REJECT_INVALID, "bad-cb-opoi-too-many-responses");
+
+    return true;
+}
+
 // ── CheckOPoIPayments ─────────────────────────────────────────────────────────
 // Verifies that for each RESPONSE tx in vtx[1..], the coinbase (vtx[0]) contains
 // an output paying the miner:
@@ -1612,13 +1699,17 @@ void ProcessAuditorVerifications(uint32_t blockHeight, const Consensus::Params& 
 // the pre-apply callers (CreateNewBlock/CheckOPoIChallengerRewards), not just
 // to ProcessOPoITransaction's own immediate-resolution path — same bug class
 // already fixed once for F14-C's verifiable-response payment gate.
-// The reward is nOPoIChallengerRewardPct % of the miner's staked amount.
+// The challenger's share is nOPoIChallengerRewardPct % of the miner's staked
+// amount; F12-A (2026-07) adds a second share, nOPoITreasuryRewardPct %, paid
+// to GetOPoITreasuryAddress() for the same proven CHALLENGE — together they
+// account for the full stakedAmount instead of leaving the challenger's half
+// as the only payout.
 
 std::vector<OPoIChallengerReward> GetChallengerRewardsAtHeight(
     const std::vector<CTransaction>& vtx, uint32_t blockHeight, const Consensus::Params& params)
 {
     std::vector<OPoIChallengerReward> rewards;
-    if (params.nOPoIChallengerRewardPct <= 0) return rewards;
+    if (params.nOPoIChallengerRewardPct <= 0 && params.nOPoITreasuryRewardPct <= 0) return rewards;
 
     LOCK(g_opoiCache.cs);
 
@@ -1631,11 +1722,12 @@ std::vector<OPoIChallengerReward> GetChallengerRewardsAtHeight(
 
         CAmount stakedAmount = stakeIt->second.amount;
         CAmount reward = (stakedAmount * params.nOPoIChallengerRewardPct) / 100;
-        if (reward <= 0) return;
+        CAmount treasuryReward = (stakedAmount * params.nOPoITreasuryRewardPct) / 100;
+        if (reward <= 0 && treasuryReward <= 0) return;
 
-        rewards.push_back({challengerAddress, reward, requestId});
-        LogPrint("opoi", "GetChallengerRewardsAtHeight: height=%u challenger=%s reward=%s\n",
-                 blockHeight, challengerAddress, FormatMoney(reward));
+        rewards.push_back({challengerAddress, reward, requestId, treasuryReward});
+        LogPrint("opoi", "GetChallengerRewardsAtHeight: height=%u challenger=%s reward=%s treasury=%s\n",
+                 blockHeight, challengerAddress, FormatMoney(reward), FormatMoney(treasuryReward));
     };
 
     // Case 1: already resolved SLASHED in an earlier block (deferred VERIFIABLE
@@ -1726,6 +1818,39 @@ bool CheckOPoIChallengerRewards(const std::vector<CTransaction>& vtx,
                              REJECT_INVALID, "bad-cb-opoi-missing-challenger-reward");
 
         checkedTotal += reward.rewardAmount;
+    }
+
+    // F12-A: treasury gets the other half of each slashed miner's stake —
+    // aggregated into a single expected output (CreateNewBlock mirrors this,
+    // see miner.cpp) rather than checking one output per requestId.
+    CAmount totalTreasuryReward = 0;
+    for (const auto& reward : rewards)
+        totalTreasuryReward += reward.treasuryAmount;
+
+    if (totalTreasuryReward > 0) {
+        if (checkedTotal + totalTreasuryReward > totalCoinbaseValue) {
+            LogPrint("opoi", "CheckOPoIChallengerRewards: treasury reward %s exceeds coinbase, skipping\n",
+                     FormatMoney(totalTreasuryReward));
+        } else {
+            CTxDestination treasuryDest = DecodeDestination(Params().GetOPoITreasuryAddress());
+            if (!IsValidDestination(treasuryDest))
+                return state.DoS(100, error("CheckOPoIChallengerRewards(): invalid treasury address %s",
+                                            Params().GetOPoITreasuryAddress()),
+                                 REJECT_INVALID, "bad-cb-opoi-invalid-treasury-addr");
+
+            CScript expectedTreasuryScript = GetScriptForDestination(treasuryDest);
+            bool foundTreasury = false;
+            for (const CTxOut& out : coinbase.vout) {
+                if (out.scriptPubKey == expectedTreasuryScript && out.nValue == totalTreasuryReward) {
+                    foundTreasury = true;
+                    break;
+                }
+            }
+            if (!foundTreasury)
+                return state.DoS(100, error("CheckOPoIChallengerRewards(): coinbase missing treasury reward"
+                                            " of %s", FormatMoney(totalTreasuryReward)),
+                                 REJECT_INVALID, "bad-cb-opoi-missing-treasury-reward");
+        }
     }
 
     return true;
