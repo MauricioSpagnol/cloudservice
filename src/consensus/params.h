@@ -142,6 +142,13 @@ struct Params {
     /** OPoI Phase 5 — challenger reward **/
     int     nOPoIChallengerRewardPct   = 10;  // % of staked amount paid to challenger on successful slash
 
+    /** OPoI v3 — challenger collateral + commit-reveal (F10-A / F8-C) **/
+    // Challenger's collateral must be >= (challenged miner's stake * nOPoIChallengerStakePct / 100).
+    int     nOPoIChallengerStakePct           = 10;
+    // Blocks after COMMIT within which REVEAL must arrive, or the challenge is
+    // dismissed (challenger's own collateral is slashed instead of the miner's).
+    int     nOPoIChallengeCommitRevealBlocks  = 144;
+
     /** OPoI Phase 6 — request expiry **/
     int     nOPoIRequestExpiryBlocks   = 2016;// blocks a PENDING request stays valid (mainnet ~2 weeks)
 

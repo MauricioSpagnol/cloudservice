@@ -43,9 +43,11 @@ static const int8_t OPOI_STAKE_RELEASED    = 3;
 static const int8_t OPOI_STAKE_SLASHED     = 4;
 static const int8_t OPOI_STAKE_SUSPENDED   = 5; // F9-F: 3 canary strikes — re-stake required
 
-static const int8_t OPOI_CHALLENGE_OPEN    = 1;
-static const int8_t OPOI_CHALLENGE_SLASHED = 2;
-static const int8_t OPOI_CHALLENGE_EXPIRED = 3;
+static const int8_t OPOI_CHALLENGE_OPEN             = 1; // COMMIT received, awaiting REVEAL
+static const int8_t OPOI_CHALLENGE_SLASHED          = 2; // proven fraud (VERIFIABLE + Auditor FAIL) — miner slashed
+static const int8_t OPOI_CHALLENGE_EXPIRED           = 3; // no REVEAL in time, or reveal didn't hold up — challenger slashed
+static const int8_t OPOI_CHALLENGE_REVEALED_PENDING  = 4; // valid REVEAL, VERIFIABLE task, waiting on Auditor majority
+static const int8_t OPOI_CHALLENGE_RESOLVED_NO_ORACLE= 5; // valid REVEAL, OPEN task — no fraud oracle exists (F10-C), no slash either side
 
 // task_type values — OPOI_TASK_OPEN / OPOI_TASK_VERIFIABLE now defined in
 // primitives/transaction.h (needed there by CTransaction's template serializer)
@@ -224,7 +226,7 @@ struct OPoIStake {
 struct OPoIChallenge {
     std::string requestId;           // which RESPONSE is disputed
     std::string challengerAddress;
-    uint256     claimedResponseHash; // what challenger claims was the correct response hash
+    std::vector<uint8_t> fraudProof; // F8-C: challenger's revealed evidence (empty until REVEAL)
     COutPoint   challengerCollateral;// F10-A: challenger's pledged UTXO (must stay locked until resolved)
     // F8-C: commit-reveal
     uint8_t     phase;               // 0=COMMIT received, 1=REVEAL received
@@ -234,12 +236,12 @@ struct OPoIChallenge {
     uint32_t    blockHeight;         // block of initial CHALLENGE (COMMIT) tx
     uint32_t    sigTime;
     uint256     txHash;
-    int8_t      challengeStatus;     // OPEN / SLASHED / EXPIRED
+    int8_t      challengeStatus;     // OPEN / SLASHED / EXPIRED / REVEALED_PENDING / RESOLVED_NO_ORACLE
 
     ADD_SERIALIZE_METHODS;
     template <typename Stream, typename Operation>
     inline void SerializationOp(Stream& s, Operation ser_action) {
-        READWRITE(requestId); READWRITE(challengerAddress); READWRITE(claimedResponseHash);
+        READWRITE(requestId); READWRITE(challengerAddress); READWRITE(fraudProof);
         READWRITE(challengerCollateral);
         READWRITE(phase); READWRITE(commitHash); READWRITE(commitHeight);
         READWRITE(blockHeight); READWRITE(sigTime); READWRITE(txHash);
@@ -247,16 +249,17 @@ struct OPoIChallenge {
     }
 
     void SetNull() {
-        requestId.clear(); challengerAddress.clear(); claimedResponseHash.SetNull();
+        requestId.clear(); challengerAddress.clear(); fraudProof.clear();
         challengerCollateral.SetNull();
         phase = 0; commitHash.clear(); commitHeight = 0;
         blockHeight = 0; sigTime = 0; txHash.SetNull();
         challengeStatus = OPOI_CHALLENGE_OPEN;
     }
-    bool IsNull()         const { return requestId.empty(); }
-    bool IsOpen()         const { return challengeStatus == OPOI_CHALLENGE_OPEN; }
-    bool IsCommitPhase()  const { return phase == 0; }
-    bool IsRevealPhase()  const { return phase == 1; }
+    bool IsNull()               const { return requestId.empty(); }
+    bool IsOpen()               const { return challengeStatus == OPOI_CHALLENGE_OPEN; }
+    bool IsPendingResolution()  const { return challengeStatus == OPOI_CHALLENGE_REVEALED_PENDING; }
+    bool IsCommitPhase()        const { return phase == 0; }
+    bool IsRevealPhase()        const { return phase == 1; }
 };
 
 // ── F15-C: shard coordinator VRF self-claim ───────────────────────────────────
@@ -469,6 +472,13 @@ public:
     // see IsResponsePaid/MarkResponsePaid/UnmarkResponsePaid below.
     std::set<std::string> setPaidResponses;
 
+    // F10-A: requestIds whose challenger reward (on a proven CHALLENGE) has
+    // already been paid — see IsChallengerRewardPaid/MarkChallengerRewardPaid/
+    // UnmarkChallengerRewardPaid below. A CHALLENGE can sit in SLASHED state
+    // across many blocks after resolution, unlike the old bare-timeout design
+    // where resolution and reward happened at the same height.
+    std::set<std::string> setPaidChallengerRewards;
+
     // F12-A: Treasury stats (accumulated totals, reset on -reindex)
     CAmount treasurySlashTotal  = 0;
     CAmount treasuryExpiryTotal = 0;
@@ -484,7 +494,7 @@ public:
         mapModelManifests.clear(); mapModelVotes.clear();
         mapCoordinatorClaims.clear(); mapShardResults.clear();
         setPaidShards.clear(); setResolvedAuditorVerifications.clear();
-        setPaidResponses.clear();
+        setPaidResponses.clear(); setPaidChallengerRewards.clear();
         treasurySlashTotal = 0; treasuryExpiryTotal = 0; treasuryAuditorTotal = 0;
     }
 
@@ -566,6 +576,21 @@ public:
     void UnmarkResponsePaid(const std::string& requestId) {
         LOCK(cs);
         setPaidResponses.erase(requestId);
+    }
+
+    bool IsChallengerRewardPaid(const std::string& requestId) const {
+        LOCK(cs);
+        return setPaidChallengerRewards.count(requestId) > 0;
+    }
+
+    void MarkChallengerRewardPaid(const std::string& requestId) {
+        LOCK(cs);
+        setPaidChallengerRewards.insert(requestId);
+    }
+
+    void UnmarkChallengerRewardPaid(const std::string& requestId) {
+        LOCK(cs);
+        setPaidChallengerRewards.erase(requestId);
     }
 
     // ── F15-C: coordinator claims ────────────────────────────────────────────
@@ -1034,19 +1059,25 @@ void ProcessAuditorVerifications(uint32_t blockHeight, const Consensus::Params& 
 struct OPoIChallengerReward {
     std::string challengerAddress;
     CAmount     rewardAmount;
+    std::string requestId;
 };
 
-// Returns rewards owed for challenges that expire at blockHeight (i.e., will be
-// slashed when this block is connected). Called from CreateNewBlock and
+// Returns rewards owed for CHALLENGEs proven at blockHeight (REVEAL verified +
+// Auditor majority FAIL for VERIFIABLE tasks). Called from CreateNewBlock and
 // CheckOPoIChallengerRewards so both use identical logic.
 std::vector<OPoIChallengerReward> GetChallengerRewardsAtHeight(
-    uint32_t blockHeight, const Consensus::Params& params);
+    const std::vector<CTransaction>& vtx, uint32_t blockHeight, const Consensus::Params& params);
 
 // Called from ConnectBlock to verify challenger reward outputs in the coinbase.
 bool CheckOPoIChallengerRewards(const std::vector<CTransaction>& vtx,
                                 uint32_t blockHeight,
                                 const Consensus::Params& params,
                                 CValidationState& state);
+
+// Called from ConnectBlock (after ProcessExpiredChallenges) to mark this
+// block's challenger rewards paid, so they aren't paid again in a later block.
+void ProcessChallengerRewardPayments(const std::vector<CTransaction>& vtx, uint32_t blockHeight,
+                                     const Consensus::Params& params);
 
 // ── F15-A2: model governance ──────────────────────────────────────────────────
 

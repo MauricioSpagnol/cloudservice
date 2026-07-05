@@ -646,7 +646,7 @@ public:
     const std::string opoiMinerAddress;   // miner addr (RESPONSE / STAKE / UNSTAKE)
     const std::string opoiModel;          // Model name, e.g. "gemma3:4b" (REQUEST only)
     const uint256     opoiPromptHash;     // SHA-256 of the prompt (REQUEST only)
-    const uint256     opoiResponseHash;   // SHA-256 of the response text (RESPONSE) / claimed hash (CHALLENGE)
+    const uint256     opoiResponseHash;   // SHA-256 of the response text (RESPONSE only)
     const uint256     opoiCommitment;     // model_fixed_forward(requestHash || responseHash) — RESPONSE only
                                           // Anti-equivocation: proves miner committed to this response hash
                                           // before seeing other responses. Does NOT prove LLM was executed.

@@ -615,8 +615,8 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
             }
             txNew.vout[0].nValue -= totalOPoIPayment;
 
-            // OPoI: add coinbase outputs for challenger rewards (challenges expiring at nHeight)
-            auto challengerRewards = GetChallengerRewardsAtHeight(nHeight, chainparams.GetConsensus());
+            // OPoI: add coinbase outputs for challenger rewards (challenges proven at nHeight)
+            auto challengerRewards = GetChallengerRewardsAtHeight(pblock->vtx, nHeight, chainparams.GetConsensus());
             CAmount totalChallengerRewards = 0;
             for (const auto& reward : challengerRewards) {
                 if (totalChallengerRewards + reward.rewardAmount > txNew.vout[0].nValue)

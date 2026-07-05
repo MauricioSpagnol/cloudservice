@@ -154,7 +154,37 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
             }
 
         } else if (tx.nType == OPOI_CHALLENGE_TX_TYPE) {
-            g_opoiCache.mapChallenges.erase(tx.opoiRequestId);
+            if (tx.opoiChallengePhase == 0) {
+                // Undo COMMIT: the challenge never existed before this tx.
+                g_opoiCache.UnlockUTXO(tx.opoiChallengerCollateralIn);
+                g_opoiCache.mapChallenges.erase(tx.opoiRequestId);
+            } else {
+                // Undo REVEAL: reverse whatever resolution it produced, then
+                // roll the challenge back to its pre-reveal (OPEN/COMMIT) state.
+                auto it = g_opoiCache.mapChallenges.find(tx.opoiRequestId);
+                if (it != g_opoiCache.mapChallenges.end()) {
+                    OPoIChallenge& ch = it->second;
+                    if (ch.challengeStatus == OPOI_CHALLENGE_SLASHED) {
+                        // Reverse the immediate miner slash + collateral unlock.
+                        auto respIt = g_opoiCache.mapResponses.find(tx.opoiRequestId);
+                        if (respIt != g_opoiCache.mapResponses.end()) {
+                            auto stakeIt = g_opoiCache.mapStakes.find(respIt->second.minerAddress);
+                            if (stakeIt != g_opoiCache.mapStakes.end())
+                                stakeIt->second.stakeStatus = OPOI_STAKE_ACTIVE;
+                        }
+                        g_opoiCache.LockUTXO(ch.challengerCollateral, ch.challengerAddress);
+                        g_opoiCache.UnmarkChallengerRewardPaid(tx.opoiRequestId);
+                    } else if (ch.challengeStatus == OPOI_CHALLENGE_RESOLVED_NO_ORACLE) {
+                        // Reverse the "no fault" collateral release.
+                        g_opoiCache.LockUTXO(ch.challengerCollateral, ch.challengerAddress);
+                    }
+                    // EXPIRED-via-PASS and REVEALED_PENDING never touched any lock —
+                    // nothing to reverse there beyond the field resets below.
+                    ch.phase = 0;
+                    ch.fraudProof.clear();
+                    ch.challengeStatus = OPOI_CHALLENGE_OPEN;
+                }
+            }
 
         } else if (tx.nType == OPOI_MODEL_REGISTER_TX_TYPE) {
             g_opoiCache.mapModelManifests.erase(tx.opoiModelId);
@@ -290,18 +320,80 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
             LogPrintf("OPoI: UNSTAKE requested by %s at height %u\n",
                       tx.opoiMinerAddress, blockHeight);
 
-    } else if (tx.nType == OPOI_CHALLENGE_TX_TYPE) {
+    } else if (tx.nType == OPOI_CHALLENGE_TX_TYPE && tx.opoiChallengePhase == 0) {
+        // COMMIT — open the challenge and lock the challenger's collateral.
         OPoIChallenge ch;
         ch.requestId           = tx.opoiRequestId;
         ch.challengerAddress   = tx.opoiRequester;
-        ch.claimedResponseHash = tx.opoiResponseHash;
-        ch.blockHeight         = blockHeight;
-        ch.sigTime             = tx.opoiSigTime;
-        ch.txHash              = tx.GetHash();
-        ch.challengeStatus     = OPOI_CHALLENGE_OPEN;
+        ch.challengerCollateral= tx.opoiChallengerCollateralIn;
+        ch.phase                = 0;
+        ch.commitHash           = HexStr(tx.opoiCommitHash);
+        ch.commitHeight         = blockHeight;
+        ch.blockHeight          = blockHeight;
+        ch.sigTime              = tx.opoiSigTime;
+        ch.txHash               = tx.GetHash();
+        ch.challengeStatus      = OPOI_CHALLENGE_OPEN;
         g_opoiCache.AddChallenge(ch);
-        LogPrintf("OPoI: CHALLENGE for request %s by %s at height %u\n",
-                  tx.opoiRequestId, tx.opoiRequester, blockHeight);
+        g_opoiCache.LockUTXO(tx.opoiChallengerCollateralIn, tx.opoiRequester);
+        LogPrintf("OPoI: CHALLENGE COMMIT for request %s by %s at height %u — collateral %s:%u locked\n",
+                  tx.opoiRequestId, tx.opoiRequester, blockHeight,
+                  tx.opoiChallengerCollateralIn.hash.GetHex(), tx.opoiChallengerCollateralIn.n);
+
+    } else if (tx.nType == OPOI_CHALLENGE_TX_TYPE) {
+        // REVEAL — verify already done in CheckOPoITransaction; here we record
+        // the disclosed proof and attempt immediate resolution. For VERIFIABLE
+        // tasks the real fraud oracle is the Auditor majority (F14-C) — a
+        // matching commitment can never prove inference fraud by itself (a
+        // dishonest miner's own commitment always matches their own garbage
+        // output), it only proves the challenger's claim hasn't changed since
+        // COMMIT. For OPEN tasks there is no on-chain fraud oracle yet (that's
+        // F10-C reputation, not built) — the reveal is accepted but resolves
+        // to "no fault either side", matching the plan's own guidance.
+        auto it = g_opoiCache.mapChallenges.find(tx.opoiRequestId);
+        if (it != g_opoiCache.mapChallenges.end()) {
+            OPoIChallenge& ch = it->second;
+            ch.phase       = 1;
+            ch.fraudProof  = tx.opoiProofData;
+
+            OPoIRequest req;
+            bool haveReq = g_opoiCache.GetRequest(tx.opoiRequestId, req);
+            if (haveReq && req.IsVerifiable() && pparams) {
+                int majority = g_opoiCache.GetAuditorMajorityResult(tx.opoiRequestId, pparams->nOPoIMinAuditors);
+                if (majority == AUDITOR_VERIFY_FAIL) {
+                    auto respIt = g_opoiCache.mapResponses.find(tx.opoiRequestId);
+                    if (respIt != g_opoiCache.mapResponses.end()) {
+                        auto stakeIt = g_opoiCache.mapStakes.find(respIt->second.minerAddress);
+                        if (stakeIt != g_opoiCache.mapStakes.end() && stakeIt->second.IsActive())
+                            stakeIt->second.stakeStatus = OPOI_STAKE_SLASHED;
+                    }
+                    g_opoiCache.UnlockUTXO(ch.challengerCollateral);
+                    ch.challengeStatus = OPOI_CHALLENGE_SLASHED;
+                    LogPrintf("OPoI: CHALLENGE proven for request %s — miner slashed, challenger %s vindicated\n",
+                              tx.opoiRequestId, tx.opoiRequester);
+                } else if (majority == AUDITOR_VERIFY_PASS) {
+                    // Auditor already validated the response — this challenge
+                    // couldn't substantiate fraud. Challenger's collateral stays
+                    // locked forever (burned), same treatment as a SLASHED
+                    // Auditor minority — no separate reward is minted.
+                    ch.challengeStatus = OPOI_CHALLENGE_EXPIRED;
+                    LogPrintf("OPoI: CHALLENGE dismissed for request %s — Auditor majority PASS, "
+                              "challenger %s collateral %s:%u permanently locked\n",
+                              tx.opoiRequestId, tx.opoiRequester,
+                              ch.challengerCollateral.hash.GetHex(), ch.challengerCollateral.n);
+                } else {
+                    // Auditor hasn't reached quorum yet — re-checked every block
+                    // by ProcessExpiredChallenges until it resolves.
+                    ch.challengeStatus = OPOI_CHALLENGE_REVEALED_PENDING;
+                }
+            } else {
+                // OPEN task (or unknown request during VerifyDB replay): no
+                // fraud oracle exists — resolve as "no fault", return collateral.
+                g_opoiCache.UnlockUTXO(ch.challengerCollateral);
+                ch.challengeStatus = OPOI_CHALLENGE_RESOLVED_NO_ORACLE;
+            }
+            LogPrintf("OPoI: CHALLENGE REVEAL for request %s by %s at height %u\n",
+                      tx.opoiRequestId, tx.opoiRequester, blockHeight);
+        }
 
     } else if (tx.nType == OPOI_MODEL_REGISTER_TX_TYPE) {
         ModelManifest m;
@@ -418,34 +510,61 @@ void RebuildOPoICache()
 
 // ── ProcessExpiredChallenges ──────────────────────────────────────────────────
 //
-// Called from ConnectBlock at the end of each block. For every open CHALLENGE
-// whose window has elapsed (blockHeight >= challenge.blockHeight + window),
-// the miner who submitted the RESPONSE is slashed: their stake is marked
-// SLASHED and they can no longer submit RESPONSE txs until they re-stake.
+// Called from ConnectBlock at the end of each block.
+//
+// F10-A/F8-C (2026-07-05): rewritten. Previously ANY open challenge — proof or
+// not — slashed the miner on a bare timeout, a free griefing vector (a
+// malicious challenger with nothing at stake could slash any miner just by
+// waiting). Now:
+//   - A COMMIT that never gets a valid REVEAL within
+//     nOPoIChallengeCommitRevealBlocks is dismissed: the CHALLENGER's own
+//     collateral is what gets burned (locked forever), not the miner's stake.
+//   - A REVEAL that resolved immediately (ProcessOPoITransaction, VERIFIABLE
+//     with an already-decided Auditor majority, or OPEN with no oracle) never
+//     reaches this function in the OPEN state — nothing to do here for it.
+//   - A REVEAL for a VERIFIABLE task whose Auditor majority wasn't decided yet
+//     at reveal time (OPOI_CHALLENGE_REVEALED_PENDING) is re-checked here on
+//     every block until the Auditor resolves.
 
 void ProcessExpiredChallenges(uint32_t blockHeight, const Consensus::Params& params)
 {
     LOCK(g_opoiCache.cs);
     for (auto& kv : g_opoiCache.mapChallenges) {
         OPoIChallenge& ch = kv.second;
-        if (!ch.IsOpen()) continue;
-        if ((int)(blockHeight - ch.blockHeight) < params.nOPoIChallengeWindowBlocks) continue;
 
-        // Window elapsed — find the miner who submitted the challenged RESPONSE
-        auto respIt = g_opoiCache.mapResponses.find(ch.requestId);
-        if (respIt != g_opoiCache.mapResponses.end()) {
-            const std::string& minerAddr = respIt->second.minerAddress;
-            auto stakeIt = g_opoiCache.mapStakes.find(minerAddr);
-            if (stakeIt != g_opoiCache.mapStakes.end() && stakeIt->second.IsActive()) {
-                stakeIt->second.stakeStatus = OPOI_STAKE_SLASHED;
-                // Collateral stays locked permanently on slash (coins effectively burned)
-                LogPrintf("OPoI: SLASH miner %s — unanswered challenge for request %s at height %u"
-                          " — collateral %s:%u permanently locked\n",
-                          minerAddr, ch.requestId, blockHeight,
-                          stakeIt->second.collateralIn.hash.GetHex(), stakeIt->second.collateralIn.n);
-            }
+        if (ch.IsOpen()) {
+            // Still COMMIT-only — dismiss if REVEAL never showed up in time.
+            if ((int)(blockHeight - ch.commitHeight) < params.nOPoIChallengeCommitRevealBlocks) continue;
+            ch.challengeStatus = OPOI_CHALLENGE_EXPIRED; // challenger's collateral stays locked forever
+            LogPrintf("OPoI: CHALLENGE dismissed for request %s — no REVEAL within %d blocks — "
+                      "challenger %s collateral %s:%u permanently locked\n",
+                      ch.requestId, params.nOPoIChallengeCommitRevealBlocks, ch.challengerAddress,
+                      ch.challengerCollateral.hash.GetHex(), ch.challengerCollateral.n);
+            continue;
         }
-        ch.challengeStatus = OPOI_CHALLENGE_SLASHED;
+
+        if (ch.IsPendingResolution()) {
+            int majority = g_opoiCache.GetAuditorMajorityResult(ch.requestId, params.nOPoIMinAuditors);
+            if (majority == AUDITOR_VERIFY_FAIL) {
+                auto respIt = g_opoiCache.mapResponses.find(ch.requestId);
+                if (respIt != g_opoiCache.mapResponses.end()) {
+                    auto stakeIt = g_opoiCache.mapStakes.find(respIt->second.minerAddress);
+                    if (stakeIt != g_opoiCache.mapStakes.end() && stakeIt->second.IsActive())
+                        stakeIt->second.stakeStatus = OPOI_STAKE_SLASHED;
+                }
+                g_opoiCache.UnlockUTXO(ch.challengerCollateral);
+                ch.challengeStatus = OPOI_CHALLENGE_SLASHED;
+                LogPrintf("OPoI: CHALLENGE proven for request %s (Auditor resolved after reveal) — "
+                          "miner slashed, challenger %s vindicated\n", ch.requestId, ch.challengerAddress);
+            } else if (majority == AUDITOR_VERIFY_PASS) {
+                ch.challengeStatus = OPOI_CHALLENGE_EXPIRED;
+                LogPrintf("OPoI: CHALLENGE dismissed for request %s (Auditor resolved PASS after reveal) — "
+                          "challenger %s collateral %s:%u permanently locked\n",
+                          ch.requestId, ch.challengerAddress,
+                          ch.challengerCollateral.hash.GetHex(), ch.challengerCollateral.n);
+            }
+            // else: Auditor still hasn't reached quorum — keep waiting.
+        }
     }
 
     // Also release stakes whose unstake cooldown has elapsed
@@ -726,15 +845,22 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
     }
 
     case OPOI_CHALLENGE_TX_TYPE: {
+        // F8-C/F10-A: two-phase commit-reveal challenge with mandatory challenger
+        // collateral. COMMIT posts collateral + a hash of the (not-yet-disclosed)
+        // fraud proof; REVEAL discloses the proof + nonce and must match. A
+        // challenge that never reaches a valid REVEAL in time is dismissed —
+        // ProcessExpiredChallenges slashes the CHALLENGER's collateral, not the
+        // miner's stake (fixes a free-griefing hole: previously ANY challenge,
+        // proof or not, slashed the miner on a bare timeout).
         if (tx.opoiRequestId.empty())
             return state.DoS(10, error("CheckOPoITransaction(): CHALLENGE missing requestId"),
                              REJECT_INVALID, "bad-txns-opoi-challenge-no-request-id");
         if (tx.opoiRequester.empty())
             return state.DoS(10, error("CheckOPoITransaction(): CHALLENGE missing challenger"),
                              REJECT_INVALID, "bad-txns-opoi-challenge-no-challenger");
-        if (tx.opoiResponseHash.IsNull())
-            return state.DoS(10, error("CheckOPoITransaction(): CHALLENGE missing claimedResponseHash"),
-                             REJECT_INVALID, "bad-txns-opoi-challenge-no-hash");
+        if (tx.opoiChallengerCollateralIn.IsNull())
+            return state.DoS(10, error("CheckOPoITransaction(): CHALLENGE missing collateralIn"),
+                             REJECT_INVALID, "bad-txns-opoi-challenge-no-collateral");
         if (!fIsVerifying) {
             OPoIResponse resp;
             if (!g_opoiCache.GetResponse(tx.opoiRequestId, resp))
@@ -742,11 +868,62 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                                            tx.opoiRequestId),
                                  REJECT_INVALID, "bad-txns-opoi-challenge-unknown-response");
         }
-        // Verify challenger's signature
-        {
-            std::string sigMsg = tx.opoiRequestId + tx.opoiRequester + tx.opoiResponseHash.GetHex();
+
+        if (tx.opoiChallengePhase == 0) {
+            // ── COMMIT ──
+            if (tx.opoiCommitHash.size() != 32)
+                return state.DoS(10, error("CheckOPoITransaction(): CHALLENGE COMMIT missing commit hash"),
+                                 REJECT_INVALID, "bad-txns-opoi-challenge-no-commit-hash");
+            if (!fIsVerifying) {
+                if (g_opoiCache.IsLockedUTXO(tx.opoiChallengerCollateralIn))
+                    return state.DoS(100, error("CheckOPoITransaction(): CHALLENGE collateral %s:%u already locked",
+                                                tx.opoiChallengerCollateralIn.hash.GetHex(),
+                                                tx.opoiChallengerCollateralIn.n),
+                                     REJECT_INVALID, "bad-txns-opoi-challenge-collateral-locked");
+                OPoIChallenge existing;
+                if (g_opoiCache.GetChallenge(tx.opoiRequestId, existing) && existing.IsOpen())
+                    return state.DoS(10, error("CheckOPoITransaction(): CHALLENGE already open for request %s",
+                                               tx.opoiRequestId),
+                                     REJECT_INVALID, "bad-txns-opoi-challenge-already-open");
+            }
+            std::string sigMsg = tx.opoiRequestId + tx.opoiRequester + HexStr(tx.opoiCommitHash)
+                               + tx.opoiChallengerCollateralIn.hash.GetHex()
+                               + strprintf("%u", tx.opoiChallengerCollateralIn.n);
             if (!VerifyOPoISig(tx.opoiRequester, sigMsg, tx.opoiSig))
-                return state.DoS(100, error("CheckOPoITransaction(): CHALLENGE invalid signature for %s",
+                return state.DoS(100, error("CheckOPoITransaction(): CHALLENGE COMMIT invalid signature for %s",
+                                            tx.opoiRequester),
+                                 REJECT_INVALID, "bad-txns-opoi-challenge-bad-sig");
+        } else {
+            // ── REVEAL ──
+            if (tx.opoiProofData.empty() || tx.opoiChallengeNonce.empty())
+                return state.DoS(10, error("CheckOPoITransaction(): CHALLENGE REVEAL missing proof/nonce"),
+                                 REJECT_INVALID, "bad-txns-opoi-challenge-no-reveal-data");
+            if (!fIsVerifying) {
+                OPoIChallenge existing;
+                if (!g_opoiCache.GetChallenge(tx.opoiRequestId, existing) || !existing.IsOpen())
+                    return state.DoS(10, error("CheckOPoITransaction(): CHALLENGE REVEAL with no open COMMIT for %s",
+                                               tx.opoiRequestId),
+                                     REJECT_INVALID, "bad-txns-opoi-challenge-no-open-commit");
+                if (existing.challengerAddress != tx.opoiRequester)
+                    return state.DoS(10, error("CheckOPoITransaction(): CHALLENGE REVEAL challenger mismatch for %s",
+                                               tx.opoiRequestId),
+                                     REJECT_INVALID, "bad-txns-opoi-challenge-challenger-mismatch");
+                unsigned char computed[32];
+                {
+                    CSHA256 hasher;
+                    hasher.Write(tx.opoiProofData.data(), tx.opoiProofData.size());
+                    hasher.Write(tx.opoiChallengeNonce.data(), tx.opoiChallengeNonce.size());
+                    hasher.Finalize(computed);
+                }
+                if (existing.commitHash != HexStr(computed, computed + 32))
+                    return state.DoS(100, error("CheckOPoITransaction(): CHALLENGE REVEAL hash mismatch for %s",
+                                                tx.opoiRequestId),
+                                     REJECT_INVALID, "bad-txns-opoi-challenge-reveal-mismatch");
+            }
+            std::string sigMsg = tx.opoiRequestId + tx.opoiRequester
+                               + HexStr(tx.opoiProofData) + HexStr(tx.opoiChallengeNonce);
+            if (!VerifyOPoISig(tx.opoiRequester, sigMsg, tx.opoiSig))
+                return state.DoS(100, error("CheckOPoITransaction(): CHALLENGE REVEAL invalid signature for %s",
                                             tx.opoiRequester),
                                  REJECT_INVALID, "bad-txns-opoi-challenge-bad-sig");
         }
@@ -1426,41 +1603,80 @@ void ProcessAuditorVerifications(uint32_t blockHeight, const Consensus::Params& 
 
 // ── GetChallengerRewardsAtHeight ──────────────────────────────────────────────
 //
-// Returns the list of challenger rewards owed for challenges that expire at
-// blockHeight. A challenge "expires" when blockHeight - ch.blockHeight >= window.
+// F10-A/F8-C (2026-07-05): rewritten around proof, not a bare timeout. A
+// challenger is rewarded once their challenge is actually PROVEN (REVEAL
+// verified + Auditor majority FAIL for VERIFIABLE — never for OPEN, which has
+// no fraud oracle). Mirrors GetVerifiablePaymentsForBlock's combine-cache-
+// with-this-block's-own-txs pattern: a REVEAL that itself completes the
+// resolution (Auditor majority already decided pre-block) must be visible to
+// the pre-apply callers (CreateNewBlock/CheckOPoIChallengerRewards), not just
+// to ProcessOPoITransaction's own immediate-resolution path — same bug class
+// already fixed once for F14-C's verifiable-response payment gate.
 // The reward is nOPoIChallengerRewardPct % of the miner's staked amount.
-// Used by both CreateNewBlock (to add coinbase outputs) and
-// CheckOPoIChallengerRewards (to validate them).
 
 std::vector<OPoIChallengerReward> GetChallengerRewardsAtHeight(
-    uint32_t blockHeight, const Consensus::Params& params)
+    const std::vector<CTransaction>& vtx, uint32_t blockHeight, const Consensus::Params& params)
 {
     std::vector<OPoIChallengerReward> rewards;
     if (params.nOPoIChallengerRewardPct <= 0) return rewards;
 
     LOCK(g_opoiCache.cs);
-    for (const auto& kv : g_opoiCache.mapChallenges) {
-        const OPoIChallenge& ch = kv.second;
-        if (!ch.IsOpen()) continue;
-        if ((int)(blockHeight - ch.blockHeight) < params.nOPoIChallengeWindowBlocks) continue;
 
-        // Find the miner that was challenged (the one who submitted the RESPONSE)
-        auto respIt = g_opoiCache.mapResponses.find(ch.requestId);
-        if (respIt == g_opoiCache.mapResponses.end()) continue;
-
+    auto tryReward = [&](const std::string& requestId, const std::string& challengerAddress) {
+        if (g_opoiCache.IsChallengerRewardPaid(requestId)) return;
+        auto respIt = g_opoiCache.mapResponses.find(requestId);
+        if (respIt == g_opoiCache.mapResponses.end()) return;
         auto stakeIt = g_opoiCache.mapStakes.find(respIt->second.minerAddress);
-        if (stakeIt == g_opoiCache.mapStakes.end()) continue;
-        if (!stakeIt->second.IsActive()) continue; // already slashed/released
+        if (stakeIt == g_opoiCache.mapStakes.end()) return;
 
         CAmount stakedAmount = stakeIt->second.amount;
         CAmount reward = (stakedAmount * params.nOPoIChallengerRewardPct) / 100;
-        if (reward <= 0) continue;
+        if (reward <= 0) return;
 
-        rewards.push_back({ch.challengerAddress, reward});
+        rewards.push_back({challengerAddress, reward, requestId});
         LogPrint("opoi", "GetChallengerRewardsAtHeight: height=%u challenger=%s reward=%s\n",
-                 blockHeight, ch.challengerAddress, FormatMoney(reward));
+                 blockHeight, challengerAddress, FormatMoney(reward));
+    };
+
+    // Case 1: already resolved SLASHED in an earlier block (deferred VERIFIABLE
+    // resolution via ProcessExpiredChallenges catching up once Auditor decides).
+    for (const auto& kv : g_opoiCache.mapChallenges) {
+        const OPoIChallenge& ch = kv.second;
+        if (ch.challengeStatus == OPOI_CHALLENGE_SLASHED)
+            tryReward(ch.requestId, ch.challengerAddress);
     }
+
+    // Case 2: this block's own REVEAL txs that resolve SLASHED right now,
+    // because the Auditor majority was already FAIL before this block.
+    for (size_t i = 1; i < vtx.size(); ++i) {
+        const CTransaction& tx = vtx[i];
+        if (tx.nVersion != OPOI_TX_VERSION || tx.nType != OPOI_CHALLENGE_TX_TYPE) continue;
+        if (tx.opoiChallengePhase != 1) continue; // REVEAL only
+
+        OPoIChallenge ch;
+        if (!g_opoiCache.GetChallenge(tx.opoiRequestId, ch) || ch.challengeStatus != OPOI_CHALLENGE_OPEN)
+            continue; // not a pending COMMIT this REVEAL could resolve
+
+        OPoIRequest req;
+        if (!g_opoiCache.GetRequest(tx.opoiRequestId, req) || !req.IsVerifiable()) continue;
+        if (g_opoiCache.GetAuditorMajorityResult(tx.opoiRequestId, params.nOPoIMinAuditors) != AUDITOR_VERIFY_FAIL)
+            continue;
+
+        tryReward(tx.opoiRequestId, tx.opoiRequester);
+    }
+
     return rewards;
+}
+
+// Marks each reward returned by GetChallengerRewardsAtHeight as paid, once the
+// block that actually includes the coinbase payout is connected for real.
+// Called after ProcessExpiredChallenges so any deferred (REVEALED_PENDING →
+// SLASHED) resolution from this same block is already visible.
+void ProcessChallengerRewardPayments(const std::vector<CTransaction>& vtx, uint32_t blockHeight,
+                                      const Consensus::Params& params)
+{
+    for (const auto& r : GetChallengerRewardsAtHeight(vtx, blockHeight, params))
+        g_opoiCache.MarkChallengerRewardPaid(r.requestId);
 }
 
 // ── CheckOPoIChallengerRewards ────────────────────────────────────────────────
@@ -1477,7 +1693,7 @@ bool CheckOPoIChallengerRewards(const std::vector<CTransaction>& vtx,
     for (const CTxOut& out : coinbase.vout)
         totalCoinbaseValue += out.nValue;
 
-    auto rewards = GetChallengerRewardsAtHeight(blockHeight, params);
+    auto rewards = GetChallengerRewardsAtHeight(vtx, blockHeight, params);
     CAmount checkedTotal = 0;
 
     for (const auto& reward : rewards) {

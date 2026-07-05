@@ -168,7 +168,9 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "opoiselecttopkexperts", 2 }, // num_experts (integer)
     { "opoiselecttopkexperts", 3 }, // top_k (integer)
     // F14-C
-    { "submitauditorverification", 4 }  // collateral_vout (integer)
+    { "submitauditorverification", 4 }, // collateral_vout (integer)
+    // F10-A/F8-C
+    { "challengeopoi",              4 }  // collateral_vout (integer)
 };
 
 class CRPCConvertTable

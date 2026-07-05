@@ -694,10 +694,12 @@ static std::string StakeStatusStr(int8_t s) {
 
 static std::string ChallengeStatusStr(int8_t s) {
     switch (s) {
-        case OPOI_CHALLENGE_OPEN:    return "OPEN";
-        case OPOI_CHALLENGE_SLASHED: return "SLASHED";
-        case OPOI_CHALLENGE_EXPIRED: return "EXPIRED";
-        default:                     return "UNKNOWN";
+        case OPOI_CHALLENGE_OPEN:              return "OPEN";
+        case OPOI_CHALLENGE_SLASHED:           return "SLASHED";
+        case OPOI_CHALLENGE_EXPIRED:           return "EXPIRED";
+        case OPOI_CHALLENGE_REVEALED_PENDING:  return "REVEALED_PENDING";
+        case OPOI_CHALLENGE_RESOLVED_NO_ORACLE:return "RESOLVED_NO_ORACLE";
+        default:                                return "UNKNOWN";
     }
 }
 
@@ -727,7 +729,13 @@ static UniValue OPoIChallengeToUniValue(const OPoIChallenge& c)
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("request_id",           c.requestId);
     obj.pushKV("challenger_address",   c.challengerAddress);
-    obj.pushKV("claimed_response_hash",c.claimedResponseHash.GetHex());
+    obj.pushKV("collateral_txid",      c.challengerCollateral.hash.GetHex());
+    obj.pushKV("collateral_vout",      (int)c.challengerCollateral.n);
+    obj.pushKV("phase",                c.phase == 0 ? "COMMIT" : "REVEAL");
+    obj.pushKV("commit_hash",          c.commitHash);
+    obj.pushKV("commit_height",        (int)c.commitHeight);
+    if (c.IsRevealPhase())
+        obj.pushKV("fraud_proof",      HexStr(c.fraudProof));
     obj.pushKV("block_height",         (int)c.blockHeight);
     obj.pushKV("status",               ChallengeStatusStr(c.challengeStatus));
     obj.pushKV("tx_hash",              c.txHash.GetHex());
@@ -899,63 +907,91 @@ UniValue unstakeopoi(const UniValue& params, bool fHelp)
     return ret;
 }
 
-// ── challengeopoi ─────────────────────────────────────────────────────────────
+// ── challengeopoi (F8-C/F10-A: COMMIT phase) ───────────────────────────────────
 
 UniValue challengeopoi(const UniValue& params, bool fHelp)
 {
-    if (fHelp || params.size() != 3)
+    if (fHelp || params.size() != 5)
         throw std::runtime_error(
-            "challengeopoi \"request_id\" \"challenger_address\" \"claimed_response_hash\"\n"
-            "\nChallenge a committed RESPONSE on-chain.\n"
-            "\nIf the challenge is not countered within the challenge window, the miner\n"
-            "who submitted the RESPONSE will have their stake slashed.\n"
+            "challengeopoi \"request_id\" \"challenger_address\" \"commit_hash\""
+            " \"collateral_txid\" collateral_vout\n"
+            "\nOpen a commit-reveal challenge against a committed RESPONSE (COMMIT phase).\n"
+            "\ncommit_hash = SHA-256(fraud_proof || secret_nonce) computed by the caller —\n"
+            "the fraud_proof and nonce themselves are disclosed later via revealchallenge,\n"
+            "so a copy-cat can't front-run a challenge it can see in the mempool.\n"
+            "\nRequires collateral >= (challenged miner's stake * nOPoIChallengerStakePct / 100).\n"
+            "If REVEAL doesn't arrive within nOPoIChallengeCommitRevealBlocks, the challenge is\n"
+            "dismissed and this collateral is permanently locked (burned) — see revealchallenge.\n"
             "\nArguments:\n"
-            "1. request_id             (string, required) UUID of the disputed request\n"
-            "2. challenger_address     (string, required) Your CS wallet address\n"
-            "3. claimed_response_hash  (string, required) SHA-256 you claim is the correct response\n"
+            "1. request_id        (string, required) UUID of the disputed request\n"
+            "2. challenger_address(string, required) Your CS wallet address\n"
+            "3. commit_hash        (string, required) hex SHA-256(fraud_proof||nonce)\n"
+            "4. collateral_txid    (string, required) TXID of the challenger's collateral UTXO\n"
+            "5. collateral_vout    (numeric, required) Output index of the collateral UTXO\n"
             "\nResult:\n"
-            "{ txid, request_id }\n"
+            "{ txid, request_id, challenged_miner }\n"
             "\nExamples:\n"
             + HelpExampleCli("challengeopoi",
-                "\"uuid\" \"t1ChalAddr...\" \"abc123...\"")
-            + HelpExampleRpc("challengeopoi",
-                "\"uuid\", \"t1ChalAddr...\", \"abc123...\"")
+                "\"uuid\" \"t1ChalAddr...\" \"abc123...\" \"def456...\" 0")
         );
 
 #ifdef ENABLE_WALLET
     EnsureWalletIsUnlocked();
 #endif
 
-    std::string requestId   = params[0].get_str();
-    std::string challenger  = params[1].get_str();
-    std::string claimedHex  = params[2].get_str();
+    std::string requestId    = params[0].get_str();
+    std::string challenger   = params[1].get_str();
+    std::string commitHashHex= params[2].get_str();
+    uint256     colTxid;
+    colTxid.SetHex(params[3].get_str());
+    uint32_t    colVout      = (uint32_t)params[4].get_int();
 
-    if (requestId.empty())  throw std::runtime_error("request_id must not be empty");
-    if (challenger.empty()) throw std::runtime_error("challenger_address must not be empty");
+    if (requestId.empty())    throw std::runtime_error("request_id must not be empty");
+    if (challenger.empty())   throw std::runtime_error("challenger_address must not be empty");
+    if (colTxid.IsNull())     throw std::runtime_error("collateral_txid is invalid");
 
-    uint256 claimedHash;
-    claimedHash.SetHex(claimedHex);
-    if (claimedHash.IsNull())
-        throw std::runtime_error("claimed_response_hash is invalid or all-zero");
+    std::vector<unsigned char> commitHash = ParseHex(commitHashHex);
+    if (commitHash.size() != 32)
+        throw std::runtime_error("commit_hash must be exactly 32 bytes (64 hex chars)");
 
     OPoIResponse resp;
     if (!g_opoiCache.GetResponse(requestId, resp))
         throw JSONRPCError(RPC_INVALID_PARAMETER,
             "No committed response found for request " + requestId);
 
-    if (claimedHash == resp.responseHash)
+    OPoIStake minerStake;
+    if (!g_opoiCache.GetStake(resp.minerAddress, minerStake))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "challenged miner has no stake on record");
+
+    COutPoint colOut(colTxid, colVout);
+    CCoins coins;
+    CAmount collateralAmount = 0;
+    {
+        LOCK(cs_main);
+        CCoinsViewCache view(pcoinsTip);
+        if (!view.GetCoins(colTxid, coins) || colVout >= coins.vout.size() || coins.vout[colVout].IsNull())
+            throw std::runtime_error("collateral UTXO not found in the UTXO set");
+        collateralAmount = coins.vout[colVout].nValue;
+    }
+    CAmount minCollateral = (minerStake.amount * Params().GetConsensus().nOPoIChallengerStakePct) / 100;
+    if (collateralAmount < minCollateral)
         throw JSONRPCError(RPC_INVALID_PARAMETER,
-            "claimed_response_hash matches the committed hash — nothing to challenge");
+            strprintf("Collateral value %.4f CS is below minimum %.4f CS (%d%% of miner's %.4f CS stake)",
+                      (double)collateralAmount / COIN, (double)minCollateral / COIN,
+                      Params().GetConsensus().nOPoIChallengerStakePct, (double)minerStake.amount / COIN));
 
     CMutableTransaction mutTx;
-    mutTx.nVersion        = OPOI_TX_VERSION;
-    mutTx.nType           = OPOI_CHALLENGE_TX_TYPE;
-    mutTx.opoiRequestId   = requestId;
-    mutTx.opoiRequester   = challenger;
-    mutTx.opoiResponseHash= claimedHash;
-    mutTx.opoiSigTime     = (uint32_t)GetTime();
+    mutTx.nVersion                  = OPOI_TX_VERSION;
+    mutTx.nType                     = OPOI_CHALLENGE_TX_TYPE;
+    mutTx.opoiRequestId             = requestId;
+    mutTx.opoiRequester             = challenger;
+    mutTx.opoiChallengePhase        = 0;
+    mutTx.opoiCommitHash            = commitHash;
+    mutTx.opoiChallengerCollateralIn= colOut;
+    mutTx.opoiSigTime               = (uint32_t)GetTime();
 
-    std::string sigMsg = requestId + challenger + claimedHex;
+    std::string sigMsg = requestId + challenger + commitHashHex
+                       + colTxid.GetHex() + strprintf("%u", colVout);
     std::string errMsg;
     if (!SignWithAddress(challenger, sigMsg, mutTx.opoiSig, errMsg))
         throw JSONRPCError(RPC_WALLET_ERROR, "Failed to sign: " + errMsg);
@@ -969,10 +1005,96 @@ UniValue challengeopoi(const UniValue& params, bool fHelp)
 #endif
 
     UniValue ret(UniValue::VOBJ);
+    ret.pushKV("txid",             tx.GetHash().GetHex());
+    ret.pushKV("request_id",       requestId);
+    ret.pushKV("challenged_miner", resp.minerAddress);
+    ret.pushKV("reveal_deadline_blocks", (int)Params().GetConsensus().nOPoIChallengeCommitRevealBlocks);
+    return ret;
+}
+
+// ── revealchallenge (F8-C: REVEAL phase) ───────────────────────────────────────
+
+UniValue revealchallenge(const UniValue& params, bool fHelp)
+{
+    if (fHelp || params.size() != 4)
+        throw std::runtime_error(
+            "revealchallenge \"request_id\" \"challenger_address\" \"fraud_proof\" \"nonce\"\n"
+            "\nDisclose the fraud_proof + nonce for an open challenge (REVEAL phase).\n"
+            "\nMust match the commit_hash from challengeopoi's COMMIT, and must arrive within\n"
+            "nOPoIChallengeCommitRevealBlocks of it, or the challenge is dismissed and this\n"
+            "collateral is burned instead. For a VERIFIABLE request, resolution follows the\n"
+            "Auditor majority (F14-C) — a matching reveal alone never proves inference fraud\n"
+            "by itself, it only proves the challenger's claim hasn't changed since COMMIT.\n"
+            "\nArguments:\n"
+            "1. request_id         (string, required) UUID of the disputed request\n"
+            "2. challenger_address (string, required) Same address used in challengeopoi\n"
+            "3. fraud_proof        (string, required) hex — the evidence committed to earlier\n"
+            "4. nonce               (string, required) hex — the secret nonce committed to earlier\n"
+            "\nResult:\n"
+            "{ txid, request_id }\n"
+            "\nExamples:\n"
+            + HelpExampleCli("revealchallenge",
+                "\"uuid\" \"t1ChalAddr...\" \"abc123...\" \"deadbeef...\"")
+        );
+
+#ifdef ENABLE_WALLET
+    EnsureWalletIsUnlocked();
+#endif
+
+    std::string requestId  = params[0].get_str();
+    std::string challenger = params[1].get_str();
+    std::vector<unsigned char> proofData = ParseHex(params[2].get_str());
+    std::vector<unsigned char> nonce     = ParseHex(params[3].get_str());
+
+    if (requestId.empty())  throw std::runtime_error("request_id must not be empty");
+    if (challenger.empty()) throw std::runtime_error("challenger_address must not be empty");
+    if (proofData.empty())  throw std::runtime_error("fraud_proof must not be empty");
+    if (nonce.empty())      throw std::runtime_error("nonce must not be empty");
+
+    OPoIChallenge ch;
+    if (!g_opoiCache.GetChallenge(requestId, ch) || !ch.IsOpen())
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "no open COMMIT found for request " + requestId);
+    if (ch.challengerAddress != challenger)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "challenger_address does not match the open COMMIT");
+
+    unsigned char computed[32];
+    {
+        CSHA256 hasher;
+        hasher.Write(proofData.data(), proofData.size());
+        hasher.Write(nonce.data(), nonce.size());
+        hasher.Finalize(computed);
+    }
+    if (ch.commitHash != HexStr(computed, computed + 32))
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            "fraud_proof/nonce does not match the commit_hash stored at COMMIT time");
+
+    CMutableTransaction mutTx;
+    mutTx.nVersion                  = OPOI_TX_VERSION;
+    mutTx.nType                     = OPOI_CHALLENGE_TX_TYPE;
+    mutTx.opoiRequestId             = requestId;
+    mutTx.opoiRequester             = challenger;
+    mutTx.opoiChallengePhase        = 1;
+    mutTx.opoiProofData             = proofData;
+    mutTx.opoiChallengeNonce        = nonce;
+    mutTx.opoiChallengerCollateralIn= ch.challengerCollateral;
+    mutTx.opoiSigTime               = (uint32_t)GetTime();
+
+    std::string sigMsg = requestId + challenger + HexStr(proofData) + HexStr(nonce);
+    std::string errMsg;
+    if (!SignWithAddress(challenger, sigMsg, mutTx.opoiSig, errMsg))
+        throw JSONRPCError(RPC_WALLET_ERROR, "Failed to sign: " + errMsg);
+
+    CTransaction tx(mutTx);
+#ifdef ENABLE_WALLET
+    CReserveKey reservekey(pwalletMain);
+    CWalletTx walletTx(pwalletMain, tx);
+    if (!pwalletMain->CommitTransaction(walletTx, reservekey))
+        throw JSONRPCError(RPC_WALLET_ERROR, "CommitTransaction failed for revealchallenge");
+#endif
+
+    UniValue ret(UniValue::VOBJ);
     ret.pushKV("txid",       tx.GetHash().GetHex());
     ret.pushKV("request_id", requestId);
-    ret.pushKV("challenged_miner", resp.minerAddress);
-    ret.pushKV("window_blocks", (int)Params().GetConsensus().nOPoIChallengeWindowBlocks);
     return ret;
 }
 
@@ -1039,7 +1161,7 @@ UniValue listopoichallenges(const UniValue& params, bool fHelp)
             "listopoichallenges ( \"status\" )\n"
             "\nList OPoI challenges.\n"
             "\nArguments:\n"
-            "1. status  (string, optional) OPEN | SLASHED | EXPIRED\n"
+            "1. status  (string, optional) OPEN | SLASHED | EXPIRED | REVEALED_PENDING | RESOLVED_NO_ORACLE\n"
             "\nExamples:\n"
             + HelpExampleCli("listopoichallenges", "")
             + HelpExampleCli("listopoichallenges", "\"OPEN\"")
@@ -1049,10 +1171,12 @@ UniValue listopoichallenges(const UniValue& params, bool fHelp)
     int8_t statusFilter = -1;
     if (params.size() == 1) {
         std::string s = params[0].get_str();
-        if      (s == "OPEN")    statusFilter = OPOI_CHALLENGE_OPEN;
-        else if (s == "SLASHED") statusFilter = OPOI_CHALLENGE_SLASHED;
-        else if (s == "EXPIRED") statusFilter = OPOI_CHALLENGE_EXPIRED;
-        else throw std::runtime_error("Invalid status. Use OPEN, SLASHED or EXPIRED.");
+        if      (s == "OPEN")               statusFilter = OPOI_CHALLENGE_OPEN;
+        else if (s == "SLASHED")            statusFilter = OPOI_CHALLENGE_SLASHED;
+        else if (s == "EXPIRED")            statusFilter = OPOI_CHALLENGE_EXPIRED;
+        else if (s == "REVEALED_PENDING")   statusFilter = OPOI_CHALLENGE_REVEALED_PENDING;
+        else if (s == "RESOLVED_NO_ORACLE") statusFilter = OPOI_CHALLENGE_RESOLVED_NO_ORACLE;
+        else throw std::runtime_error("Invalid status. Use OPEN, SLASHED, EXPIRED, REVEALED_PENDING or RESOLVED_NO_ORACLE.");
     }
 
     UniValue arr(UniValue::VARR);
@@ -1921,6 +2045,7 @@ static const CRPCCommand commands[] =
     { "opoi",   "stakeopoi",          &stakeopoi,           false },
     { "opoi",   "unstakeopoi",        &unstakeopoi,         false },
     { "opoi",   "challengeopoi",      &challengeopoi,       false },
+    { "opoi",   "revealchallenge",    &revealchallenge,     false },
     { "opoi",   "listopoistakes",     &listopoistakes,      false },
     { "opoi",   "getopoistake",       &getopoistake,        false },
     { "opoi",   "listopoichallenges", &listopoichallenges,  false },
