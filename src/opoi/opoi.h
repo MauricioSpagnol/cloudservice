@@ -453,6 +453,16 @@ public:
 
     // Phase 4: locked collateral UTXOs (miner cannot spend while staked or slashed)
     std::map<COutPoint, std::string> mapLockedUTXOs;    // collateral → ownerAddress
+    // Bug fix (2026-07-05): which tx actually locked this UTXO. Needed so
+    // CheckOPoITransaction can tell "this exact STAKE/CHALLENGE-COMMIT/
+    // AUDITOR_VERIFY tx is being redelivered late via normal P2P relay" (harmless —
+    // AlreadyHave()'s usual dedup can never catch this, since these tx types are
+    // required to have empty vin/vout and HaveCoins() is always false for them)
+    // apart from "a genuinely different tx is racing to lock the same UTXO" (a real
+    // conflict). Without this, both cases hit the same DoS(100) rejection, which
+    // alone reaches the default ban threshold and disconnects/bans an honest peer
+    // for nothing more than ordinary tx-relay timing.
+    std::map<COutPoint, uint256>     mapLockingTxHash;   // collateral → locking txid
 
     // F14-C: Auditor verification results
     // Key = requestId, value = all AuditorVerification records for that request
@@ -722,19 +732,30 @@ public:
 
     // ── Phase 4: collateral locking ──────────────────────────────────────────
 
-    void LockUTXO(const COutPoint& out, const std::string& minerAddress) {
+    void LockUTXO(const COutPoint& out, const std::string& minerAddress, const uint256& txHash) {
         LOCK(cs);
         mapLockedUTXOs[out] = minerAddress;
+        mapLockingTxHash[out] = txHash;
     }
 
     void UnlockUTXO(const COutPoint& out) {
         LOCK(cs);
         mapLockedUTXOs.erase(out);
+        mapLockingTxHash.erase(out);
     }
 
     bool IsLockedUTXO(const COutPoint& out) const {
         LOCK(cs);
         return mapLockedUTXOs.count(out) > 0;
+    }
+
+    // Bug fix (2026-07-05): see mapLockingTxHash comment above.
+    bool GetLockingTxHash(const COutPoint& out, uint256& outHash) const {
+        LOCK(cs);
+        auto it = mapLockingTxHash.find(out);
+        if (it == mapLockingTxHash.end()) return false;
+        outHash = it->second;
+        return true;
     }
 
     // ── Phase 2 ──────────────────────────────────────────────────────────────
@@ -893,8 +914,10 @@ public:
             if (existing.auditorAddress == fv.auditorAddress) return true; // one vote per Auditor
         verifs.push_back(fv);
         // Lock Auditor's collateral
-        if (!fv.auditorCollateral.IsNull())
+        if (!fv.auditorCollateral.IsNull()) {
             mapLockedUTXOs[fv.auditorCollateral] = fv.auditorAddress;
+            mapLockingTxHash[fv.auditorCollateral] = fv.txHash;
+        }
         return true;
     }
 

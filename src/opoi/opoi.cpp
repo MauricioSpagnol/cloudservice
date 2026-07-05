@@ -103,6 +103,27 @@ static bool CheckVrfSortition(const std::string& minerAddress,
     return true;
 }
 
+// Bug fix (2026-07-05): distinguishes a harmless late P2P redelivery of a tx that
+// already locked this UTXO from a genuinely different, conflicting tx. Bitcoin
+// Core's normal defense against re-validating an already-known/confirmed tx
+// (AlreadyHave() checking mempool/pcoinsTip->HaveCoins) can never recognize an
+// OPoI tx as "already seen", because these tx types are required to have empty
+// vin/vout (HaveCoins() is defined as "!vout.empty()", always false here). So a
+// stale tx-relay message for an already-mined STAKE/CHALLENGE-COMMIT/
+// AUDITOR_VERIFY — ordinary P2P timing, not an attack — always reaches
+// CheckOPoITransaction again and used to be rejected with DoS(100), which alone
+// reaches the default ban threshold (banscore=100) and disconnects the honest
+// relaying peer. Confirmed causing a real, unintended reorg in multi-node testing
+// (2026-07-05): a node got banned by its own peers mid-block-production and kept
+// mining a divergent chain alone. This only suppresses the DoS score for the
+// EXACT same txid being redelivered — a different tx racing for the same UTXO
+// still gets the full DoS(100) below, since that's a genuine conflict.
+static bool IsHarmlessRedelivery(const COutPoint& collateral, const uint256& txHash)
+{
+    uint256 lockingTxHash;
+    return g_opoiCache.GetLockingTxHash(collateral, lockingTxHash) && lockingTxHash == txHash;
+}
+
 // Stable VRF seed anchor for a request: the hash of the block the REQUEST
 // itself confirmed in. Unlike chainActive.Tip(), this never changes once the
 // request is mined, so proofs computed against it stay valid regardless of
@@ -193,11 +214,11 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
                             if (stakeIt != g_opoiCache.mapStakes.end())
                                 stakeIt->second.stakeStatus = OPOI_STAKE_ACTIVE;
                         }
-                        g_opoiCache.LockUTXO(ch.challengerCollateral, ch.challengerAddress);
+                        g_opoiCache.LockUTXO(ch.challengerCollateral, ch.challengerAddress, ch.txHash);
                         g_opoiCache.UnmarkChallengerRewardPaid(tx.opoiRequestId);
                     } else if (ch.challengeStatus == OPOI_CHALLENGE_RESOLVED_NO_ORACLE) {
                         // Reverse the "no fault" collateral release.
-                        g_opoiCache.LockUTXO(ch.challengerCollateral, ch.challengerAddress);
+                        g_opoiCache.LockUTXO(ch.challengerCollateral, ch.challengerAddress, ch.txHash);
                     }
                     // EXPIRED-via-PASS and REVEALED_PENDING never touched any lock —
                     // nothing to reverse there beyond the field resets below.
@@ -357,7 +378,7 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
             VerifyOPoISig(tx.opoiMinerAddress, sigMsg, tx.opoiSig, &stake.minerPubKey);
         }
         g_opoiCache.AddStake(stake);
-        g_opoiCache.LockUTXO(tx.opoiCollateralIn, tx.opoiMinerAddress); // lock collateral
+        g_opoiCache.LockUTXO(tx.opoiCollateralIn, tx.opoiMinerAddress, tx.GetHash()); // lock collateral
         LogPrintf("OPoI: STAKE by %s (%.4f CS) at height %u — collateral %s:%u locked\n",
                   tx.opoiMinerAddress, (double)tx.opoiPayment / COIN, blockHeight,
                   tx.opoiCollateralIn.hash.GetHex(), tx.opoiCollateralIn.n);
@@ -381,7 +402,7 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         ch.txHash               = tx.GetHash();
         ch.challengeStatus      = OPOI_CHALLENGE_OPEN;
         g_opoiCache.AddChallenge(ch);
-        g_opoiCache.LockUTXO(tx.opoiChallengerCollateralIn, tx.opoiRequester);
+        g_opoiCache.LockUTXO(tx.opoiChallengerCollateralIn, tx.opoiRequester, tx.GetHash());
         // F10-C: reputation tracking — count a CHALLENGE opened against the
         // responder of this requestId (if a RESPONSE is even cached yet).
         {
@@ -968,10 +989,15 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
             return state.DoS(10, error("CheckOPoITransaction(): STAKE payment must be positive"),
                              REJECT_INVALID, "bad-txns-opoi-stake-zero-amount");
         // Collateral must not be already locked by another stake
-        if (!fIsVerifying && g_opoiCache.IsLockedUTXO(tx.opoiCollateralIn))
+        if (!fIsVerifying && g_opoiCache.IsLockedUTXO(tx.opoiCollateralIn)) {
+            if (IsHarmlessRedelivery(tx.opoiCollateralIn, tx.GetHash()))
+                return state.Invalid(error("CheckOPoITransaction(): STAKE %s already known",
+                                           tx.GetHash().GetHex()),
+                                     REJECT_DUPLICATE, "bad-txns-opoi-stake-already-known");
             return state.DoS(100, error("CheckOPoITransaction(): STAKE collateral %s:%u already locked",
                                         tx.opoiCollateralIn.hash.GetHex(), tx.opoiCollateralIn.n),
                              REJECT_INVALID, "bad-txns-opoi-stake-collateral-locked");
+        }
         // Verify miner owns the collateral address
         {
             std::string sigMsg = tx.opoiMinerAddress + tx.opoiCollateralIn.hash.GetHex()
@@ -1034,11 +1060,16 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                 return state.DoS(10, error("CheckOPoITransaction(): CHALLENGE COMMIT missing commit hash"),
                                  REJECT_INVALID, "bad-txns-opoi-challenge-no-commit-hash");
             if (!fIsVerifying) {
-                if (g_opoiCache.IsLockedUTXO(tx.opoiChallengerCollateralIn))
+                if (g_opoiCache.IsLockedUTXO(tx.opoiChallengerCollateralIn)) {
+                    if (IsHarmlessRedelivery(tx.opoiChallengerCollateralIn, tx.GetHash()))
+                        return state.Invalid(error("CheckOPoITransaction(): CHALLENGE COMMIT %s already known",
+                                                   tx.GetHash().GetHex()),
+                                             REJECT_DUPLICATE, "bad-txns-opoi-challenge-already-known");
                     return state.DoS(100, error("CheckOPoITransaction(): CHALLENGE collateral %s:%u already locked",
                                                 tx.opoiChallengerCollateralIn.hash.GetHex(),
                                                 tx.opoiChallengerCollateralIn.n),
                                      REJECT_INVALID, "bad-txns-opoi-challenge-collateral-locked");
+                }
                 OPoIChallenge existing;
                 if (g_opoiCache.GetChallenge(tx.opoiRequestId, existing) && existing.IsOpen())
                     return state.DoS(10, error("CheckOPoITransaction(): CHALLENGE already open for request %s",
@@ -1341,10 +1372,15 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                                            tx.opoiRequestId),
                                  REJECT_INVALID, "bad-txns-opoi-auditor-not-verifiable");
             // Collateral must not already be locked by another stake/audit.
-            if (g_opoiCache.IsLockedUTXO(tx.opoiAuditorCollateralIn))
+            if (g_opoiCache.IsLockedUTXO(tx.opoiAuditorCollateralIn)) {
+                if (IsHarmlessRedelivery(tx.opoiAuditorCollateralIn, tx.GetHash()))
+                    return state.Invalid(error("CheckOPoITransaction(): AUDITOR_VERIFY %s already known",
+                                               tx.GetHash().GetHex()),
+                                         REJECT_DUPLICATE, "bad-txns-opoi-auditor-already-known");
                 return state.DoS(100, error("CheckOPoITransaction(): AUDITOR_VERIFY collateral %s:%u already locked",
                                             tx.opoiAuditorCollateralIn.hash.GetHex(), tx.opoiAuditorCollateralIn.n),
                                  REJECT_INVALID, "bad-txns-opoi-auditor-collateral-locked");
+            }
         }
         // Verify the Auditor owns the collateral address — same shape as STAKE's
         // ownership proof (opoi.cpp, OPOI_STAKE_TX_TYPE above).
