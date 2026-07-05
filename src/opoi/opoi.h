@@ -432,7 +432,8 @@ struct AuditorVerification {
 // (getopoipendingdeliveries RPC) — no addressed routing to a specific "home
 // node" needed, since flooding means every node ends up with a copy anyway.
 static const uint8_t OPOI_DELIVERY_PROMPT       = 0;
-static const uint8_t OPOI_DELIVERY_SHARD_ASSIGN = 1; // reserved, not consumed yet
+static const uint8_t OPOI_DELIVERY_SHARD_ASSIGN = 1; // F15-H fast-follow (2026-07-05): coordinator → miner
+static const uint8_t OPOI_DELIVERY_SHARD_RESULT = 2; // F15-H fast-follow (2026-07-05): miner → coordinator reply
 static const size_t  OPOI_DELIVERY_MAX_PAYLOAD_HEX = 131072; // 64KB of raw payload, hex-encoded
 
 struct PendingDelivery {
@@ -440,9 +441,15 @@ struct PendingDelivery {
     uint8_t     kind;
     std::string payloadHex;
     uint32_t    sigTime;
+    // F15-H fast-follow: who signed this (the consumer's "reply to" address
+    // for SHARD_ASSIGN/SHARD_RESULT — see COPoIDataMsg comment below). Empty
+    // for PROMPT, where the signer is always the REQUEST's own requester and
+    // doesn't need to be carried separately.
+    std::string senderAddress;
 
     void SetNull() {
         requestId.clear(); kind = OPOI_DELIVERY_PROMPT; payloadHex.clear(); sigTime = 0;
+        senderAddress.clear();
     }
 };
 
@@ -452,10 +459,23 @@ struct PendingDelivery {
 // signmessage-compatible) so validation reuses the exact machinery
 // CheckOPoITransaction already relies on for RESPONSE/CHALLENGE signatures —
 // no new trust primitive.
+//
+// F15-H fast-follow (2026-07-05): senderAddress identifies who is claiming to
+// have signed this. For PROMPT, the expected signer is always the REQUEST's
+// requester (senderAddress is redundant there, but still checked for
+// consistency). For SHARD_ASSIGN (a coordinator relaying a shard assignment
+// to a miner with no reachable endpoint) and SHARD_RESULT (that miner's reply
+// carrying the computed tensor back), there is no single address derivable
+// from the requestId alone — a request can have multiple accepted
+// coordinators (F15-C, VRF-selected redundancy) and any ACTIVE staker could
+// be the assigned miner — so the message must say who it claims to be, and
+// ProcessOPoIDataMessage checks that claim against the right on-chain role
+// (IsClaimedCoordinator / IsActiveStaker) before trusting the signature.
 struct COPoIDataMsg {
     std::string destStakeAddress;
     std::string requestId;
     uint8_t     kind;
+    std::string senderAddress;
     std::string payloadHex;
     uint32_t    sigTime;
     std::vector<unsigned char> sig;
@@ -464,19 +484,19 @@ struct COPoIDataMsg {
     template <typename Stream, typename Operation>
     inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(destStakeAddress); READWRITE(requestId); READWRITE(kind);
-        READWRITE(payloadHex); READWRITE(sigTime); READWRITE(sig);
+        READWRITE(senderAddress); READWRITE(payloadHex); READWRITE(sigTime); READWRITE(sig);
     }
 
     uint256 GetHash() const { return SerializeHash(*this); }
 };
 
-// Validates a COPoIDataMsg (signature must recover to the named REQUEST's
-// requester, request must still be PENDING, payload size bounded) and, if
-// valid, stores it into g_opoiCache. Shared by the P2P receive handler
-// (main.cpp, "opoidata" command) and the submitopoipendingdelivery RPC —
-// same validation either way, only the entry point differs. Returns false
-// (with a short machine-readable reason) without storing anything on any
-// failure; callers use the return value to decide whether to flood-relay
+// Validates a COPoIDataMsg — signer authorization depends on kind (see
+// COPoIDataMsg comment above) — and, if valid, stores it into g_opoiCache.
+// Shared by the P2P receive handler (main.cpp, "opoidata" command) and the
+// submitopoipendingdelivery RPC — same validation either way, only the entry
+// point differs. Returns false (with a short machine-readable reason)
+// without storing anything on any failure; callers use the return value to
+// decide whether to flood-relay
 // onward (never relay something that failed validation).
 bool ProcessOPoIDataMessage(const COPoIDataMsg& msg, std::string& reason);
 

@@ -2195,23 +2195,42 @@ UniValue getauditorverifications(const UniValue& params, bool fHelp)
 // ── OPoI relay (2026-07-05): P2P delivery for NAT'd/CGNAT'd miners ────────────
 // See PendingDelivery/COPoIDataMsg doc comments in opoi.h for the full design.
 
+static bool ParseOPoIDeliveryKind(const std::string& s, uint8_t& out)
+{
+    if (s.empty() || s == "PROMPT")       { out = OPOI_DELIVERY_PROMPT;       return true; }
+    if (s == "SHARD_ASSIGN")              { out = OPOI_DELIVERY_SHARD_ASSIGN; return true; }
+    if (s == "SHARD_RESULT")              { out = OPOI_DELIVERY_SHARD_RESULT; return true; }
+    return false;
+}
+
 UniValue submitopoipendingdelivery(const UniValue& params, bool fHelp)
 {
-    if (fHelp || params.size() != 3)
+    if (fHelp || params.size() < 3 || params.size() > 5)
         throw std::runtime_error(
-            "submitopoipendingdelivery \"request_id\" \"dest_stake_address\" \"payload_hex\"\n"
-            "\nOPoI relay: deliver off-chain data (e.g. prompt text) to a miner with no\n"
-            "reachable HTTP endpoint, via P2P flood-relay instead of POSTing directly to\n"
-            "the miner's declared endpoint (see /api/opoi/prompt). Signs as the\n"
-            "REQUEST's own requester (this node's wallet must hold that key) and floods\n"
-            "it to every connected peer; the destination miner's own node ends up with a\n"
-            "copy regardless of which node originated it (no addressed routing needed)\n"
-            "and the miner polls it via getopoipendingdeliveries on ITS OWN node.\n"
+            "submitopoipendingdelivery \"request_id\" \"dest_stake_address\" \"payload_hex\""
+            " ( \"kind\" \"sender_address\" )\n"
+            "\nOPoI relay: deliver off-chain data to a miner with no reachable HTTP\n"
+            "endpoint, via P2P flood-relay instead of POSTing directly to the miner's\n"
+            "declared endpoint. Floods to every connected peer; the destination miner's\n"
+            "own node ends up with a copy regardless of which node originated it (no\n"
+            "addressed routing needed) and polls it via getopoipendingdeliveries on ITS\n"
+            "OWN node.\n"
+            "\nFor kind=PROMPT (default), signs as the REQUEST's own requester — see\n"
+            "/api/opoi/prompt for the direct-HTTP equivalent. For kind=SHARD_ASSIGN (a\n"
+            "coordinator relaying a shard assignment — F15-H) or kind=SHARD_RESULT (the\n"
+            "assigned miner's reply carrying the computed tensor back), sender_address is\n"
+            "required and must be this node's own address: a coordinator (must have an\n"
+            "accepted claim for this request) or an ACTIVE staker, respectively — there\n"
+            "is no single address derivable from request_id alone for these two kinds,\n"
+            "since a request can have several accepted coordinators (VRF redundancy) and\n"
+            "any ACTIVE staker could be the assigned miner.\n"
             "\nArguments:\n"
             "1. request_id          (string, required) UUID of the inference request\n"
-            "2. dest_stake_address  (string, required) The miner's stake/mining address\n"
-            "3. payload_hex         (string, required) Raw payload as hex (e.g. UTF-8\n"
-            "                       prompt text hex-encoded) — max 64KB encoded\n"
+            "2. dest_stake_address  (string, required) Recipient's stake/mining address\n"
+            "3. payload_hex         (string, required) Raw payload as hex — max 64KB encoded\n"
+            "4. kind                (string, optional) PROMPT (default) | SHARD_ASSIGN | SHARD_RESULT\n"
+            "5. sender_address      (string, optional) Required for SHARD_ASSIGN/SHARD_RESULT;\n"
+            "                       this node's wallet must hold its key\n"
             "\nResult:\n"
             "{ delivered: true }\n"
             "\nExamples:\n"
@@ -2225,11 +2244,19 @@ UniValue submitopoipendingdelivery(const UniValue& params, bool fHelp)
     std::string requestId  = params[0].get_str();
     std::string destAddr   = params[1].get_str();
     std::string payloadHex = params[2].get_str();
+    std::string kindStr    = (params.size() > 3) ? params[3].get_str() : "";
+    std::string senderAddr = (params.size() > 4) ? params[4].get_str() : "";
 
     if (requestId.empty()) throw std::runtime_error("request_id must not be empty");
     if (destAddr.empty())  throw std::runtime_error("dest_stake_address must not be empty");
     if (payloadHex.size() > OPOI_DELIVERY_MAX_PAYLOAD_HEX)
         throw std::runtime_error("payload_hex exceeds max size");
+
+    uint8_t kind;
+    if (!ParseOPoIDeliveryKind(kindStr, kind))
+        throw std::runtime_error("kind must be PROMPT, SHARD_ASSIGN, or SHARD_RESULT");
+    if (kind != OPOI_DELIVERY_PROMPT && senderAddr.empty())
+        throw std::runtime_error("sender_address is required for SHARD_ASSIGN/SHARD_RESULT");
 
     OPoIRequest req;
     if (!g_opoiCache.GetRequest(requestId, req))
@@ -2237,17 +2264,20 @@ UniValue submitopoipendingdelivery(const UniValue& params, bool fHelp)
     if (!req.IsPending())
         throw JSONRPCError(RPC_INVALID_PARAMETER, "request " + requestId + " is no longer PENDING");
 
+    std::string signerAddr = (kind == OPOI_DELIVERY_PROMPT) ? req.requester : senderAddr;
+
     COPoIDataMsg msg;
     msg.destStakeAddress = destAddr;
     msg.requestId        = requestId;
-    msg.kind             = OPOI_DELIVERY_PROMPT;
+    msg.kind             = kind;
+    msg.senderAddress    = senderAddr;
     msg.payloadHex       = payloadHex;
     msg.sigTime          = (uint32_t)GetTime();
 
     std::string sigMsg = std::string("OPOIDATA") + requestId + destAddr
-                        + strprintf("%u", (unsigned)msg.kind) + payloadHex;
+                        + strprintf("%u", (unsigned)msg.kind) + senderAddr + payloadHex;
     std::string errMsg;
-    if (!SignWithAddress(req.requester, sigMsg, msg.sig, errMsg))
+    if (!SignWithAddress(signerAddr, sigMsg, msg.sig, errMsg))
         throw JSONRPCError(RPC_WALLET_ERROR, "Failed to sign: " + errMsg);
 
     std::string reason;
@@ -2284,7 +2314,7 @@ UniValue getopoipendingdeliveries(const UniValue& params, bool fHelp)
             "\nArguments:\n"
             "1. stake_address  (string, required) The miner's stake/mining address\n"
             "\nResult:\n"
-            "[{ request_id, kind, payload_hex, sig_time }, ...]\n"
+            "[{ request_id, kind, kind_str, sender_address, payload_hex, sig_time }, ...]\n"
             "\nExamples:\n"
             + HelpExampleCli("getopoipendingdeliveries", "\"tmMinerAddr...\"")
         );
@@ -2295,10 +2325,14 @@ UniValue getopoipendingdeliveries(const UniValue& params, bool fHelp)
     UniValue arr(UniValue::VARR);
     for (const auto& d : g_opoiCache.GetAndDrainPendingDeliveries(destAddr)) {
         UniValue obj(UniValue::VOBJ);
-        obj.pushKV("request_id",  d.requestId);
-        obj.pushKV("kind",        (int)d.kind);
-        obj.pushKV("payload_hex", d.payloadHex);
-        obj.pushKV("sig_time",    (int)d.sigTime);
+        obj.pushKV("request_id",     d.requestId);
+        obj.pushKV("kind",           (int)d.kind);
+        std::string kindStr = d.kind == OPOI_DELIVERY_SHARD_ASSIGN ? "SHARD_ASSIGN"
+                            : d.kind == OPOI_DELIVERY_SHARD_RESULT ? "SHARD_RESULT" : "PROMPT";
+        obj.pushKV("kind_str",       kindStr);
+        obj.pushKV("sender_address", d.senderAddress);
+        obj.pushKV("payload_hex",    d.payloadHex);
+        obj.pushKV("sig_time",       (int)d.sigTime);
         arr.push_back(obj);
     }
     return arr;

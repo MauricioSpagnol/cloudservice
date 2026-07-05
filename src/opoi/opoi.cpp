@@ -127,9 +127,15 @@ static bool IsHarmlessRedelivery(const COutPoint& collateral, const uint256& txH
 // ── OPoI relay (2026-07-05): P2P delivery for NAT'd/CGNAT'd miners ────────────
 // Shared by the "opoidata" P2P receive handler (main.cpp) and the
 // submitopoipendingdelivery RPC (rpc/opoi.cpp) — same validation either way.
-// Ties spam-prevention to real on-chain state for free: the signature must
-// recover to the REQUEST's own requester address, and the REQUEST must still
-// be PENDING — no requestId, wrong signer, or already-resolved request means
+// Ties spam-prevention to real on-chain state for free, but WHICH on-chain
+// role must have signed depends on kind (see COPoIDataMsg comment in
+// opoi.h): PROMPT is always the REQUEST's own requester; SHARD_ASSIGN (F15-H
+// fast-follow) must be an accepted coordinator for this requestId
+// (IsClaimedCoordinator — a request can have several by design, VRF
+// redundancy, so this isn't derivable from the requestId alone); SHARD_RESULT
+// (the assigned miner's reply, carrying the computed tensor back) must be an
+// ACTIVE staker. The REQUEST must still be PENDING either way — no
+// requestId, wrong/unauthorized signer, or already-resolved request means
 // this is dropped before ever being stored or relayed, the same way
 // CheckOPoITransaction already validates RESPONSE/CHALLENGE signatures.
 bool ProcessOPoIDataMessage(const COPoIDataMsg& msg, std::string& reason)
@@ -140,10 +146,6 @@ bool ProcessOPoIDataMessage(const COPoIDataMsg& msg, std::string& reason)
     }
     if (msg.payloadHex.size() > OPOI_DELIVERY_MAX_PAYLOAD_HEX) {
         reason = "payload-too-large";
-        return false;
-    }
-    if (msg.kind != OPOI_DELIVERY_PROMPT && msg.kind != OPOI_DELIVERY_SHARD_ASSIGN) {
-        reason = "bad-kind";
         return false;
     }
 
@@ -157,18 +159,43 @@ bool ProcessOPoIDataMessage(const COPoIDataMsg& msg, std::string& reason)
         return false;
     }
 
+    std::string expectedSigner;
+    switch (msg.kind) {
+    case OPOI_DELIVERY_PROMPT:
+        expectedSigner = req.requester;
+        break;
+    case OPOI_DELIVERY_SHARD_ASSIGN:
+        if (msg.senderAddress.empty() || !g_opoiCache.IsClaimedCoordinator(msg.requestId, msg.senderAddress)) {
+            reason = "not-a-coordinator";
+            return false;
+        }
+        expectedSigner = msg.senderAddress;
+        break;
+    case OPOI_DELIVERY_SHARD_RESULT:
+        if (msg.senderAddress.empty() || !g_opoiCache.IsActiveStaker(msg.senderAddress)) {
+            reason = "not-an-active-staker";
+            return false;
+        }
+        expectedSigner = msg.senderAddress;
+        break;
+    default:
+        reason = "bad-kind";
+        return false;
+    }
+
     std::string sigMsg = std::string("OPOIDATA") + msg.requestId + msg.destStakeAddress
-                        + strprintf("%u", msg.kind) + msg.payloadHex;
-    if (!VerifyOPoISig(req.requester, sigMsg, msg.sig)) {
+                        + strprintf("%u", msg.kind) + msg.senderAddress + msg.payloadHex;
+    if (!VerifyOPoISig(expectedSigner, sigMsg, msg.sig)) {
         reason = "bad-sig";
         return false;
     }
 
     PendingDelivery d;
-    d.requestId  = msg.requestId;
-    d.kind       = msg.kind;
-    d.payloadHex = msg.payloadHex;
-    d.sigTime    = msg.sigTime;
+    d.requestId     = msg.requestId;
+    d.kind          = msg.kind;
+    d.payloadHex    = msg.payloadHex;
+    d.sigTime       = msg.sigTime;
+    d.senderAddress = msg.senderAddress;
     g_opoiCache.AddPendingDelivery(msg.destStakeAddress, d);
     return true;
 }
