@@ -1267,10 +1267,22 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                              REJECT_INVALID, "bad-txns-opoi-model-no-pom-root");
         if (!fIsVerifying) {
             ModelManifest existing;
-            if (g_opoiCache.GetModelManifest(tx.opoiModelId, existing))
+            if (g_opoiCache.GetModelManifest(tx.opoiModelId, existing)) {
+                // Bug fix (2026-07-05): same class as MODEL_VOTE/STAKE/etc —
+                // a late P2P redelivery of this exact already-applied
+                // MODEL_REGISTER tx must not be judged against
+                // "already registered", which is true precisely BECAUSE this
+                // tx already succeeded once. Confirmed live via the same
+                // rapid-block-generation repro that found the MODEL_VOTE/
+                // COORDINATOR_CLAIM bugs.
+                if (existing.txHash == tx.GetHash())
+                    return state.Invalid(error("CheckOPoITransaction(): MODEL_REGISTER %s already known",
+                                               tx.GetHash().GetHex()),
+                                         REJECT_DUPLICATE, "bad-txns-opoi-model-already-known");
                 return state.DoS(10, error("CheckOPoITransaction(): model %s already registered",
                                            tx.opoiModelId),
                                  REJECT_INVALID, "bad-txns-opoi-model-already-registered");
+            }
             if (!g_opoiCache.IsActiveStaker(tx.opoiRequester))
                 return state.DoS(10, error("CheckOPoITransaction(): MODEL_REGISTER proposer %s not staked",
                                            tx.opoiRequester),
