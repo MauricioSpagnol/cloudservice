@@ -94,6 +94,16 @@ struct OPoIRequest {
     // Commit-reveal response tracking (F10-B)
     std::map<std::string, std::string> responseCommits;  // minerAddr → commitHash (phase=COMMIT)
     std::map<std::string, std::string> responseReveals;  // minerAddr → responseHash (phase=REVEAL)
+    // F10-B: flips true once nOPoIResponseCommitWindowBlocks have passed since
+    // blockHeight (see ProcessResponseCommitWindows). No COMMIT is valid once
+    // this is true; no REVEAL is valid while it's still false — this closes
+    // the commit phase for every miner at the same height, which is what
+    // actually prevents copying (no REVEAL can be public before this flips).
+    // In-class initializer (not just SetNull()) so a plain `OPoIRequest req;`
+    // followed by manual field assignment (as ProcessOPoITransaction's REQUEST
+    // apply does, never calling SetNull()) can't leave this as stack garbage —
+    // the exact bug class already found once for OPoIStake's reputation fields.
+    bool        commitWindowClosed = false;
 
     ADD_SERIALIZE_METHODS;
     template <typename Stream, typename Operation>
@@ -113,6 +123,7 @@ struct OPoIRequest {
         blockHeight = 0; sigTime = 0; txHash.SetNull();
         status = OPOI_STATUS_PENDING;
         responseCommits.clear(); responseReveals.clear();
+        commitWindowClosed = false;
     }
     bool IsNull()       const { return requestId.empty(); }
     bool IsPending()    const { return status == OPOI_STATUS_PENDING; }
@@ -738,11 +749,16 @@ public:
         auto it = mapRequests.find(resp.requestId);
         if (it != mapRequests.end() && resp.IsRevealed())
             it->second.status = OPOI_STATUS_FULFILLED;
-        // Remove pending commit when reveal is stored
-        if (resp.IsRevealed()) {
-            std::string key = resp.requestId + ":" + resp.minerAddress;
-            mapResponseCommits.erase(key);
-        }
+        // F10-B: bug fix — this used to erase the pending commit here, on the
+        // theory that a stored REVEAL makes the COMMIT moot. But that made a
+        // reorg unrecoverable: if only the REVEAL's block gets disconnected
+        // (fork point between COMMIT and REVEAL), ProcessOPoITransaction's
+        // undo path has no way to reconstruct the erased commit, permanently
+        // stranding a miner who genuinely committed on the surviving chain.
+        // The commit record is now kept forever (mirrors how a CHALLENGE's
+        // commitHash is never erased after its REVEAL either) — REVEAL
+        // validity is decided by req.commitWindowClosed + hash match, not by
+        // whether this map still has an entry.
         return true;
     }
 
@@ -971,6 +987,16 @@ void ProcessExpiredChallenges(uint32_t blockHeight, const Consensus::Params& par
 // within nOPoIRequestExpiryBlocks. After expiry, RESPONSE txs for that requestId
 // are rejected by CheckOPoITransaction.
 void ProcessExpiredRequests(uint32_t blockHeight, const Consensus::Params& params);
+
+// F10-B: called from ConnectBlock (and RebuildOPoICache replay) to close a
+// REQUEST's commit window once nOPoIResponseCommitWindowBlocks have passed
+// since it confirmed. CheckOPoITransaction reads req.commitWindowClosed
+// rather than computing height live — same convention as request expiry and
+// challenge timeouts above, and for the same reason the VRF seed anchor was
+// fixed to a stable block hash: a live chainActive.Height() read inside
+// CheckOPoITransaction is a moving target depending on whether it's called
+// for a mempool candidate or for a block being connected.
+void ProcessResponseCommitWindows(uint32_t blockHeight, const Consensus::Params& params);
 
 // Called from ConnectBlock to verify OPoI miner payments in the coinbase tx.
 // For each RESPONSE tx in the block, verifies the coinbase has an output paying

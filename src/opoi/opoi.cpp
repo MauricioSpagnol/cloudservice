@@ -132,14 +132,35 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
             g_opoiCache.mapRequests.erase(tx.opoiRequestId);
 
         } else if (tx.nType == OPOI_RESPONSE_TX_TYPE) {
-            g_opoiCache.mapResponses.erase(tx.opoiRequestId);
-            auto it = g_opoiCache.mapRequests.find(tx.opoiRequestId);
-            if (it != g_opoiCache.mapRequests.end())
-                it->second.status = OPOI_STATUS_PENDING;
-            // F14-C: undo "paid" bookkeeping for a VERIFIABLE response too (mirrors
-            // UnmarkShardPaid below) — if this reconnects differently, it must be
-            // payable again.
-            g_opoiCache.UnmarkResponsePaid(tx.opoiRequestId);
+            if (tx.opoiResponsePhase == 0) {
+                // F10-B: undo COMMIT — remove the pending commitment as if it
+                // never happened. Necessary for reorg correctness: without
+                // this, a fork whose split point falls between this COMMIT
+                // and its REVEAL would leave a stale commit record that no
+                // longer corresponds to any transaction on the active chain.
+                std::string key = tx.opoiRequestId + ":" + tx.opoiMinerAddress;
+                g_opoiCache.mapResponseCommits.erase(key);
+                auto it = g_opoiCache.mapRequests.find(tx.opoiRequestId);
+                if (it != g_opoiCache.mapRequests.end())
+                    it->second.responseCommits.erase(tx.opoiMinerAddress);
+            } else {
+                g_opoiCache.mapResponses.erase(tx.opoiRequestId);
+                auto it = g_opoiCache.mapRequests.find(tx.opoiRequestId);
+                if (it != g_opoiCache.mapRequests.end()) {
+                    it->second.status = OPOI_STATUS_PENDING;
+                    it->second.responseReveals.erase(tx.opoiMinerAddress); // F10-B
+                }
+                // F14-C: undo "paid" bookkeeping for a VERIFIABLE response too (mirrors
+                // UnmarkShardPaid below) — if this reconnects differently, it must be
+                // payable again.
+                g_opoiCache.UnmarkResponsePaid(tx.opoiRequestId);
+                // F10-C: reverse the reputation counter this REVEAL's apply bumped —
+                // a pre-existing gap (F10-C never added this) that matters more now
+                // that F10-B relies on the same undo branch being split by phase.
+                auto stakeIt = g_opoiCache.mapStakes.find(tx.opoiMinerAddress);
+                if (stakeIt != g_opoiCache.mapStakes.end() && stakeIt->second.responsesTotal > 0)
+                    --stakeIt->second.responsesTotal;
+            }
 
         } else if (tx.nType == OPOI_STAKE_TX_TYPE) {
             g_opoiCache.mapStakes.erase(tx.opoiMinerAddress);
@@ -289,6 +310,13 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
             auto stakeIt = g_opoiCache.mapStakes.find(tx.opoiMinerAddress);
             if (stakeIt != g_opoiCache.mapStakes.end())
                 ++stakeIt->second.responsesTotal;
+        }
+        // F10-B: record the reveal against the REQUEST (visibility only — REVEAL
+        // validity itself is decided in CheckOPoITransaction before this ever runs).
+        {
+            auto reqIt = g_opoiCache.mapRequests.find(tx.opoiRequestId);
+            if (reqIt != g_opoiCache.mapRequests.end())
+                reqIt->second.responseReveals[tx.opoiMinerAddress] = tx.opoiResponseHash.GetHex();
         }
         LogPrintf("OPoI: RESPONSE for %s by %s (tokens=%u) at height %u\n",
                   tx.opoiRequestId, tx.opoiMinerAddress, tx.opoiTokenCount, blockHeight);
@@ -526,6 +554,7 @@ void RebuildOPoICache()
             if (NetworkUpgradeActive(pindex->nHeight, params, Consensus::UPGRADE_OPOI)) {
                 ProcessExpiredChallenges((uint32_t)pindex->nHeight, params);
                 ProcessExpiredRequests((uint32_t)pindex->nHeight, params);
+                ProcessResponseCommitWindows((uint32_t)pindex->nHeight, params);
                 ProcessModelVotingWindows((uint32_t)pindex->nHeight, params);
                 ProcessShardPayments(block.vtx, params);
                 ProcessVerifiableResponsePayments(block.vtx, params);
@@ -635,6 +664,35 @@ void ProcessExpiredRequests(uint32_t blockHeight, const Consensus::Params& param
         // PoW miners include the treasury payout in the coinbase (see miner.cpp).
         LogPrintf("OPoI: REQUEST %s expired at height %u — payment %.4f CS → treasury\n",
                   req.requestId, blockHeight, (double)req.payment / COIN);
+    }
+}
+
+// ── ProcessResponseCommitWindows (F10-B) ──────────────────────────────────────
+//
+// Called from ConnectBlock (and RebuildOPoICache replay). Flips a REQUEST's
+// commitWindowClosed flag once nOPoIResponseCommitWindowBlocks have passed
+// since it confirmed. CheckOPoITransaction reads this flag instead of ever
+// computing "current height" itself — every REQUEST closes its commit phase
+// at the same height for every miner, which is the actual anti-copy property:
+// no REVEAL is ever valid while the flag is still false, so there is no
+// public answer yet for a copier to steal while commits are still open.
+//
+// Like ProcessExpiredRequests/ProcessExpiredChallenges, this is one-directional
+// (not reversed on reorg) — a deep-enough disconnect past the closing height
+// leaves the flag set even though the chain no longer confirms it; same
+// accepted v1 gap already noted elsewhere for challenge/auditor state.
+
+void ProcessResponseCommitWindows(uint32_t blockHeight, const Consensus::Params& params)
+{
+    if (params.nOPoIResponseCommitWindowBlocks <= 0) return;
+    LOCK(g_opoiCache.cs);
+    for (auto& kv : g_opoiCache.mapRequests) {
+        OPoIRequest& req = kv.second;
+        if (req.commitWindowClosed) continue;
+        if ((uint32_t)(blockHeight - req.blockHeight) < (uint32_t)params.nOPoIResponseCommitWindowBlocks) continue;
+        req.commitWindowClosed = true;
+        LogPrint("opoi", "OPoI: RESPONSE commit window closed for %s at height %u\n",
+                 req.requestId, blockHeight);
     }
 }
 
@@ -772,10 +830,12 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
             return state.DoS(10, error("CheckOPoITransaction(): RESPONSE from non-staked miner %s",
                                        tx.opoiMinerAddress),
                              REJECT_INVALID, "bad-txns-opoi-miner-not-staked");
-        // Phase 6: reject RESPONSE for an expired REQUEST
+        // Phase 6: reject RESPONSE for an expired REQUEST. req/haveReq are also
+        // used below by the F10-B commit-reveal window checks in both phases.
+        OPoIRequest req;
+        bool haveReq = !fIsVerifying && g_opoiCache.GetRequest(tx.opoiRequestId, req);
         if (!fIsVerifying) {
-            OPoIRequest req;
-            if (g_opoiCache.GetRequest(tx.opoiRequestId, req) && req.IsExpired())
+            if (haveReq && req.IsExpired())
                 return state.DoS(10, error("CheckOPoITransaction(): RESPONSE for expired REQUEST %s",
                                             tx.opoiRequestId),
                                  REJECT_INVALID, "bad-txns-opoi-request-expired");
@@ -787,7 +847,7 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
             // wasn't found in cache (e.g. VerifyDB replay ordering) — nothing to
             // compare against, so let the existing REQUEST-side checks be authoritative.
             OPoIStake stake;
-            if (!req.model.empty() && g_opoiCache.GetStake(tx.opoiMinerAddress, stake)
+            if (haveReq && !req.model.empty() && g_opoiCache.GetStake(tx.opoiMinerAddress, stake)
                 && !stake.modelId.empty() && stake.modelId != req.model)
                 return state.DoS(10, error("CheckOPoITransaction(): RESPONSE miner %s staked for model %s, "
                                            "REQUEST %s asked for model %s",
@@ -804,12 +864,17 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
         // originated them (which still had the in-memory object, never actually
         // serialized). submitopoiresponse now explicitly sets phase=1 (see rpc/opoi.cpp).
         if (tx.opoiResponsePhase == 0) {
-            // COMMIT phase (F10-B anti-copy protocol; not yet exposed via RPC —
-            // this branch exists so a well-formed COMMIT tx is at least structurally
-            // validated instead of falling through to "invalid nType").
+            // COMMIT phase — hides the response content behind a hash until the
+            // commit window closes for everyone at once (see below), which is the
+            // actual anti-copy property: no REVEAL is ever public while COMMITs
+            // for this REQUEST are still being accepted.
             if (tx.opoiResponseCommitHash.size() != 32)
                 return state.DoS(10, error("CheckOPoITransaction(): RESPONSE COMMIT missing commit hash"),
                                  REJECT_INVALID, "bad-txns-opoi-response-no-commit-hash");
+            if (!fIsVerifying && haveReq && req.commitWindowClosed)
+                return state.DoS(10, error("CheckOPoITransaction(): RESPONSE COMMIT for %s arrived after "
+                                           "the commit window closed", tx.opoiRequestId),
+                                 REJECT_INVALID, "bad-txns-opoi-response-commit-window-closed");
             std::string sigMsg = tx.opoiRequestId + tx.opoiMinerAddress + HexStr(tx.opoiResponseCommitHash);
             if (!VerifyOPoISig(tx.opoiMinerAddress, sigMsg, tx.opoiSig))
                 return state.DoS(100, error("CheckOPoITransaction(): RESPONSE COMMIT invalid signature for %s",
@@ -822,6 +887,42 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
         if (tx.opoiResponseHash.IsNull())
             return state.DoS(10, error("CheckOPoITransaction(): RESPONSE missing responseHash"),
                              REJECT_INVALID, "bad-txns-opoi-no-response-hash");
+
+        // F10-B: the commit window must have closed before ANY reveal is accepted
+        // — this, not the hash check below, is what actually blocks copying: since
+        // no REVEAL can become public while the window is still open, there is
+        // never an already-revealed answer for a copier to steal while honest
+        // miners are still deciding what to commit to.
+        if (!fIsVerifying) {
+            if (!haveReq || !req.commitWindowClosed)
+                return state.DoS(10, error("CheckOPoITransaction(): RESPONSE REVEAL for %s arrived before "
+                                           "the commit window closed", tx.opoiRequestId),
+                                 REJECT_INVALID, "bad-txns-opoi-response-reveal-too-early");
+
+            std::string committedHash;
+            if (!g_opoiCache.GetResponseCommit(tx.opoiRequestId, tx.opoiMinerAddress, committedHash))
+                return state.DoS(10, error("CheckOPoITransaction(): RESPONSE REVEAL for %s by %s with no "
+                                           "prior COMMIT", tx.opoiRequestId, tx.opoiMinerAddress),
+                                 REJECT_INVALID, "bad-txns-opoi-response-no-commit");
+            if (tx.opoiResponseNonce.empty())
+                return state.DoS(10, error("CheckOPoITransaction(): RESPONSE REVEAL missing nonce"),
+                                 REJECT_INVALID, "bad-txns-opoi-response-no-nonce");
+
+            unsigned char computed[32];
+            {
+                CSHA256 hasher;
+                hasher.Write(tx.opoiResponseHash.begin(), 32);
+                hasher.Write(tx.opoiCommitment.begin(), 32);
+                std::string tokenStr = strprintf("%u", tx.opoiTokenCount);
+                hasher.Write((const unsigned char*)tokenStr.data(), tokenStr.size());
+                hasher.Write(tx.opoiResponseNonce.data(), tx.opoiResponseNonce.size());
+                hasher.Finalize(computed);
+            }
+            if (committedHash != HexStr(computed, computed + 32))
+                return state.DoS(100, error("CheckOPoITransaction(): RESPONSE REVEAL for %s by %s does not "
+                                            "match its COMMIT", tx.opoiRequestId, tx.opoiMinerAddress),
+                                 REJECT_INVALID, "bad-txns-opoi-response-commit-mismatch");
+        }
 
         // F10-D: VRF eligibility — only the sortition selected by ECVRF may respond.
         // Skipped during VerifyDB (fIsVerifying), same convention as the staker check

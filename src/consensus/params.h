@@ -157,6 +157,16 @@ struct Params {
     // dismissed (challenger's own collateral is slashed instead of the miner's).
     int     nOPoIChallengeCommitRevealBlocks  = 144;
 
+    /** F10-B — RESPONSE commit-reveal window (anti-copy): blocks after a
+     *  REQUEST confirms during which staked miners may COMMIT a response
+     *  (hash of their answer + a secret nonce). No REVEAL is accepted before
+     *  this window closes for the REQUEST, and no COMMIT is accepted after —
+     *  closing the commit phase for every miner at the same height is what
+     *  actually blocks copying: since no REVEAL can ever become public while
+     *  commits are still open, there is no answer yet to copy while an
+     *  honest miner is still deciding what to commit to. **/
+    int     nOPoIResponseCommitWindowBlocks   = 144;
+
     /** OPoI Phase 6 — request expiry **/
     int     nOPoIRequestExpiryBlocks   = 2016;// blocks a PENDING request stays valid (mainnet ~2 weeks)
 

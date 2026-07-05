@@ -3961,6 +3961,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         ProcessChallengerRewardPayments(block.vtx, (uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessExpiredChallenges((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessExpiredRequests((uint32_t)pindex->nHeight, chainparams.GetConsensus());
+        ProcessResponseCommitWindows((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessModelVotingWindows((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessShardPayments(block.vtx, chainparams.GetConsensus());
         ProcessVerifiableResponsePayments(block.vtx, chainparams.GetConsensus());

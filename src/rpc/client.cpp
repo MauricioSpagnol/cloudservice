@@ -161,6 +161,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     // string. Found while multi-node testing F12-A/F10-C, which both
     // require token_count > 0 to reach a paid RESPONSE.
     { "submitopoiresponse", 4 },   // token_count (integer)
+    { "submitopoiresponsecommit", 4 }, // token_count (integer) — F10-B
     { "listopoirequests",   0 },   // verbose (bool treated as int)
     { "listopoiresponses",  0 },
     // F15-A/A2

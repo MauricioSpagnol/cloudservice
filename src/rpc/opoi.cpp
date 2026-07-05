@@ -7,7 +7,8 @@
 //   listopoiresponses  — list committed AI response proofs
 //   getopoirequest     — get a single request by UUID
 //   submitopoirequest  — broadcast a new REQUEST tx (client side)
-//   submitopoiresponse — broadcast a RESPONSE tx   (miner side)
+//   submitopoiresponsecommit — commit-reveal RESPONSE, COMMIT phase (F10-B, miner side)
+//   submitopoiresponse — commit-reveal RESPONSE, REVEAL phase        (miner side)
 //   rebuilopoidb       — rescan chain and rebuild OPoI cache
 
 #include "opoi/opoi.h"
@@ -25,6 +26,7 @@
 #include "key_io.h"
 #include "csnode/obfuscation.h"
 #include "init.h"
+#include "random.h"
 
 #ifdef ENABLE_WALLET
 extern CWallet* pwalletMain;
@@ -59,6 +61,10 @@ static UniValue OPoIRequestToUniValue(const OPoIRequest& r)
         default:                    s = "UNKNOWN";   break;
     }
     obj.pushKV("status", s);
+    // F10-B: commit-reveal visibility for testing/monitoring
+    obj.pushKV("commit_window_closed", r.commitWindowClosed);
+    obj.pushKV("response_commits", (int)r.responseCommits.size());
+    obj.pushKV("response_reveals", (int)r.responseReveals.size());
     return obj;
 }
 
@@ -374,40 +380,59 @@ UniValue submitopoirequest(const UniValue& params, bool fHelp)
     return ret;
 }
 
-// submitopoiresponse "request_id" "response_hash_hex" "miner_address" "commitment_hex" token_count
-UniValue submitopoiresponse(const UniValue& params, bool fHelp)
+// F10-B: shared by submitopoiresponsecommit and submitopoiresponse so both
+// sides of the RPC boundary agree on the preimage — must stay byte-identical
+// to the hash CheckOPoITransaction recomputes in opoi.cpp's REVEAL branch.
+static void ComputeResponseCommitHash(const uint256& responseHash, const uint256& commitment,
+                                       uint32_t tokenCount, const std::vector<unsigned char>& nonce,
+                                       unsigned char out[32])
 {
-    if (fHelp || params.size() < 3 || params.size() > 5)
+    CSHA256 hasher;
+    hasher.Write(responseHash.begin(), 32);
+    hasher.Write(commitment.begin(), 32);
+    std::string tokenStr = strprintf("%u", tokenCount);
+    hasher.Write((const unsigned char*)tokenStr.data(), tokenStr.size());
+    hasher.Write(nonce.data(), nonce.size());
+    hasher.Finalize(out);
+}
+
+// submitopoiresponsecommit "request_id" "response_hash_hex" "miner_address" ( "commitment_hex" token_count "nonce_hex" )
+UniValue submitopoiresponsecommit(const UniValue& params, bool fHelp)
+{
+    if (fHelp || params.size() < 3 || params.size() > 6)
         throw std::runtime_error(
-            "submitopoiresponse \"request_id\" \"response_hash_hex\" \"miner_address\""
-            " ( \"commitment_hex\" token_count )\n"
-            "\nBroadcast an AI inference response proof transaction (miner only).\n"
+            "submitopoiresponsecommit \"request_id\" \"response_hash_hex\" \"miner_address\""
+            " ( \"commitment_hex\" token_count \"nonce_hex\" )\n"
+            "\nOpen a commit-reveal RESPONSE (F10-B anti-copy protocol, COMMIT phase).\n"
+            "\nresponse_hash/commitment/token_count are hidden behind a hash until the commit\n"
+            "window closes (nOPoIResponseCommitWindowBlocks after the REQUEST confirmed) —\n"
+            "disclose them later with submitopoiresponse, passing the SAME nonce_hex returned\n"
+            "here. This is what stops a copy-cat: no answer is public while commits are\n"
+            "still being accepted, so there's nothing yet for a rival to steal.\n"
             "\nArguments:\n"
             "1. request_id        (string, required)  UUID of the inference request\n"
             "2. response_hash_hex (string, required)  SHA-256 of the response text as hex\n"
             "3. miner_address     (string, required)  Miner's CS wallet address\n"
             "4. commitment_hex    (string, optional)  model_fixed_forward(reqHash||respHash) — anti-equivocation\n"
             "5. token_count       (numeric, optional) Actual tokens generated (for fee-per-token)\n"
+            "6. nonce_hex         (string, optional)  Secret nonce — generated for you if omitted\n"
             "\nResult:\n"
-            "\"txid\"  (string) Transaction ID\n"
+            "{ txid, request_id, nonce_hex, commit_window_closes_at_height }\n"
             "\nExamples:\n"
-            + HelpExampleCli("submitopoiresponse",
+            + HelpExampleCli("submitopoiresponsecommit",
                 "\"uuid\" \"def456...\" \"t1MinerAddr...\"")
-            + HelpExampleCli("submitopoiresponse",
-                "\"uuid\" \"def456...\" \"t1MinerAddr...\" \"commitment_hex...\" 256")
-            + HelpExampleRpc("submitopoiresponse",
-                "\"uuid\", \"def456...\", \"t1MinerAddr...\"")
         );
 
 #ifdef ENABLE_WALLET
     EnsureWalletIsUnlocked();
 #endif
 
-    std::string requestId   = params[0].get_str();
-    std::string rhHex       = params[1].get_str();
-    std::string minerAddr   = params[2].get_str();
-    std::string commitHex   = (params.size() > 3) ? params[3].get_str() : "";
-    uint32_t    tokenCount  = (params.size() > 4) ? (uint32_t)params[4].get_int() : 0;
+    std::string requestId  = params[0].get_str();
+    std::string rhHex      = params[1].get_str();
+    std::string minerAddr  = params[2].get_str();
+    std::string commitHex  = (params.size() > 3) ? params[3].get_str() : "";
+    uint32_t    tokenCount = (params.size() > 4) ? (uint32_t)params[4].get_int() : 0;
+    std::string nonceHex   = (params.size() > 5) ? params[5].get_str() : "";
 
     if (requestId.empty()) throw std::runtime_error("request_id must not be empty");
     if (minerAddr.empty()) throw std::runtime_error("miner_address must not be empty");
@@ -418,8 +443,133 @@ UniValue submitopoiresponse(const UniValue& params, bool fHelp)
         throw std::runtime_error("response_hash_hex is invalid or all-zero");
 
     uint256 commitment;
+    if (!commitHex.empty()) commitment.SetHex(commitHex);
+
+    std::vector<unsigned char> nonce;
+    if (!nonceHex.empty()) {
+        nonce = ParseHex(nonceHex);
+        if (nonce.empty()) throw std::runtime_error("nonce_hex is invalid");
+    } else {
+        nonce.resize(16);
+        GetRandBytes(nonce.data(), nonce.size());
+        nonceHex = HexStr(nonce);
+    }
+
+    OPoIRequest req;
+    if (!g_opoiCache.GetRequest(requestId, req))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "unknown request_id: " + requestId);
+    if (req.commitWindowClosed)
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            "commit window already closed for request " + requestId);
+
+    OPoIStake stake;
+    if (!g_opoiCache.GetStake(minerAddr, stake) || !stake.IsActive())
+        throw JSONRPCError(RPC_INVALID_PARAMETER, minerAddr + " is not an active OPoI staker");
+
+    unsigned char commitHashBytes[32];
+    ComputeResponseCommitHash(responseHash, commitment, tokenCount, nonce, commitHashBytes);
+
+    CMutableTransaction mutTx;
+    mutTx.nVersion            = OPOI_TX_VERSION;
+    mutTx.nType               = OPOI_RESPONSE_TX_TYPE;
+    mutTx.opoiRequestId       = requestId;
+    mutTx.opoiMinerAddress    = minerAddr;
+    mutTx.opoiResponsePhase   = 0; // COMMIT
+    mutTx.opoiResponseCommitHash.assign(commitHashBytes, commitHashBytes + 32);
+    mutTx.opoiSigTime         = (uint32_t)GetTime();
+
+    std::string sigMsg = requestId + minerAddr + HexStr(commitHashBytes, commitHashBytes + 32);
+    std::string errMsg;
+    if (!SignWithAddress(minerAddr, sigMsg, mutTx.opoiSig, errMsg))
+        throw JSONRPCError(RPC_WALLET_ERROR, "Failed to sign: " + errMsg);
+
+    CTransaction tx(mutTx);
+#ifdef ENABLE_WALLET
+    CReserveKey reservekey(pwalletMain);
+    CWalletTx walletTx(pwalletMain, tx);
+    if (!pwalletMain->CommitTransaction(walletTx, reservekey))
+        throw JSONRPCError(RPC_WALLET_ERROR, "CommitTransaction failed for submitopoiresponsecommit");
+#endif
+
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("txid",       tx.GetHash().GetHex());
+    ret.pushKV("request_id", requestId);
+    ret.pushKV("nonce_hex",  nonceHex);
+    ret.pushKV("commit_window_closes_at_height",
+               (int)(req.blockHeight + Params().GetConsensus().nOPoIResponseCommitWindowBlocks));
+    return ret;
+}
+
+// submitopoiresponse "request_id" "response_hash_hex" "miner_address" "commitment_hex" token_count "nonce_hex"
+UniValue submitopoiresponse(const UniValue& params, bool fHelp)
+{
+    if (fHelp || params.size() < 6 || params.size() > 6)
+        throw std::runtime_error(
+            "submitopoiresponse \"request_id\" \"response_hash_hex\" \"miner_address\""
+            " \"commitment_hex\" token_count \"nonce_hex\"\n"
+            "\nDisclose a committed AI inference response (REVEAL phase, miner only).\n"
+            "\nMust be preceded by submitopoiresponsecommit for the same request_id/miner_address,\n"
+            "with the SAME response_hash_hex/commitment_hex/token_count/nonce_hex — and can only\n"
+            "be broadcast once the commit window has closed (F10-B anti-copy: see\n"
+            "submitopoiresponsecommit's commit_window_closes_at_height).\n"
+            "\nArguments:\n"
+            "1. request_id        (string, required)  UUID of the inference request\n"
+            "2. response_hash_hex (string, required)  SHA-256 of the response text as hex\n"
+            "3. miner_address     (string, required)  Miner's CS wallet address\n"
+            "4. commitment_hex    (string, required)  model_fixed_forward(reqHash||respHash) — anti-equivocation.\n"
+            "                     Pass \"\" if submitopoiresponsecommit was also called without it.\n"
+            "5. token_count       (numeric, required) Actual tokens generated (for fee-per-token)\n"
+            "6. nonce_hex         (string, required)  The nonce_hex returned by submitopoiresponsecommit\n"
+            "\nResult:\n"
+            "\"txid\"  (string) Transaction ID\n"
+            "\nExamples:\n"
+            + HelpExampleCli("submitopoiresponse",
+                "\"uuid\" \"def456...\" \"t1MinerAddr...\" \"\" 256 \"abcd1234...\"")
+            + HelpExampleRpc("submitopoiresponse",
+                "\"uuid\", \"def456...\", \"t1MinerAddr...\", \"\", 256, \"abcd1234...\"")
+        );
+
+#ifdef ENABLE_WALLET
+    EnsureWalletIsUnlocked();
+#endif
+
+    std::string requestId   = params[0].get_str();
+    std::string rhHex       = params[1].get_str();
+    std::string minerAddr   = params[2].get_str();
+    std::string commitHex   = params[3].get_str();
+    uint32_t    tokenCount  = (uint32_t)params[4].get_int();
+    std::string nonceHex    = params[5].get_str();
+
+    if (requestId.empty()) throw std::runtime_error("request_id must not be empty");
+    if (minerAddr.empty()) throw std::runtime_error("miner_address must not be empty");
+    if (nonceHex.empty())  throw std::runtime_error("nonce_hex must not be empty");
+
+    uint256 responseHash;
+    responseHash.SetHex(rhHex);
+    if (responseHash.IsNull())
+        throw std::runtime_error("response_hash_hex is invalid or all-zero");
+
+    uint256 commitment;
     if (!commitHex.empty()) {
         commitment.SetHex(commitHex);
+    }
+
+    std::vector<unsigned char> nonce = ParseHex(nonceHex);
+    if (nonce.empty()) throw std::runtime_error("nonce_hex is invalid");
+
+    // Client-side pre-check (mirrors revealchallenge): catch a mismatched
+    // nonce/hash here with a clear message instead of a bare consensus reject.
+    {
+        std::string committedHash;
+        if (!g_opoiCache.GetResponseCommit(requestId, minerAddr, committedHash))
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "no COMMIT found for " + minerAddr + " on request " + requestId +
+                " — call submitopoiresponsecommit first");
+        unsigned char computed[32];
+        ComputeResponseCommitHash(responseHash, commitment, tokenCount, nonce, computed);
+        if (committedHash != HexStr(computed, computed + 32))
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "response_hash/commitment/token_count/nonce does not match the COMMIT stored earlier");
     }
 
     // F10-D: generate the VRF eligibility proof. Seed is anchored to the block the
@@ -470,12 +620,17 @@ UniValue submitopoiresponse(const UniValue& params, bool fHelp)
     mutTx.opoiResponseHash  = responseHash;
     mutTx.opoiCommitment    = commitment;
     mutTx.opoiTokenCount    = tokenCount;
+    mutTx.opoiResponseNonce = nonce; // F10-B: disclosed now so CheckOPoITransaction can
+                                      // recompute and match it against the stored COMMIT hash.
     mutTx.opoiVrfProof      = vrfProof;
     mutTx.opoiSigTime       = (uint32_t)GetTime();
 
     // Canonical form (both sides derive this from the typed tx fields, not raw
     // user-supplied hex strings, so signing and verification always agree
-    // regardless of hex case/formatting the caller used).
+    // regardless of hex case/formatting the caller used). Deliberately excludes
+    // the nonce — that's already bound by the commit-hash match check above, and
+    // the signature formula must stay identical to what CheckOPoITransaction
+    // verifies (see opoi.cpp), which predates F10-B and was never extended here.
     std::string sigMsg = requestId + minerAddr + responseHash.GetHex() + commitment.GetHex()
                         + strprintf("%u", tokenCount);
     std::string errMsg;
@@ -2045,6 +2200,7 @@ static const CRPCCommand commands[] =
     { "opoi",   "getopoirequest",     &getopoirequest,      false },
     { "opoi",   "getopoistats",       &getopoistats,        false },
     { "opoi",   "submitopoirequest",  &submitopoirequest,   false },
+    { "opoi",   "submitopoiresponsecommit", &submitopoiresponsecommit, false },
     { "opoi",   "submitopoiresponse", &submitopoiresponse,  false },
     // Phase 3 — escrow
     { "opoi",   "stakeopoi",          &stakeopoi,           false },

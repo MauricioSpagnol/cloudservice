@@ -190,6 +190,9 @@ public:
         consensus.nOPoIChallengerStakePct          = 10;
         consensus.nOPoIChallengeCommitRevealBlocks = 144;   // ~1 hour to REVEAL after COMMIT
 
+        // F10-B — RESPONSE commit-reveal window (anti-copy)
+        consensus.nOPoIResponseCommitWindowBlocks  = 144;   // ~1 hour to COMMIT before REVEAL opens
+
         // F14-C — Auditors (verify VERIFIABLE-task responses against a test suite)
         consensus.nOPoIMinAuditors           = 3;           // odd ≥ 3, majority always decisive
         consensus.nOPoIAuditorMinCollateral  = 50 * COIN;   // 50 CS minimum collateral
@@ -388,6 +391,9 @@ public:
         consensus.nOPoIChallengerStakePct          = 10;
         consensus.nOPoIChallengeCommitRevealBlocks = 20;    // ~8 minutes on testnet
 
+        // F10-B — RESPONSE commit-reveal window (anti-copy)
+        consensus.nOPoIResponseCommitWindowBlocks  = 20;    // ~8 minutes on testnet
+
         // F14-C — Auditors (testnet — lower collateral for easier testing)
         consensus.nOPoIMinAuditors           = 3;
         consensus.nOPoIAuditorMinCollateral  = 5 * COIN;
@@ -561,6 +567,9 @@ public:
         // F10-A/F8-C — challenger collateral + commit-reveal (regtest — fast)
         consensus.nOPoIChallengerStakePct          = 10;
         consensus.nOPoIChallengeCommitRevealBlocks = 3;
+
+        // F10-B — RESPONSE commit-reveal window (regtest — fast)
+        consensus.nOPoIResponseCommitWindowBlocks  = 3;
 
         // F14-C — Auditors (regtest — quorum of 1 so a single-node test can resolve it)
         consensus.nOPoIMinAuditors           = 1;
