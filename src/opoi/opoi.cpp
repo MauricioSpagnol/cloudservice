@@ -237,6 +237,7 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
                 // longer corresponds to any transaction on the active chain.
                 std::string key = tx.opoiRequestId + ":" + tx.opoiMinerAddress;
                 g_opoiCache.mapResponseCommits.erase(key);
+                g_opoiCache.mapResponseCommitTxHash.erase(key);
                 auto it = g_opoiCache.mapRequests.find(tx.opoiRequestId);
                 if (it != g_opoiCache.mapRequests.end())
                     it->second.responseCommits.erase(tx.opoiMinerAddress);
@@ -302,6 +303,7 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
                     ch.phase = 0;
                     ch.fraudProof.clear();
                     ch.challengeStatus = OPOI_CHALLENGE_OPEN;
+                    ch.revealTxHash.SetNull();
                 }
             }
 
@@ -383,7 +385,7 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
     } else if (tx.nType == OPOI_RESPONSE_TX_TYPE && tx.opoiResponsePhase == 0) {
         // COMMIT phase (F10-B) — no response hash yet, just record the commitment.
         g_opoiCache.AddResponseCommit(tx.opoiRequestId, tx.opoiMinerAddress,
-                                       HexStr(tx.opoiResponseCommitHash), blockHeight);
+                                       HexStr(tx.opoiResponseCommitHash), blockHeight, tx.GetHash());
         LogPrintf("OPoI: RESPONSE_COMMIT for %s by %s at height %u\n",
                   tx.opoiRequestId, tx.opoiMinerAddress, blockHeight);
 
@@ -509,6 +511,7 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
             OPoIChallenge& ch = it->second;
             ch.phase       = 1;
             ch.fraudProof  = tx.opoiProofData;
+            ch.revealTxHash = tx.GetHash();
 
             OPoIRequest req;
             bool haveReq = g_opoiCache.GetRequest(tx.opoiRequestId, req);
@@ -1001,6 +1004,18 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
             if (tx.opoiResponseCommitHash.size() != 32)
                 return state.DoS(10, error("CheckOPoITransaction(): RESPONSE COMMIT missing commit hash"),
                                  REJECT_INVALID, "bad-txns-opoi-response-no-commit-hash");
+            // Bug fix (2026-07-05): same class as MODEL_VOTE/MODEL_REGISTER/
+            // REQUEST — a late P2P redelivery of this exact already-applied
+            // COMMIT must not be judged against the window-closed check
+            // below, which describes whether a NEW commit may be accepted,
+            // not whether an old one may be re-seen. A genuinely new commit
+            // (changing the committed hash before the window closes, which
+            // is allowed) has a different txHash and is unaffected.
+            if (!fIsVerifying && g_opoiCache.IsHarmlessResponseCommitRedelivery(
+                    tx.opoiRequestId, tx.opoiMinerAddress, tx.GetHash()))
+                return state.Invalid(error("CheckOPoITransaction(): RESPONSE COMMIT %s already known",
+                                           tx.GetHash().GetHex()),
+                                     REJECT_DUPLICATE, "bad-txns-opoi-response-commit-already-known");
             if (!fIsVerifying && haveReq && req.commitWindowClosed)
                 return state.DoS(10, error("CheckOPoITransaction(): RESPONSE COMMIT for %s arrived after "
                                            "the commit window closed", tx.opoiRequestId),
@@ -1227,7 +1242,21 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                                  REJECT_INVALID, "bad-txns-opoi-challenge-no-reveal-data");
             if (!fIsVerifying) {
                 OPoIChallenge existing;
-                if (!g_opoiCache.GetChallenge(tx.opoiRequestId, existing) || !existing.IsOpen())
+                bool haveChallenge = g_opoiCache.GetChallenge(tx.opoiRequestId, existing);
+                // Bug fix (2026-07-05): same class as RESPONSE COMMIT/
+                // MODEL_VOTE/etc — once REVEAL applies, challengeStatus
+                // always leaves OPEN (to SLASHED/EXPIRED/REVEALED_PENDING/
+                // RESOLVED_NO_ORACLE), so a late P2P redelivery of this exact
+                // already-applied REVEAL would otherwise always hit
+                // "no open commit" below, even though it already succeeded
+                // once. revealTxHash (set at REVEAL-apply time, separate
+                // from txHash which stays the COMMIT's forever) lets a
+                // byte-identical resend be recognized as harmless.
+                if (haveChallenge && !existing.IsOpen() && existing.revealTxHash == tx.GetHash())
+                    return state.Invalid(error("CheckOPoITransaction(): CHALLENGE REVEAL %s already known",
+                                               tx.GetHash().GetHex()),
+                                         REJECT_DUPLICATE, "bad-txns-opoi-challenge-reveal-already-known");
+                if (!haveChallenge || !existing.IsOpen())
                     return state.DoS(10, error("CheckOPoITransaction(): CHALLENGE REVEAL with no open COMMIT for %s",
                                                tx.opoiRequestId),
                                      REJECT_INVALID, "bad-txns-opoi-challenge-no-open-commit");

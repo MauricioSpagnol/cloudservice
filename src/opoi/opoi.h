@@ -254,8 +254,16 @@ struct OPoIChallenge {
     // Resolution
     uint32_t    blockHeight;         // block of initial CHALLENGE (COMMIT) tx
     uint32_t    sigTime;
-    uint256     txHash;
+    uint256     txHash;              // the COMMIT tx's hash (never updated by REVEAL)
     int8_t      challengeStatus;     // OPEN / SLASHED / EXPIRED / REVEALED_PENDING / RESOLVED_NO_ORACLE
+    // Bug fix (2026-07-05): the REVEAL tx's own hash, separate from txHash
+    // above (which stays the COMMIT's forever) — needed to recognize a
+    // harmless late P2P redelivery of this exact already-applied REVEAL.
+    // Once REVEAL applies, challengeStatus always leaves OPEN (to SLASHED/
+    // EXPIRED/REVEALED_PENDING/RESOLVED_NO_ORACLE), so without this a
+    // redelivery would always hit "no open commit" even though it already
+    // succeeded once.
+    uint256     revealTxHash;
 
     ADD_SERIALIZE_METHODS;
     template <typename Stream, typename Operation>
@@ -264,7 +272,7 @@ struct OPoIChallenge {
         READWRITE(challengerCollateral);
         READWRITE(phase); READWRITE(commitHash); READWRITE(commitHeight);
         READWRITE(blockHeight); READWRITE(sigTime); READWRITE(txHash);
-        READWRITE(challengeStatus);
+        READWRITE(challengeStatus); READWRITE(revealTxHash);
     }
 
     void SetNull() {
@@ -273,6 +281,7 @@ struct OPoIChallenge {
         phase = 0; commitHash.clear(); commitHeight = 0;
         blockHeight = 0; sigTime = 0; txHash.SetNull();
         challengeStatus = OPOI_CHALLENGE_OPEN;
+        revealTxHash.SetNull();
     }
     bool IsNull()               const { return requestId.empty(); }
     bool IsOpen()               const { return challengeStatus == OPOI_CHALLENGE_OPEN; }
@@ -534,6 +543,12 @@ public:
     std::map<std::string, OPoIResponse> mapResponses;   // requestId → OPoIResponse (REVEAL only)
     // Response commit-reveal pending (F10-B): requestId+minerAddr → commitHash
     std::map<std::string, std::string>  mapResponseCommits; // "reqId:minerAddr" → commitHash
+    // Bug fix (2026-07-05): which tx applied this COMMIT — same
+    // harmless-redelivery purpose as mapLockingTxHash/ModelVoteRecord.txHash.
+    // Kept as a separate companion map (rather than changing
+    // mapResponseCommits's value type) since the commit hash string is
+    // already used/displayed elsewhere unchanged.
+    std::map<std::string, uint256>      mapResponseCommitTxHash; // "reqId:minerAddr" → committing txid
 
     // Phase 3
     std::map<std::string, OPoIStake>     mapStakes;     // minerAddress → OPoIStake
@@ -607,6 +622,7 @@ public:
     void SetNull() {
         LOCK(cs);
         mapRequests.clear(); mapResponses.clear(); mapResponseCommits.clear();
+        mapResponseCommitTxHash.clear();
         mapStakes.clear(); mapChallenges.clear();
         mapLockedUTXOs.clear(); mapAuditorVerifications.clear();
         mapModelManifests.clear(); mapModelVotes.clear();
@@ -898,15 +914,28 @@ public:
     bool AddResponseCommit(const std::string& requestId,
                            const std::string& minerAddress,
                            const std::string& commitHash,
-                           uint32_t blockHeight) {
+                           uint32_t blockHeight,
+                           const uint256& txHash) {
         LOCK(cs);
         std::string key = requestId + ":" + minerAddress;
         mapResponseCommits[key] = commitHash;
+        mapResponseCommitTxHash[key] = txHash;
         // Track in request
         auto it = mapRequests.find(requestId);
         if (it != mapRequests.end())
             it->second.responseCommits[minerAddress] = commitHash;
         return true;
+    }
+
+    // Bug fix (2026-07-05): true only if this exact tx already applied as
+    // this miner's recorded COMMIT — a genuinely new commit (changing the
+    // committed hash before the window closes, which is allowed) has a
+    // different txHash and still goes through the normal window-closed check.
+    bool IsHarmlessResponseCommitRedelivery(const std::string& requestId, const std::string& minerAddress,
+                                            const uint256& txHash) const {
+        LOCK(cs);
+        auto it = mapResponseCommitTxHash.find(requestId + ":" + minerAddress);
+        return it != mapResponseCommitTxHash.end() && it->second == txHash;
     }
 
     bool GetResponseCommit(const std::string& requestId,
