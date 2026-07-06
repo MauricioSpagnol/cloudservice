@@ -541,6 +541,47 @@ struct COPoIDataMsg {
 // onward (never relay something that failed validation).
 bool ProcessOPoIDataMessage(const COPoIDataMsg& msg, std::string& reason);
 
+// ── OPoI content cache (F14-E) ─────────────────────────────────────────────────
+// Deliberately NOT consensus/blockchain data, same as PendingDelivery above —
+// but a DIFFERENT shape of problem: PendingDelivery is a mailbox addressed to
+// one specific recipient (the requester knows exactly which miner to push a
+// prompt to). Auditing is permissionless — ANY address may vote on a
+// VERIFIABLE response (see submitauditorverification) — so there is no single
+// predetermined recipient to push the test suite / response text to. This is
+// a content-addressable cache instead: keyed by (requestId, kind), read (not
+// drained — many auditors read the SAME content) by anyone via
+// getopoicontent, and — this is what replaces the signature machinery
+// COPoIDataMsg needs — only ever accepted/stored/relayed if its SHA-256
+// matches the hash ALREADY committed on-chain (REQUEST's testSuite, or
+// RESPONSE's responseHash). Nobody can poison this cache with the wrong
+// content: a mismatch is rejected outright, so there's nothing a signature
+// would add here that the hash check doesn't already guarantee.
+static const uint8_t OPOI_CONTENT_TEST_SUITE = 0; // published by the REQUEST's own requester
+static const uint8_t OPOI_CONTENT_RESPONSE   = 1; // published by the RESPONSE's own miner
+
+struct COPoIContentMsg {
+    std::string requestId;
+    uint8_t     kind;
+    std::string payloadHex;
+
+    ADD_SERIALIZE_METHODS;
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(requestId); READWRITE(kind); READWRITE(payloadHex);
+    }
+
+    uint256 GetHash() const { return SerializeHash(*this); }
+};
+
+// Validates a COPoIContentMsg against the hash already committed on-chain for
+// its (requestId, kind) — REQUEST.testSuite for TEST_SUITE, RESPONSE's
+// responseHash for RESPONSE — and, if it matches, stores it into
+// g_opoiCache. Shared by the P2P receive handler (main.cpp, "opoicontent"
+// command) and the submitopoicontent RPC, same as ProcessOPoIDataMessage's
+// role for PendingDelivery. Returns false (with a short machine-readable
+// reason) without storing anything on any failure.
+bool ProcessOPoIContentMessage(const COPoIContentMsg& msg, std::string& reason);
+
 // Pure majority computation over an arbitrary set of Auditor verifications —
 // no cache access, so it can run both against the persisted cache
 // (OPoICache::GetAuditorMajorityResult) and against a "cache + this block's
@@ -649,6 +690,13 @@ public:
     // key), not by message hash.
     std::set<uint256> setKnownOPoIDataHashes;
 
+    // F14-E: content cache, keyed by "requestId:kind" — see
+    // COPoIContentMsg/ProcessOPoIContentMessage above. Never drained (unlike
+    // mapPendingDeliveries): many auditors read the same test suite/response
+    // text, and it's already hash-verified before being stored, so there's
+    // no harm in it staying around for everyone to read.
+    std::map<std::string, std::string> mapContentByKey;
+
     OPoICache() = default;
 
     void SetNull() {
@@ -662,6 +710,7 @@ public:
         setPaidShards.clear(); setResolvedAuditorVerifications.clear();
         setPaidResponses.clear(); setPaidChallengerRewards.clear();
         mapPendingDeliveries.clear(); setKnownOPoIDataHashes.clear();
+        mapContentByKey.clear();
         treasurySlashTotal = 0; treasuryExpiryTotal = 0; treasuryAuditorTotal = 0;
     }
 
@@ -1170,6 +1219,35 @@ public:
     void MarkOPoIDataHashKnown(const uint256& hash) {
         LOCK(cs);
         setKnownOPoIDataHashes.insert(hash);
+    }
+
+    // ── F14-E: content cache ──────────────────────────────────────────────────
+    // Unlike setKnownOPoIDataHashes (a separate dedup set, since PendingDelivery
+    // can hold many distinct messages per destination), one (requestId, kind)
+    // key here only ever has ONE valid value — it's already hash-verified
+    // before ProcessOPoIContentMessage ever calls this — so "already have this
+    // key" doubles as both storage AND flood-relay dedup, no separate set
+    // needed.
+    static std::string ContentKey(const std::string& requestId, uint8_t kind) {
+        return requestId + ":" + strprintf("%u", (unsigned)kind);
+    }
+
+    bool HasContent(const std::string& requestId, uint8_t kind) const {
+        LOCK(cs);
+        return mapContentByKey.count(ContentKey(requestId, kind)) > 0;
+    }
+
+    void AddContent(const std::string& requestId, uint8_t kind, const std::string& payloadHex) {
+        LOCK(cs);
+        mapContentByKey[ContentKey(requestId, kind)] = payloadHex;
+    }
+
+    bool GetContent(const std::string& requestId, uint8_t kind, std::string& payloadHexOut) const {
+        LOCK(cs);
+        auto it = mapContentByKey.find(ContentKey(requestId, kind));
+        if (it == mapContentByKey.end()) return false;
+        payloadHexOut = it->second;
+        return true;
     }
 
     // Called alongside ProcessExpiredRequests in ConnectBlock (main.cpp) — a

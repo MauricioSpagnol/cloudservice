@@ -209,6 +209,69 @@ bool ProcessOPoIDataMessage(const COPoIDataMsg& msg, std::string& reason)
     return true;
 }
 
+// ── OPoI content cache (F14-E) ─────────────────────────────────────────────────
+// See COPoIContentMsg's doc comment in opoi.h for why this needs no
+// signature: the hash check below is the entire trust model. Shared by the
+// P2P receive handler (main.cpp, "opoicontent" command) and the
+// submitopoicontent RPC.
+bool ProcessOPoIContentMessage(const COPoIContentMsg& msg, std::string& reason)
+{
+    if (msg.requestId.empty()) {
+        reason = "missing-fields";
+        return false;
+    }
+    if (msg.payloadHex.size() > OPOI_DELIVERY_MAX_PAYLOAD_HEX) {
+        reason = "payload-too-large";
+        return false;
+    }
+    if (g_opoiCache.HasContent(msg.requestId, msg.kind)) {
+        // Already have it (and it was already hash-verified to get there) —
+        // harmless, not an error; just nothing new to store or relay further.
+        reason = "already-known";
+        return false;
+    }
+
+    uint256 expectedHash;
+    switch (msg.kind) {
+    case OPOI_CONTENT_TEST_SUITE: {
+        OPoIRequest req;
+        if (!g_opoiCache.GetRequest(msg.requestId, req) || req.taskType != OPOI_TASK_VERIFIABLE) {
+            reason = "unknown-or-not-verifiable-request";
+            return false;
+        }
+        expectedHash = req.testSuite;
+        break;
+    }
+    case OPOI_CONTENT_RESPONSE: {
+        OPoIResponse resp;
+        if (!g_opoiCache.GetResponse(msg.requestId, resp) || !resp.IsRevealed()) {
+            reason = "no-revealed-response";
+            return false;
+        }
+        expectedHash = resp.responseHash;
+        break;
+    }
+    default:
+        reason = "bad-kind";
+        return false;
+    }
+    if (expectedHash.IsNull()) {
+        reason = "no-expected-hash";
+        return false;
+    }
+
+    std::vector<unsigned char> payload = ParseHex(msg.payloadHex);
+    unsigned char hashBytes[32];
+    CSHA256().Write(payload.data(), payload.size()).Finalize(hashBytes);
+    if (HexStr(hashBytes, hashBytes + 32) != expectedHash.GetHex()) {
+        reason = "hash-mismatch";
+        return false;
+    }
+
+    g_opoiCache.AddContent(msg.requestId, msg.kind, msg.payloadHex);
+    return true;
+}
+
 // Stable VRF seed anchor for a request: the hash of the block the REQUEST
 // itself confirmed in. Unlike chainActive.Tip(), this never changes once the
 // request is mined, so proofs computed against it stay valid regardless of

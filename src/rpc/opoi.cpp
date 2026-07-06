@@ -2469,6 +2469,99 @@ UniValue getopoipendingdeliveries(const UniValue& params, bool fHelp)
     return arr;
 }
 
+// ── OPoI content cache (F14-E) ───────────────────────────────────────────────
+
+UniValue submitopoicontent(const UniValue& params, bool fHelp)
+{
+    if (fHelp || params.size() != 3)
+        throw std::runtime_error(
+            "submitopoicontent \"request_id\" \"kind\" \"content_hex\"\n"
+            "\nPublish the plaintext test suite or response text for a VERIFIABLE\n"
+            "request, so a permissionless Auditor can fetch and grade it (F14-E) —\n"
+            "only the SHA-256 hash of either is ever on-chain otherwise. Rejected\n"
+            "unless content_hex's own SHA-256 matches the hash already committed\n"
+            "on-chain (the REQUEST's testSuite, or the RESPONSE's responseHash) —\n"
+            "there is no signature check here, the hash match IS the trust model:\n"
+            "nobody can poison this with the wrong content. Floods to every peer\n"
+            "the same way submitopoipendingdelivery does; every node ends up with a\n"
+            "copy regardless of who originated it.\n"
+            "\nArguments:\n"
+            "1. request_id   (string, required) UUID of the VERIFIABLE request\n"
+            "2. kind         (string, required) TEST_SUITE or RESPONSE\n"
+            "3. content_hex  (string, required) The plaintext, as hex — max 64KB\n"
+            "\nResult:\n"
+            "{ published: true }\n"
+            "\nExamples:\n"
+            + HelpExampleCli("submitopoicontent", "\"uuid\" \"TEST_SUITE\" \"646566207465737428293a...\"")
+        );
+
+    std::string requestId  = params[0].get_str();
+    std::string kindStr    = params[1].get_str();
+    std::string contentHex = params[2].get_str();
+
+    if (requestId.empty()) throw std::runtime_error("request_id must not be empty");
+    uint8_t kind;
+    if (kindStr == "TEST_SUITE")   kind = OPOI_CONTENT_TEST_SUITE;
+    else if (kindStr == "RESPONSE") kind = OPOI_CONTENT_RESPONSE;
+    else throw std::runtime_error("kind must be TEST_SUITE or RESPONSE");
+    if (contentHex.size() > OPOI_DELIVERY_MAX_PAYLOAD_HEX)
+        throw std::runtime_error("content_hex exceeds max size");
+
+    COPoIContentMsg msg;
+    msg.requestId  = requestId;
+    msg.kind       = kind;
+    msg.payloadHex = contentHex;
+
+    std::string reason;
+    if (!ProcessOPoIContentMessage(msg, reason))
+        throw JSONRPCError(RPC_MISC_ERROR, "rejected: " + reason);
+
+    uint256 msgHash = msg.GetHash();
+    {
+        LOCK(cs_vNodes);
+        for (CNode* pnode : vNodes) {
+            if (pnode->setKnown.insert(msgHash).second)
+                pnode->PushMessage("opoicontent", msg);
+        }
+    }
+
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("published", true);
+    return ret;
+}
+
+UniValue getopoicontent(const UniValue& params, bool fHelp)
+{
+    if (fHelp || params.size() != 2)
+        throw std::runtime_error(
+            "getopoicontent \"request_id\" \"kind\"\n"
+            "\nRead the plaintext test suite or response text for a VERIFIABLE\n"
+            "request from THIS node's local content cache (F14-E) — see\n"
+            "submitopoicontent. Unlike getopoipendingdeliveries, this does NOT\n"
+            "drain: many Auditors read the same content, so it stays available.\n"
+            "Empty string if not (yet) published/received on this node — the\n"
+            "caller should retry later, not treat this as a permanent absence.\n"
+            "\nArguments:\n"
+            "1. request_id  (string, required) UUID of the VERIFIABLE request\n"
+            "2. kind        (string, required) TEST_SUITE or RESPONSE\n"
+            "\nResult:\n"
+            "\"content_hex\"  (string) empty if not available yet\n"
+            "\nExamples:\n"
+            + HelpExampleCli("getopoicontent", "\"uuid\" \"TEST_SUITE\"")
+        );
+
+    std::string requestId = params[0].get_str();
+    std::string kindStr   = params[1].get_str();
+    uint8_t kind;
+    if (kindStr == "TEST_SUITE")    kind = OPOI_CONTENT_TEST_SUITE;
+    else if (kindStr == "RESPONSE") kind = OPOI_CONTENT_RESPONSE;
+    else throw std::runtime_error("kind must be TEST_SUITE or RESPONSE");
+
+    std::string payloadHex;
+    g_opoiCache.GetContent(requestId, kind, payloadHex);
+    return payloadHex;
+}
+
 // ── Registration ──────────────────────────────────────────────────────────────
 
 static const CRPCCommand commands[] =
@@ -2508,6 +2601,9 @@ static const CRPCCommand commands[] =
     // OPoI relay — P2P delivery for NAT'd/CGNAT'd miners
     { "opoi",   "submitopoipendingdelivery", &submitopoipendingdelivery, false },
     { "opoi",   "getopoipendingdeliveries",  &getopoipendingdeliveries,  false },
+    // F14-E — content cache (test suite / response text for permissionless Auditors)
+    { "opoi",   "submitopoicontent",  &submitopoicontent,  false },
+    { "opoi",   "getopoicontent",     &getopoicontent,     false },
     { "hidden", "rebuilopoidb",       &rebuilopoidb,        false },
     { "hidden", "opoivrfselftest",    &opoivrfselftest,     false },
     { "hidden", "opoivrfverifyraw",   &opoivrfverifyraw,    false },

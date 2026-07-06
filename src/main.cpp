@@ -7451,6 +7451,36 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         }
     }
 
+    // F14-E: content cache flood-relay (test suite / response text for
+    // permissionless Auditors) — see opoi.h's COPoIContentMsg doc comment.
+    // No separate dedup set needed here (unlike "opoidata" above): a
+    // content-cache key only ever has ONE valid value, so
+    // ProcessOPoIContentMessage's own g_opoiCache.HasContent check already
+    // does the "don't re-verify/re-store what we have" job — this just
+    // adds the per-peer setKnown bookkeeping for flood propagation.
+    else if (strCommand == "opoicontent")
+    {
+        COPoIContentMsg msg;
+        vRecv >> msg;
+
+        uint256 msgHash = msg.GetHash();
+        pfrom->setKnown.insert(msgHash);
+
+        std::string reason;
+        if (ProcessOPoIContentMessage(msg, reason)) {
+            LOCK(cs_vNodes);
+            BOOST_FOREACH(CNode* pnode, vNodes) {
+                if (pnode->setKnown.insert(msgHash).second)
+                    pnode->PushMessage("opoicontent", msg);
+            }
+        } else {
+            // Same reasoning as "opoidata": routine P2P timing (content
+            // arriving before the REQUEST/RESPONSE it verifies against is
+            // visible yet, or a harmless re-flood of already-known content)
+            // is not malice — no Misbehaving penalty.
+            LogPrint("opoi", "opoicontent rejected from peer=%d: %s\n", pfrom->id, reason);
+        }
+    }
 
     else if (!(nLocalServices & NODE_BLOOM) &&
               (strCommand == "filterload" ||
