@@ -193,6 +193,13 @@ public:
         // F10-B — RESPONSE commit-reveal window (anti-copy)
         consensus.nOPoIResponseCommitWindowBlocks  = 144;   // ~1 hour to COMMIT before REVEAL opens
 
+        // F9-E — periodic stake renewal (liveness proof, no slash on expiry)
+        consensus.nOPoIStakeRenewalBlocks   = 20160;        // ~6 days at 25s/block
+
+        // F11-A — REQUEST budget floor scaled by declared prompt size
+        consensus.nOPoIFeeBase              = 100000;       // 0.001 CS
+        consensus.nOPoIFeePerToken          = 10000;        // 0.0001 CS per estimated prompt token
+
         // F14-C — Auditors (verify VERIFIABLE-task responses against a test suite)
         consensus.nOPoIMinAuditors           = 3;           // odd ≥ 3, majority always decisive
         consensus.nOPoIAuditorMinCollateral  = 50 * COIN;   // 50 CS minimum collateral
@@ -394,6 +401,13 @@ public:
         // F10-B — RESPONSE commit-reveal window (anti-copy)
         consensus.nOPoIResponseCommitWindowBlocks  = 20;    // ~8 minutes on testnet
 
+        // F9-E — periodic stake renewal (liveness proof, no slash on expiry)
+        consensus.nOPoIStakeRenewalBlocks   = 200;          // ~83 minutes on testnet
+
+        // F11-A — REQUEST budget floor scaled by declared prompt size
+        consensus.nOPoIFeeBase              = 100000;       // 0.001 CS
+        consensus.nOPoIFeePerToken          = 10000;        // 0.0001 CS per estimated prompt token
+
         // F14-C — Auditors (testnet — lower collateral for easier testing)
         consensus.nOPoIMinAuditors           = 3;
         consensus.nOPoIAuditorMinCollateral  = 5 * COIN;
@@ -570,6 +584,13 @@ public:
 
         // F10-B — RESPONSE commit-reveal window (regtest — fast)
         consensus.nOPoIResponseCommitWindowBlocks  = 3;
+
+        // F9-E — periodic stake renewal (regtest — fast, easy to cross with `generate`)
+        consensus.nOPoIStakeRenewalBlocks   = 10;
+
+        // F11-A — REQUEST budget floor scaled by declared prompt size (regtest — cheap)
+        consensus.nOPoIFeeBase              = 10000;
+        consensus.nOPoIFeePerToken          = 1000;
 
         // F14-C — Auditors (regtest — quorum of 1 so a single-node test can resolve it)
         consensus.nOPoIMinAuditors           = 1;

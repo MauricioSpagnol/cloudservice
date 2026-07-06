@@ -50,6 +50,8 @@ static UniValue OPoIRequestToUniValue(const OPoIRequest& r)
     obj.pushKV("task_class",    r.taskClass == OPOI_TASKCLASS_BATCH ? "BATCH" : "INTERACTIVE");
     if (r.taskType == OPOI_TASK_VERIFIABLE)
         obj.pushKV("test_suite", r.testSuite.GetHex());
+    obj.pushKV("prompt_token_count", (int)r.promptTokenCount); // F11-A
+    obj.pushKV("is_canary",          (bool)r.isCanary);        // F9-F
     obj.pushKV("block_height",  (int)r.blockHeight);
     obj.pushKV("sig_time",      (int)r.sigTime);
     obj.pushKV("tx_hash",       r.txHash.GetHex());
@@ -246,11 +248,11 @@ UniValue getopoirequest(const UniValue& params, bool fHelp)
 // submitopoirequest "request_id" "model" "prompt_hash_hex" max_tokens payment "requester_address" ( fee_per_token task_type )
 UniValue submitopoirequest(const UniValue& params, bool fHelp)
 {
-    if (fHelp || params.size() < 6 || params.size() > 10)
+    if (fHelp || params.size() < 6 || params.size() > 12)
         throw std::runtime_error(
             "submitopoirequest \"request_id\" \"model\" \"prompt_hash_hex\""
             " max_tokens payment \"requester_address\""
-            " ( fee_per_token task_type task_class test_suite_hex )\n"
+            " ( fee_per_token task_type task_class test_suite_hex prompt_token_count is_canary )\n"
             "\nBroadcast an AI inference request transaction.\n"
             "\nThe actual prompt text is NOT stored on-chain — only its SHA-256 hash.\n"
             "Send the prompt directly to the miner's HTTP API after broadcasting.\n"
@@ -261,7 +263,9 @@ UniValue submitopoirequest(const UniValue& params, bool fHelp)
             "                     execution (getmodelgraph) for this request\n"
             "3. prompt_hash_hex   (string, required)  SHA-256 of the prompt as hex\n"
             "4. max_tokens        (numeric, required) Maximum tokens in the response\n"
-            "5. payment           (numeric, required) Base CSCOIN reward for the miner\n"
+            "5. payment           (numeric, required) Base CSCOIN reward for the miner —\n"
+            "                     also the REQUEST's own budget floor (F11-A): must be >=\n"
+            "                     nOPoIFeeBase + prompt_token_count * nOPoIFeePerToken\n"
             "6. requester_address (string, required)  Your CS wallet address\n"
             "7. fee_per_token     (numeric, optional) Extra fee per token generated (default: 0)\n"
             "8. task_type         (string, optional)  OPEN or VERIFIABLE (default: OPEN)\n"
@@ -269,9 +273,19 @@ UniValue submitopoirequest(const UniValue& params, bool fHelp)
             "                     F15-G: if model's dense pipeline is deeper than\n"
             "                     nOPoIMaxPipelineDepth, INTERACTIVE is rejected —\n"
             "                     use BATCH for models with a deep shard pipeline.\n"
-            "10. test_suite_hex   (string, required if task_type=VERIFIABLE) SHA-256\n"
-            "                     of the test suite an Auditor will check the response\n"
-            "                     against (F14-C)\n"
+            "10. test_suite_hex   (string, required if task_type=VERIFIABLE, or if\n"
+            "                     is_canary=true) SHA-256 of the test suite an Auditor\n"
+            "                     will check the response against (F14-C). A canary\n"
+            "                     REQUEST must use getcanarytestsuite's hash exactly.\n"
+            "11. prompt_token_count (numeric, optional) F11-A: your own estimate of the\n"
+            "                     prompt's token count, self-declared (never verified —\n"
+            "                     the prompt itself is never on-chain) — used only to\n"
+            "                     compute this REQUEST's own minimum payment (see #5)\n"
+            "12. is_canary        (bool, optional) F9-F: mark this as a canary audit —\n"
+            "                     requires task_type=VERIFIABLE and test_suite_hex ==\n"
+            "                     getcanarytestsuite's hash. A FAILed canary strikes the\n"
+            "                     responding miner (see getopoistake's canary_strikes);\n"
+            "                     3 strikes suspends the stake until renewopoistake.\n"
             "\nTotal miner payment = payment + actual_token_count * fee_per_token\n"
             "\nResult:\n"
             "\"txid\"  (string) Transaction ID\n"
@@ -313,6 +327,9 @@ UniValue submitopoirequest(const UniValue& params, bool fHelp)
         if (testSuite.IsNull())
             throw std::runtime_error("test_suite_hex is invalid or all-zero");
     }
+    uint32_t promptTokenCount = (params.size() > 10) ? (uint32_t)params[10].get_int() : 0;
+    bool     isCanary         = (params.size() > 11) ? params[11].get_bool() : false;
+
     // Friendly pre-check mirroring CheckOPoITransaction's consensus rule (F14-B).
     if (taskType == OPOI_TASK_VERIFIABLE && testSuite.IsNull())
         throw std::runtime_error("task_type=VERIFIABLE requires a non-empty test_suite_hex");
@@ -339,6 +356,25 @@ UniValue submitopoirequest(const UniValue& params, bool fHelp)
                 manifest.numDenseShards, Params().GetConsensus().nOPoIMaxPipelineDepth));
     }
 
+    // F11-A: friendly pre-check mirroring CheckOPoITransaction's consensus rule.
+    {
+        const Consensus::Params& p = Params().GetConsensus();
+        CAmount minPayment = p.nOPoIFeeBase + (CAmount)promptTokenCount * p.nOPoIFeePerToken;
+        if ((p.nOPoIFeeBase > 0 || p.nOPoIFeePerToken > 0) && payment < minPayment)
+            throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf(
+                "payment %s below required minimum %s (base %s + %u prompt tokens * %s)",
+                FormatMoney(payment), FormatMoney(minPayment), FormatMoney(p.nOPoIFeeBase),
+                promptTokenCount, FormatMoney(p.nOPoIFeePerToken)));
+    }
+    // F9-F: friendly pre-check mirroring CheckOPoITransaction's consensus rule.
+    if (isCanary) {
+        if (taskType != OPOI_TASK_VERIFIABLE)
+            throw std::runtime_error("is_canary=true requires task_type=VERIFIABLE");
+        if (testSuite != GetOPoICanaryTestSuiteHash())
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "is_canary=true requires test_suite_hex == " + GetOPoICanaryTestSuiteHash().GetHex());
+    }
+
     CMutableTransaction mutTx;
     mutTx.nVersion       = OPOI_TX_VERSION;
     mutTx.nType          = OPOI_REQUEST_TX_TYPE;
@@ -352,12 +388,15 @@ UniValue submitopoirequest(const UniValue& params, bool fHelp)
     mutTx.opoiTaskType   = taskType;
     mutTx.opoiTaskClass  = taskClass;
     mutTx.opoiTestSuite  = testSuite;
+    mutTx.opoiPromptTokenCount = promptTokenCount;
+    mutTx.opoiIsCanary         = isCanary ? 1 : 0;
     mutTx.opoiSigTime    = (uint32_t)GetTime();
 
-    // Sign: requestId + requester + model + promptHashHex + maxTokens + payment + feePerToken + taskType + taskClass + testSuiteHex
+    // Sign: requestId + requester + model + promptHashHex + maxTokens + payment + feePerToken + taskType + taskClass + testSuiteHex + promptTokenCount + isCanary
     std::string sigMsg = requestId + requester + model + phHex +
                          strprintf("%u%d%d%d%d", maxTok, payment, feePerToken, (int)taskType, (int)taskClass) +
-                         testSuite.GetHex();
+                         testSuite.GetHex() +
+                         strprintf("%u%d", promptTokenCount, (int)mutTx.opoiIsCanary);
     std::string errMsg;
     if (!SignWithAddress(requester, sigMsg, mutTx.opoiSig, errMsg))
         throw JSONRPCError(RPC_WALLET_ERROR, "Failed to sign: " + errMsg);
@@ -844,6 +883,7 @@ static std::string StakeStatusStr(int8_t s) {
         case OPOI_STAKE_UNSTAKING: return "UNSTAKING";
         case OPOI_STAKE_RELEASED:  return "RELEASED";
         case OPOI_STAKE_SLASHED:   return "SLASHED";
+        case OPOI_STAKE_SUSPENDED: return "SUSPENDED"; // F9-E/F9-F: renewal overdue or 3 canary strikes
         default:                   return "UNKNOWN";
     }
 }
@@ -882,6 +922,9 @@ static UniValue OPoIStakeToUniValue(const OPoIStake& s)
     obj.pushKV("responses_total",       (int)s.responsesTotal);
     obj.pushKV("responses_challenged",  (int)s.responsesChallenged);
     obj.pushKV("responses_slashed",     (int)s.responsesSlashed);
+    // F9-E/F9-F: renewal + canary-strike visibility
+    obj.pushKV("last_renewal_height",   (int)s.lastRenewalHeight);
+    obj.pushKV("canary_strikes",        (int)s.canaryStrikes);
     return obj;
 }
 
@@ -1066,6 +1109,85 @@ UniValue unstakeopoi(const UniValue& params, bool fHelp)
     ret.pushKV("miner_address",  minerAddr);
     ret.pushKV("cooldown_blocks",(int)Params().GetConsensus().nOPoIUnstakeCooldownBlocks);
     return ret;
+}
+
+// ── renewopoistake (F9-E/F9-F) ─────────────────────────────────────────────────
+
+UniValue renewopoistake(const UniValue& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw std::runtime_error(
+            "renewopoistake \"miner_address\"\n"
+            "\nProve continued liveness for an OPoI stake (F9-E) — resets the\n"
+            "nOPoIStakeRenewalBlocks clock and (F9-F) clears any canary strikes,\n"
+            "lifting a SUSPENDED status back to ACTIVE. No collateral involved:\n"
+            "unlike a fresh stakeopoi call, this never touches the miner's locked\n"
+            "collateral. Works for either an ACTIVE stake approaching its renewal\n"
+            "deadline, or one already SUSPENDED (renewal overdue, or 3 canary\n"
+            "strikes) — never for UNSTAKING/RELEASED/SLASHED.\n"
+            "\nArguments:\n"
+            "1. miner_address  (string, required) Miner's CS wallet address\n"
+            "\nResult:\n"
+            "{ txid, miner_address }\n"
+            "\nExamples:\n"
+            + HelpExampleCli("renewopoistake", "\"t1MinerAddr...\"")
+            + HelpExampleRpc("renewopoistake", "\"t1MinerAddr...\"")
+        );
+
+#ifdef ENABLE_WALLET
+    EnsureWalletIsUnlocked();
+#endif
+
+    std::string minerAddr = params[0].get_str();
+    if (minerAddr.empty()) throw std::runtime_error("miner_address must not be empty");
+
+    OPoIStake stake;
+    if (!g_opoiCache.GetStake(minerAddr, stake)
+        || (stake.stakeStatus != OPOI_STAKE_ACTIVE && stake.stakeStatus != OPOI_STAKE_SUSPENDED))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, minerAddr + " has no ACTIVE or SUSPENDED OPoI stake to renew");
+
+    CMutableTransaction mutTx;
+    mutTx.nVersion         = OPOI_TX_VERSION;
+    mutTx.nType            = OPOI_RENEW_TX_TYPE;
+    mutTx.opoiMinerAddress = minerAddr;
+    mutTx.opoiSigTime      = (uint32_t)GetTime();
+
+    std::string sigMsg = std::string("RENEW") + minerAddr;
+    std::string errMsg;
+    if (!SignWithAddress(minerAddr, sigMsg, mutTx.opoiSig, errMsg))
+        throw JSONRPCError(RPC_WALLET_ERROR, "Failed to sign: " + errMsg);
+
+    CTransaction tx(mutTx);
+#ifdef ENABLE_WALLET
+    CReserveKey reservekey(pwalletMain);
+    CWalletTx walletTx(pwalletMain, tx);
+    if (!pwalletMain->CommitTransaction(walletTx, reservekey))
+        throw JSONRPCError(RPC_WALLET_ERROR, "CommitTransaction failed for renewopoistake");
+#endif
+
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("txid",          tx.GetHash().GetHex());
+    ret.pushKV("miner_address", minerAddr);
+    return ret;
+}
+
+// ── getcanarytestsuite (F9-F) ───────────────────────────────────────────────────
+
+UniValue getcanarytestsuite(const UniValue& params, bool fHelp)
+{
+    if (fHelp || params.size() != 0)
+        throw std::runtime_error(
+            "getcanarytestsuite\n"
+            "\nReturns the single test_suite hash every canary REQUEST (F9-F,\n"
+            "is_canary=true in submitopoirequest) must use — pinned, identical on\n"
+            "every network, since an Auditor grades it off-chain either way.\n"
+            "\nResult:\n"
+            "\"hash_hex\"  (string)\n"
+            "\nExamples:\n"
+            + HelpExampleCli("getcanarytestsuite", "")
+            + HelpExampleRpc("getcanarytestsuite", "")
+        );
+    return GetOPoICanaryTestSuiteHash().GetHex();
 }
 
 // ── challengeopoi (F8-C/F10-A: COMMIT phase) ───────────────────────────────────
@@ -2361,6 +2483,8 @@ static const CRPCCommand commands[] =
     // Phase 3 — escrow
     { "opoi",   "stakeopoi",          &stakeopoi,           false },
     { "opoi",   "unstakeopoi",        &unstakeopoi,         false },
+    { "opoi",   "renewopoistake",     &renewopoistake,      false },
+    { "opoi",   "getcanarytestsuite", &getcanarytestsuite,  false },
     { "opoi",   "challengeopoi",      &challengeopoi,       false },
     { "opoi",   "revealchallenge",    &revealchallenge,     false },
     { "opoi",   "listopoistakes",     &listopoistakes,      false },

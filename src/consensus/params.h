@@ -215,6 +215,26 @@ struct Params {
     int         nOPoIMaxRequestsPerBlock    = 50;
     int         nOPoIMaxResponsesPerBlock   = 100;
 
+    /** F9-E — periodic stake renewal: a stake is not eternal. Once more than
+     *  this many blocks have passed since its last RENEW tx (or original
+     *  STAKE, if never renewed), ProcessStakeRenewals suspends it
+     *  (stakeStatus -> OPOI_STAKE_SUSPENDED, same status F9-F's canary
+     *  strikes use) — IsActiveStaker() then correctly rejects it for
+     *  RESPONSE/etc, exactly like an unstaked address, with no separate
+     *  eligibility check needed anywhere. Recoverable at any time via a
+     *  RENEW tx, never slashed (0 = disabled). **/
+    int         nOPoIStakeRenewalBlocks     = 0;
+
+    /** F11-A — minimum REQUEST budget (opoiPayment), scaled by the
+     *  requester's own declared prompt size (opoiPromptTokenCount):
+     *  min(payment) = nOPoIFeeBase + promptTokenCount * nOPoIFeePerToken.
+     *  Anti-spam / fair-cost floor for large prompts — independent of
+     *  feePerToken (that's a RESPONSE-time payment for ACTUALLY generated
+     *  tokens, F9-D/F16; this is a REQUEST-time floor on the upfront
+     *  budget). Both 0 = no floor enforced. **/
+    int64_t     nOPoIFeeBase                = 0;
+    int64_t     nOPoIFeePerToken            = 0;
+
 };
 } // namespace Consensus
 

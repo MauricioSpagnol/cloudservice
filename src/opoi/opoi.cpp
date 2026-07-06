@@ -282,6 +282,17 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
                 it->second.unstakeTxHash.SetNull();
             }
 
+        } else if (tx.nType == OPOI_RENEW_TX_TYPE) {
+            // F9-E: known v1 gap, same class already accepted elsewhere in
+            // this function (e.g. the minority-Auditor unlock note below) —
+            // reversing this exactly would need the PRE-renewal
+            // lastRenewalHeight/canaryStrikes/stakeStatus, which nothing
+            // stores. Left as a no-op: a disconnected RENEW just leaves the
+            // miner's eligibility window/strike count slightly more generous
+            // than strictly correct post-reorg — fails open, never causes a
+            // wrongly-rejected legitimate action, and self-corrects once
+            // enough blocks pass again either way.
+
         } else if (tx.nType == OPOI_CHALLENGE_TX_TYPE) {
             if (tx.opoiChallengePhase == 0) {
                 // Undo COMMIT: the challenge never existed before this tx.
@@ -380,6 +391,8 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         req.feePerToken = tx.opoiFeePerToken;
         req.taskType    = tx.opoiTaskType;
         req.taskClass   = tx.opoiTaskClass; // F15-G
+        req.promptTokenCount = tx.opoiPromptTokenCount; // F11-A — was never copied before this fix
+        req.isCanary    = tx.opoiIsCanary;              // F9-F  — was never copied before this fix
         req.testSuite   = tx.opoiTestSuite; // F14-B/C — was never copied before this fix
         req.blockHeight = blockHeight;
         req.sigTime     = tx.opoiSigTime;
@@ -475,6 +488,20 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         if (g_opoiCache.StartUnstake(tx.opoiMinerAddress, blockHeight, tx.GetHash()))
             LogPrintf("OPoI: UNSTAKE requested by %s at height %u\n",
                       tx.opoiMinerAddress, blockHeight);
+
+    } else if (tx.nType == OPOI_RENEW_TX_TYPE) {
+        // F9-E/F9-F: CheckOPoITransaction already guaranteed the stake exists
+        // and is ACTIVE or SUSPENDED — renewal always results in ACTIVE
+        // either way, clears canary strikes, and resets the clock.
+        auto it = g_opoiCache.mapStakes.find(tx.opoiMinerAddress);
+        if (it != g_opoiCache.mapStakes.end()) {
+            bool wasSuspended = (it->second.stakeStatus == OPOI_STAKE_SUSPENDED);
+            it->second.lastRenewalHeight = blockHeight;
+            it->second.canaryStrikes     = 0;
+            it->second.stakeStatus       = OPOI_STAKE_ACTIVE;
+            LogPrintf("OPoI: RENEW by %s at height %u%s\n", tx.opoiMinerAddress, blockHeight,
+                      wasSuspended ? " — reactivated from SUSPENDED" : "");
+        }
 
     } else if (tx.nType == OPOI_CHALLENGE_TX_TYPE && tx.opoiChallengePhase == 0) {
         // COMMIT — open the challenge and lock the challenger's collateral.
@@ -666,6 +693,7 @@ void RebuildOPoICache()
                 ProcessExpiredChallenges((uint32_t)pindex->nHeight, params);
                 ProcessExpiredRequests((uint32_t)pindex->nHeight, params);
                 ProcessResponseCommitWindows((uint32_t)pindex->nHeight, params);
+                ProcessStakeRenewals((uint32_t)pindex->nHeight, params);
                 ProcessModelVotingWindows((uint32_t)pindex->nHeight, params);
                 ProcessShardPayments(block.vtx, params);
                 ProcessVerifiableResponsePayments(block.vtx, params);
@@ -807,6 +835,37 @@ void ProcessResponseCommitWindows(uint32_t blockHeight, const Consensus::Params&
     }
 }
 
+// ── ProcessStakeRenewals (F9-E) ────────────────────────────────────────────────
+//
+// Called from ConnectBlock (and RebuildOPoICache replay), same convention as
+// ProcessResponseCommitWindows above. Suspends an ACTIVE stake
+// (stakeStatus -> OPOI_STAKE_SUSPENDED, the same status F9-F's canary
+// strikes use — see OPoIStake::IsSuspended) once nOPoIStakeRenewalBlocks
+// have passed since its last renewal (or original STAKE confirmation,
+// whichever is later) without a RENEW tx. SUSPENDED means IsActiveStaker()
+// is false, so RESPONSE (and anything else already gated by it) is rejected
+// exactly like a never-staked address — no separate eligibility check
+// needed anywhere else. Recoverable at any time via RENEW, never slashed:
+// matches the doc's own rationale (a miner going quiet could just mean
+// unreachable hardware, not proven fraud).
+//
+// One-directional like ProcessResponseCommitWindows/ProcessExpiredRequests:
+// not reversed on reorg (same accepted v1 gap, documented there too).
+void ProcessStakeRenewals(uint32_t blockHeight, const Consensus::Params& params)
+{
+    if (params.nOPoIStakeRenewalBlocks <= 0) return;
+    LOCK(g_opoiCache.cs);
+    for (auto& kv : g_opoiCache.mapStakes) {
+        OPoIStake& stake = kv.second;
+        if (!stake.IsActive()) continue;
+        uint32_t sinceHeight = std::max(stake.blockHeight, stake.lastRenewalHeight);
+        if ((uint32_t)(blockHeight - sinceHeight) < (uint32_t)params.nOPoIStakeRenewalBlocks) continue;
+        stake.stakeStatus = OPOI_STAKE_SUSPENDED;
+        LogPrintf("OPoI: stake renewal overdue for %s at height %u — suspended until RENEW\n",
+                  stake.minerAddress, blockHeight);
+    }
+}
+
 // ── ProcessModelVotingWindows (F15-A2) ────────────────────────────────────────
 //
 // Tallies every ModelManifest whose voting window closed at blockHeight.
@@ -911,6 +970,46 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
         if (tx.opoiTaskType == OPOI_TASK_VERIFIABLE && tx.opoiTestSuite.IsNull())
             return state.DoS(10, error("CheckOPoITransaction(): VERIFIABLE REQUEST missing testSuite"),
                              REJECT_INVALID, "bad-txns-opoi-request-verifiable-needs-test-suite");
+        // F11-A: minimum REQUEST budget scaled by the requester's own declared
+        // prompt size — anti-spam / fair-cost floor for large prompts. Purely a
+        // floor on opoiPayment (the upfront budget the requester commits),
+        // independent of feePerToken (that's a RESPONSE-time payment for
+        // ACTUALLY generated tokens, F9-D/F16 — a different number entirely).
+        // Known limitation, not solvable on-chain: opoiPromptTokenCount is
+        // self-declared — the prompt text itself is never on-chain (only its
+        // hash, delivered off-chain to the miner), so there is no way to
+        // verify a requester didn't understate it. Still worth enforcing: it
+        // stops a requester from lowballing the very number they themselves
+        // claim, even if that number is a lie.
+        {
+            const Consensus::Params& p = Params().GetConsensus();
+            CAmount minPayment = p.nOPoIFeeBase + (CAmount)tx.opoiPromptTokenCount * p.nOPoIFeePerToken;
+            if ((p.nOPoIFeeBase > 0 || p.nOPoIFeePerToken > 0) && tx.opoiPayment < minPayment)
+                return state.DoS(10, error("CheckOPoITransaction(): REQUEST payment %s below required minimum "
+                                           "%s (base %s + %u prompt tokens * %s)",
+                                           FormatMoney(tx.opoiPayment), FormatMoney(minPayment),
+                                           FormatMoney(p.nOPoIFeeBase), tx.opoiPromptTokenCount,
+                                           FormatMoney(p.nOPoIFeePerToken)),
+                                 REJECT_INVALID, "bad-txns-opoi-request-fee-too-low");
+        }
+        // F9-F: canary audits — a REQUEST marked canary must be VERIFIABLE (an
+        // Auditor has to grade it, same as any other VERIFIABLE task) and must
+        // use the network's single pinned test suite, not an arbitrary one —
+        // otherwise "canary" would just be a free label with no actual
+        // guarantee of testing the one thing the network agreed to test. A
+        // canary that FAILs strikes the responding miner (see
+        // ProcessAuditorVerifications) instead of the normal challenge-slash
+        // path — the doc's own rationale: a failed canary could just mean
+        // insufficient hardware, not proven fraud.
+        if (tx.opoiIsCanary) {
+            if (tx.opoiTaskType != OPOI_TASK_VERIFIABLE)
+                return state.DoS(10, error("CheckOPoITransaction(): canary REQUEST must be VERIFIABLE"),
+                                 REJECT_INVALID, "bad-txns-opoi-request-canary-not-verifiable");
+            if (tx.opoiTestSuite != GetOPoICanaryTestSuiteHash())
+                return state.DoS(10, error("CheckOPoITransaction(): canary REQUEST must use the pinned "
+                                           "canary test suite"),
+                                 REJECT_INVALID, "bad-txns-opoi-request-canary-wrong-test-suite");
+        }
         // F15-G: if opoiModel names an ACTIVE Model Manifest whose dense pipeline is
         // deeper than nOPoIMaxPipelineDepth, an INTERACTIVE request cannot use it —
         // commit-reveal adds +1 block per sequential shard, so a deep pipeline would
@@ -947,11 +1046,16 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
         // submitopoirequest actually signs — see rpc/opoi.cpp), so every REQUEST
         // submitted via that RPC failed signature verification unconditionally.
         {
+            // F11-A/F9-F: promptTokenCount/isCanary appended at the end — both
+            // now consensus-checked above, so both must be bound by the
+            // signature too (otherwise either could be tampered with
+            // post-signature without invalidating it).
             std::string sigMsg = tx.opoiRequestId + tx.opoiRequester + tx.opoiModel
                                + tx.opoiPromptHash.GetHex()
                                + strprintf("%u%d%d%d%d", tx.opoiMaxTokens, tx.opoiPayment,
                                            tx.opoiFeePerToken, (int)tx.opoiTaskType, (int)tx.opoiTaskClass)
-                               + tx.opoiTestSuite.GetHex();
+                               + tx.opoiTestSuite.GetHex()
+                               + strprintf("%u%d", tx.opoiPromptTokenCount, (int)tx.opoiIsCanary);
             if (!VerifyOPoISig(tx.opoiRequester, sigMsg, tx.opoiSig))
                 return state.DoS(100, error("CheckOPoITransaction(): REQUEST invalid signature for %s",
                                             tx.opoiRequester),
@@ -1187,6 +1291,42 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                                             tx.opoiMinerAddress),
                                  REJECT_INVALID, "bad-txns-opoi-unstake-bad-sig");
         }
+        break;
+    }
+
+    case OPOI_RENEW_TX_TYPE: {
+        // F9-E: proves continued liveness — resets the renewal-window clock
+        // and (F9-F) clears canary strikes / lifts a SUSPENDED status. No
+        // collateral involved at all: unlike a fresh STAKE tx, this never
+        // touches mapLockedUTXOs, so there's no risk of orphaning the
+        // miner's existing locked collateral the way a second STAKE tx
+        // (with a NEW UTXO) for an already-active miner would — that's a
+        // separate, narrower, pre-existing gap not fixed here (AddStake
+        // unconditionally overwrites mapStakes[minerAddress], including its
+        // collateralIn, with no unlock of whatever was locked before).
+        if (tx.opoiMinerAddress.empty())
+            return state.DoS(10, error("CheckOPoITransaction(): RENEW missing minerAddress"),
+                             REJECT_INVALID, "bad-txns-opoi-renew-no-miner");
+        if (!fIsVerifying) {
+            OPoIStake stake;
+            if (!g_opoiCache.GetStake(tx.opoiMinerAddress, stake)
+                || (stake.stakeStatus != OPOI_STAKE_ACTIVE && stake.stakeStatus != OPOI_STAKE_SUSPENDED))
+                return state.DoS(10, error("CheckOPoITransaction(): RENEW for %s — no ACTIVE or SUSPENDED stake",
+                                           tx.opoiMinerAddress),
+                                 REJECT_INVALID, "bad-txns-opoi-renew-not-renewable");
+        }
+        // No harmless-redelivery guard needed (unlike most other OPoI tx
+        // types): a RENEW is safe to apply more than once — every path here
+        // that could reject one still accepts ACTIVE, and an already-ACTIVE
+        // stake is always renewable, so a late P2P redelivery of an
+        // already-applied RENEW just harmlessly re-renews (bumps the clock
+        // forward again, clears strikes again) instead of hitting a
+        // DoS-scored rejection.
+        std::string sigMsg = std::string("RENEW") + tx.opoiMinerAddress;
+        if (!VerifyOPoISig(tx.opoiMinerAddress, sigMsg, tx.opoiSig))
+            return state.DoS(100, error("CheckOPoITransaction(): RENEW invalid signature for %s",
+                                        tx.opoiMinerAddress),
+                             REJECT_INVALID, "bad-txns-opoi-renew-bad-sig");
         break;
     }
 
@@ -2040,6 +2180,34 @@ void ProcessAuditorVerifications(uint32_t blockHeight, const Consensus::Params& 
             }
         }
         g_opoiCache.MarkAuditorResolved(requestId);
+
+        // F9-F: a canary REQUEST that FAILs strikes the responding miner —
+        // never a full slash (the doc's own rationale: "sem slash — pode ser
+        // hardware insuficiente", i.e. a FAIL alone doesn't prove fraud the
+        // way a proven CHALLENGE does), just a mark that, after
+        // OPOI_MAX_CANARY_STRIKES, suspends the stake exactly like a missed
+        // renewal (F9-E) does — recoverable the same way, via RENEW. Known
+        // v1 gap, same class already accepted just above for the
+        // minority-Auditor unlock: not reversed on a reorg deep enough to
+        // disconnect past this resolution.
+        if (majority == AUDITOR_VERIFY_FAIL) {
+            OPoIRequest req;
+            if (g_opoiCache.GetRequest(requestId, req) && req.isCanary) {
+                auto respIt = g_opoiCache.mapResponses.find(requestId);
+                if (respIt != g_opoiCache.mapResponses.end()) {
+                    auto stakeIt = g_opoiCache.mapStakes.find(respIt->second.minerAddress);
+                    if (stakeIt != g_opoiCache.mapStakes.end()) {
+                        ++stakeIt->second.canaryStrikes;
+                        bool suspend = stakeIt->second.canaryStrikes >= OPOI_MAX_CANARY_STRIKES
+                                    && stakeIt->second.IsActive();
+                        if (suspend) stakeIt->second.stakeStatus = OPOI_STAKE_SUSPENDED;
+                        LogPrintf("OPoI: canary strike #%u for %s at height %u%s\n",
+                                  (unsigned)stakeIt->second.canaryStrikes, respIt->second.minerAddress,
+                                  blockHeight, suspend ? " — stake SUSPENDED (3 strikes)" : "");
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -67,6 +67,18 @@ static const uint8_t AUDITOR_VERIFY_TIMEOUT = 2;
 // Canary audit strike threshold before stake suspension (not slash)
 static const uint8_t OPOI_MAX_CANARY_STRIKES = 3;
 
+// F9-F: single pinned test suite for canary audits, the same across every
+// network — an Auditor grades it off-chain either way (same as any other
+// VERIFIABLE task, F14-C), so there's no reason mainnet/testnet/regtest
+// would ever need a DIFFERENT one. A REQUEST claiming opoiIsCanary must use
+// exactly this hash (see CheckOPoITransaction's REQUEST case) — otherwise
+// "canary" would just be a free label with no actual guarantee that it
+// tests the one thing the network agreed to test.
+inline uint256 GetOPoICanaryTestSuiteHash() {
+    static const std::string label = "OPoI-Canary-TestSuite-v1";
+    return Hash(label.begin(), label.end());
+}
+
 // Known model identifiers (must match POM roots in consensus/params.h)
 static const char* OPOI_MODEL_GEMMA_3_4B     = "GEMMA_3_4B";
 static const char* OPOI_MODEL_DOLPHIN_8B     = "DOLPHIN_8B";
@@ -1022,14 +1034,6 @@ public:
         return it != mapStakes.end() && it->second.IsActive();
     }
 
-    bool IsEligibleToRespond(const std::string& minerAddress) const {
-        LOCK(cs);
-        auto it = mapStakes.find(minerAddress);
-        // Must be ACTIVE and not suspended (canary strikes < max)
-        return it != mapStakes.end() && it->second.IsActive() &&
-               it->second.canaryStrikes < OPOI_MAX_CANARY_STRIKES;
-    }
-
     bool StartUnstake(const std::string& minerAddress, uint32_t height, const uint256& txHashIn) {
         LOCK(cs);
         auto it = mapStakes.find(minerAddress);
@@ -1250,6 +1254,14 @@ void ProcessExpiredRequests(uint32_t blockHeight, const Consensus::Params& param
 // CheckOPoITransaction is a moving target depending on whether it's called
 // for a mempool candidate or for a block being connected.
 void ProcessResponseCommitWindows(uint32_t blockHeight, const Consensus::Params& params);
+
+// F9-E: called from ConnectBlock (and RebuildOPoICache replay), same
+// convention as ProcessResponseCommitWindows above — suspends
+// (stakeStatus -> OPOI_STAKE_SUSPENDED) an ACTIVE stake once
+// nOPoIStakeRenewalBlocks have passed since its last renewal (or original
+// STAKE, if never renewed) without a RENEW tx. Recoverable at any time via
+// RENEW (see ProcessOPoITransaction), never slashed.
+void ProcessStakeRenewals(uint32_t blockHeight, const Consensus::Params& params);
 
 // Called from ConnectBlock to verify OPoI miner payments in the coinbase tx.
 // For each RESPONSE tx in the block, verifies the coinbase has an output paying
