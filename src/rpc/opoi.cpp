@@ -2197,9 +2197,11 @@ UniValue getauditorverifications(const UniValue& params, bool fHelp)
 
 static bool ParseOPoIDeliveryKind(const std::string& s, uint8_t& out)
 {
-    if (s.empty() || s == "PROMPT")       { out = OPOI_DELIVERY_PROMPT;       return true; }
-    if (s == "SHARD_ASSIGN")              { out = OPOI_DELIVERY_SHARD_ASSIGN; return true; }
-    if (s == "SHARD_RESULT")              { out = OPOI_DELIVERY_SHARD_RESULT; return true; }
+    if (s.empty() || s == "PROMPT")       { out = OPOI_DELIVERY_PROMPT;              return true; }
+    if (s == "SHARD_ASSIGN")              { out = OPOI_DELIVERY_SHARD_ASSIGN;        return true; }
+    if (s == "SHARD_RESULT")              { out = OPOI_DELIVERY_SHARD_RESULT;        return true; }
+    if (s == "MODEL_CHUNK_REQUEST")       { out = OPOI_DELIVERY_MODEL_CHUNK_REQUEST; return true; }
+    if (s == "MODEL_CHUNK")               { out = OPOI_DELIVERY_MODEL_CHUNK;         return true; }
     return false;
 }
 
@@ -2224,12 +2226,17 @@ UniValue submitopoipendingdelivery(const UniValue& params, bool fHelp)
             "is no single address derivable from request_id alone for these two kinds,\n"
             "since a request can have several accepted coordinators (VRF redundancy) and\n"
             "any ACTIVE staker could be the assigned miner.\n"
+            "\nkind=MODEL_CHUNK_REQUEST/MODEL_CHUNK (model distribution fast-follow) work\n"
+            "the same way: sender_address required, must be an ACTIVE staker. A GGUF/\n"
+            "tokenizer is split client-side into many <=64KB chunks (cs-miner's\n"
+            "model_fetch.rs), so a full transfer is one REQUEST plus many CHUNK calls.\n"
             "\nArguments:\n"
             "1. request_id          (string, required) UUID of the inference request\n"
             "2. dest_stake_address  (string, required) Recipient's stake/mining address\n"
             "3. payload_hex         (string, required) Raw payload as hex — max 64KB encoded\n"
             "4. kind                (string, optional) PROMPT (default) | SHARD_ASSIGN | SHARD_RESULT\n"
-            "5. sender_address      (string, optional) Required for SHARD_ASSIGN/SHARD_RESULT;\n"
+            "                       | MODEL_CHUNK_REQUEST | MODEL_CHUNK\n"
+            "5. sender_address      (string, optional) Required for anything but PROMPT;\n"
             "                       this node's wallet must hold its key\n"
             "\nResult:\n"
             "{ delivered: true }\n"
@@ -2327,8 +2334,10 @@ UniValue getopoipendingdeliveries(const UniValue& params, bool fHelp)
         UniValue obj(UniValue::VOBJ);
         obj.pushKV("request_id",     d.requestId);
         obj.pushKV("kind",           (int)d.kind);
-        std::string kindStr = d.kind == OPOI_DELIVERY_SHARD_ASSIGN ? "SHARD_ASSIGN"
-                            : d.kind == OPOI_DELIVERY_SHARD_RESULT ? "SHARD_RESULT" : "PROMPT";
+        std::string kindStr = d.kind == OPOI_DELIVERY_SHARD_ASSIGN        ? "SHARD_ASSIGN"
+                            : d.kind == OPOI_DELIVERY_SHARD_RESULT        ? "SHARD_RESULT"
+                            : d.kind == OPOI_DELIVERY_MODEL_CHUNK_REQUEST ? "MODEL_CHUNK_REQUEST"
+                            : d.kind == OPOI_DELIVERY_MODEL_CHUNK         ? "MODEL_CHUNK" : "PROMPT";
         obj.pushKV("kind_str",       kindStr);
         obj.pushKV("sender_address", d.senderAddress);
         obj.pushKV("payload_hex",    d.payloadHex);

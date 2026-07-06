@@ -172,6 +172,15 @@ bool ProcessOPoIDataMessage(const COPoIDataMsg& msg, std::string& reason)
         expectedSigner = msg.senderAddress;
         break;
     case OPOI_DELIVERY_SHARD_RESULT:
+    case OPOI_DELIVERY_MODEL_CHUNK_REQUEST:
+    case OPOI_DELIVERY_MODEL_CHUNK:
+        // Model distribution fast-follow: no on-chain role derivable from
+        // requestId alone for either direction (any ACTIVE staker may be
+        // fetching, and any ACTIVE staker may be hosting) — same bar as
+        // SHARD_RESULT. Deeper trust (does the served content actually match
+        // model_id?) is deferred to the fetcher's own SHA-256/pomRoot check
+        // (model_fetch.rs), exactly like the existing direct-HTTP fetch
+        // already trusts-but-verifies each candidate peer.
         if (msg.senderAddress.empty() || !g_opoiCache.IsActiveStaker(msg.senderAddress)) {
             reason = "not-an-active-staker";
             return false;

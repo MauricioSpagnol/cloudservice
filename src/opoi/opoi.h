@@ -440,9 +440,26 @@ struct AuditorVerification {
 // destination miner's own cs-miner polls ITS OWN node's copy
 // (getopoipendingdeliveries RPC) — no addressed routing to a specific "home
 // node" needed, since flooding means every node ends up with a copy anyway.
-static const uint8_t OPOI_DELIVERY_PROMPT       = 0;
-static const uint8_t OPOI_DELIVERY_SHARD_ASSIGN = 1; // F15-H fast-follow (2026-07-05): coordinator → miner
-static const uint8_t OPOI_DELIVERY_SHARD_RESULT = 2; // F15-H fast-follow (2026-07-05): miner → coordinator reply
+static const uint8_t OPOI_DELIVERY_PROMPT              = 0;
+static const uint8_t OPOI_DELIVERY_SHARD_ASSIGN        = 1; // F15-H fast-follow (2026-07-05): coordinator → miner
+static const uint8_t OPOI_DELIVERY_SHARD_RESULT        = 2; // F15-H fast-follow (2026-07-05): miner → coordinator reply
+// F15-H fast-follow, model distribution (2026-07-05): lets a miner fetch a
+// model_id's GGUF/tokenizer from a staker who hosts it but never declared a
+// reachable OPoIStake.endpoint (today, model_fetch.rs's direct-HTTP fetch
+// simply never selects such a staker as a source — this is the P2P fallback).
+// The file is split client-side into <=64KB-raw chunks (see model_fetch.rs's
+// MODEL_CHUNK_SIZE) since a whole GGUF would blow past OPOI_DELIVERY_MAX_PAYLOAD_HEX
+// by orders of magnitude; REQUEST asks a hosting peer for one artifact of one
+// model_id, and it replies with one CHUNK delivery per piece (no further
+// request/ack per chunk — see cs-miner's model_chunk_registry.rs for
+// reassembly). Known, accepted cost of reusing the flood-relay mechanism
+// as-is rather than building a new point-to-point protocol: every chunk is
+// still flooded to the ENTIRE P2P mesh (same as PROMPT/SHARD_ASSIGN/
+// SHARD_RESULT), so total network-wide bandwidth/storage for one transfer is
+// file_size × node_count. Acceptable for the network sizes this project runs
+// today; a true unicast/point-to-point relay would be a larger follow-up.
+static const uint8_t OPOI_DELIVERY_MODEL_CHUNK_REQUEST = 3;
+static const uint8_t OPOI_DELIVERY_MODEL_CHUNK         = 4;
 static const size_t  OPOI_DELIVERY_MAX_PAYLOAD_HEX = 131072; // 64KB of raw payload, hex-encoded
 
 struct PendingDelivery {
@@ -480,6 +497,9 @@ struct PendingDelivery {
 // be the assigned miner — so the message must say who it claims to be, and
 // ProcessOPoIDataMessage checks that claim against the right on-chain role
 // (IsClaimedCoordinator / IsActiveStaker) before trusting the signature.
+// MODEL_CHUNK_REQUEST/MODEL_CHUNK (model distribution fast-follow) are the
+// same story — no single address derivable from requestId alone (any ACTIVE
+// staker could be fetching or hosting) — both require IsActiveStaker.
 struct COPoIDataMsg {
     std::string destStakeAddress;
     std::string requestId;
