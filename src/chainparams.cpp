@@ -178,7 +178,7 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_P2SHNODES].nActivationHeight = Consensus::NetworkUpgrade::ALWAYS_ACTIVE;
 
         consensus.vUpgrades[Consensus::UPGRADE_OPOI].nProtocolVersion = 170020;
-        consensus.vUpgrades[Consensus::UPGRADE_OPOI].nActivationHeight = 250000;
+        consensus.vUpgrades[Consensus::UPGRADE_OPOI].nActivationHeight = 100000;
 
         // OPoI Phase 3 escrow
         consensus.nOPoIMinStake              = 100 * COIN;  // 100 CS minimum stake
