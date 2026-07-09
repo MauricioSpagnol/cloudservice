@@ -1900,6 +1900,17 @@ bool CheckOPoIPayments(const std::vector<CTransaction>& vtx,
         if (tx.nVersion != OPOI_TX_VERSION || tx.nType != OPOI_RESPONSE_TX_TYPE)
             continue;
 
+        // Bug fix (2026-07-09): COMMIT and REVEAL are two separate on-chain
+        // txs of this same nType (F10-B commit-reveal) — only the REVEAL
+        // (phase 1) actually makes the content available/verifiable, so only
+        // it should be paid. Without this check, a validating node would
+        // accept (and itself construct, via CreateNewBlock) a coinbase that
+        // pays every RESPONSE twice — once for its COMMIT confirming, again
+        // for its REVEAL confirming. This mirrors CreateNewBlock, which must
+        // match this exactly.
+        if (tx.opoiResponsePhase != 1)
+            continue;
+
         OPoIRequest req;
         if (!g_opoiCache.GetRequest(tx.opoiRequestId, req) || req.payment <= 0) {
             LogPrint("opoi", "CheckOPoIPayments: no cached REQUEST for %s, skipping\n",

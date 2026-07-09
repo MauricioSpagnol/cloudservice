@@ -576,6 +576,15 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
                 const CTransaction& vtx = pblock->vtx[i];
                 if (vtx.nVersion != OPOI_TX_VERSION || vtx.nType != OPOI_RESPONSE_TX_TYPE)
                     continue;
+                // Bug fix (2026-07-09): COMMIT and REVEAL are two separate
+                // on-chain txs of this same nType (F10-B commit-reveal) — this
+                // loop must only pay on REVEAL (phase 1), when the content is
+                // actually verifiable. Without this check, every RESPONSE was
+                // paid twice: once when its COMMIT confirmed, again when its
+                // REVEAL confirmed. Mirrors CheckOPoIPayments, which must
+                // match this exactly.
+                if (vtx.opoiResponsePhase != 1)
+                    continue;
                 OPoIRequest req;
                 if (!g_opoiCache.GetRequest(vtx.opoiRequestId, req) || req.payment <= 0)
                     continue;
