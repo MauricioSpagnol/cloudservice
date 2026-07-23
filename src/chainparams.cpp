@@ -555,7 +555,10 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_ACADIA].nActivationHeight = Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
 
         consensus.vUpgrades[Consensus::UPGRADE_KAMIOOKA].nProtocolVersion = 170012;
-        consensus.vUpgrades[Consensus::UPGRADE_KAMIOOKA].nActivationHeight = Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+        // TEST-ONLY: activate KAMIOOKA from genesis so regtest validates the
+        // mainnet ZelHash (Equihash 125,4 / 52-byte) solutions — lets cs-miner's
+        // real 125,4 shares be accepted as blocks at trivial regtest difficulty.
+        consensus.vUpgrades[Consensus::UPGRADE_KAMIOOKA].nActivationHeight = Consensus::NetworkUpgrade::ALWAYS_ACTIVE;
 
         consensus.vUpgrades[Consensus::UPGRADE_KAMATA].nProtocolVersion = 170016;
         consensus.vUpgrades[Consensus::UPGRADE_KAMATA].nActivationHeight = Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
@@ -625,6 +628,7 @@ public:
 
         eh_epoch_1 = eh48_5;
         eh_epoch_2 = eh48_5;
+        eh_epoch_3 = zelHash;   // TEST-ONLY: 125,4 (52-byte) — see KAMIOOKA above
 
         pchMessageStart[0] = 0xaa;
         pchMessageStart[1] = 0xe8;
