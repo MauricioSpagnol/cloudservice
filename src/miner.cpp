@@ -110,8 +110,27 @@ void UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParams, 
     }
 }
 
+// A single OPoI transaction that was valid when it entered the mempool can
+// become invalid before it's mined (e.g. its signer's stake lapses to
+// SUSPENDED between broadcast and the next block — confirmed live via a
+// real regtest OPoI shard-pipeline test, 2026-07-23). CreateNewBlock() below
+// evicts that transaction once it's identified (see the IsInvalidTx()
+// branch), but eviction alone only prevents the failure from recurring on
+// the NEXT independent call — the CURRENT call still throws, which exits
+// the internal mining thread entirely (see BitcoinMiner()'s catch block)
+// and forces an external getblocktemplate/generate caller to notice the
+// error and retry itself. This bounds a small number of self-healing
+// retries WITHIN one call instead: after evicting the offending tx, rebuild
+// the candidate from the now-clean mempool and try again, so the common
+// case (one stale tx) is fully transparent to every caller. Bounded (not
+// unbounded recursion) in case something systemically different is wrong
+// and kept invalidating fresh candidates.
+static const int OPOI_BLOCK_RETRY_LIMIT = 5;
+
 CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& scriptPubKeyIn, std::map<int, std::pair<CScript, CAmount>>* fluxnodePayouts)
 {
+    static thread_local int opoiBlockRetryDepth = 0;
+
     // Create new block
     std::unique_ptr<CBlockTemplate> pblocktemplate(new CBlockTemplate());
     if(!pblocktemplate.get())
@@ -718,6 +737,24 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
                 LogPrintf("Removing transaction from mempool that is causing block to fail validity check. %s\n", state.GetInvalidTx().GetHash().GetHex());
                 std::list<CTransaction> removed;
                 mempool.remove(state.GetInvalidTx(), removed, false);
+
+                // Self-heal: the mempool no longer has the tx that broke this
+                // candidate, so a fresh attempt (rebuilding from the now-clean
+                // mempool) should succeed — see OPOI_BLOCK_RETRY_LIMIT's doc
+                // comment above. RAII-style depth restore via try/catch so the
+                // counter is correctly decremented whether the retry succeeds
+                // or itself throws (exhausting the bound).
+                if (opoiBlockRetryDepth < OPOI_BLOCK_RETRY_LIMIT) {
+                    opoiBlockRetryDepth++;
+                    try {
+                        CBlockTemplate* retried = CreateNewBlock(chainparams, scriptPubKeyIn, fluxnodePayouts);
+                        opoiBlockRetryDepth--;
+                        return retried;
+                    } catch (...) {
+                        opoiBlockRetryDepth--;
+                        throw;
+                    }
+                }
             }
             throw std::runtime_error(strprintf("CreateNewBlock(): TestBlockValidity failed: %s", state.GetRejectReason()));
         }

@@ -1040,8 +1040,27 @@ public:
         return IsFluxnodeUpgradeTx() && nFluxTxVersion == FLUXNODE_INTERNAL_P2SH_TX_VERSION;
     }
 
+    // 2026-07-23: OPoI (and CSApp) transactions are REQUIRED to have empty
+    // vin/vout (enforced in CheckOPoITransaction / main.cpp's CSApp check,
+    // respectively — HaveCoins() semantics don't apply to them), same as
+    // Fluxnode txs already were carved out for below. Without this carve-out
+    // every OPoI tx satisfies the generic empty-vin/vout null check, making
+    // IsNull() always true for them — which silently breaks
+    // CValidationState::IsInvalidTx() (defined as !txInvalidTx.IsNull())
+    // whenever SetInvalidTx() is called with a real OPoI tx: the mempool-
+    // eviction/self-heal path in miner.cpp's CreateNewBlock() never fires,
+    // because the "invalid tx" it just recorded reads back as if none had
+    // ever been set. Confirmed via a live regtest reproduction (a stake
+    // going SUSPENDED under a still-unconfirmed COORDINATOR_CLAIM never
+    // self-healed; generate/getblocktemplate failed identically forever).
+    // Safe: a default-constructed CTransaction() (the "no tx" sentinel
+    // DoSTx/CValidationState's default param relies on) has
+    // nVersion == SPROUT_MIN_CURRENT_VERSION, never OPOI_TX_VERSION or
+    // CSAPP_TX_VERSION, so this can't make an actual empty sentinel
+    // non-null by accident.
     bool IsNull() const {
-        return (vin.empty() && vout.empty() && !IsFluxnodeTx()) || (IsFluxnodeTx() && collateralIn.IsNull());
+        return (vin.empty() && vout.empty() && !IsFluxnodeTx() && !IsOPoITx() && !IsCSAppTx())
+            || (IsFluxnodeTx() && collateralIn.IsNull());
     }
 
     std::string TypeToString() const {

@@ -1547,8 +1547,28 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
     }
 
     if (tx.IsOPoITx()) {
-        if (!CheckOPoITransaction(tx, state))
+        if (!CheckOPoITransaction(tx, state)) {
+            // Every OPoI rejection path in opoi.cpp calls state.DoS(...), never
+            // state.DoSTx(...)/SetInvalidTx(...) — so state.IsInvalidTx() was
+            // always false for OPoI failures, and CreateNewBlock()'s existing
+            // "remove the offending tx and keep going" logic (miner.cpp, gated
+            // on IsInvalidTx()) never fired for them. A single OPoI tx that
+            // becomes invalid after entering the mempool (e.g. its signer's
+            // stake lapses to SUSPENDED between broadcast and the next block)
+            // would otherwise fail TestBlockValidity() for every future
+            // CreateNewBlock() caller (generate, getblocktemplate, the
+            // internal mining thread) indefinitely, since nothing else ever
+            // evicts it — confirmed live via a real regtest OPoI shard-pipeline
+            // test (2026-07-23): "TestBlockValidity failed:
+            // bad-txns-opoi-shard-not-staked" repeated on every subsequent
+            // attempt until a manual stake renewal happened to land in the
+            // same block ahead of the stale tx (an ordering coincidence, not
+            // a real fix). Marking the tx here — regardless of which specific
+            // check inside CheckOPoITransaction rejected it — lets that
+            // already-written eviction logic actually run.
+            state.SetInvalidTx(tx);
             return false;
+        }
     }
 
     // Size limits
