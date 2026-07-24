@@ -423,20 +423,31 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
             g_opoiCache.UnmarkShardPaid(tx.opoiRequestId, tx.opoiShardIndex);
 
         } else if (tx.nType == OPOI_AUDITOR_VERIFY_TX_TYPE) {
+            // Look up this vote's resolved status BEFORE erasing it — mirrors
+            // the CHALLENGE undo above (ch.challengeStatus == OPOI_CHALLENGE_SLASHED):
+            // a SLASHED vote's collateral was never unlocked by
+            // ProcessAuditorVerifications (it stays burned forever by design),
+            // so undoing this tx must not unlock it either. PENDING (quorum
+            // never reached) and COMPLETE (majority — already unlocked as a
+            // reward) both unlock harmlessly here as before.
+            int8_t status = OPOI_AUDITOR_STATUS_PENDING;
             auto it = g_opoiCache.mapAuditorVerifications.find(tx.opoiRequestId);
             if (it != g_opoiCache.mapAuditorVerifications.end()) {
                 auto& verifs = it->second;
+                for (const auto& v : verifs) {
+                    if (v.auditorAddress == tx.opoiAuditorAddress) {
+                        status = v.status;
+                        break;
+                    }
+                }
                 verifs.erase(std::remove_if(verifs.begin(), verifs.end(),
                     [&](const AuditorVerification& v) { return v.auditorAddress == tx.opoiAuditorAddress; }),
                     verifs.end());
             }
-            // Release the lock this vote applied. NOTE (known v1 gap, same class
-            // already accepted for CHALLENGE slashing — see ProcessExpiredChallenges):
-            // if this vote had already been resolved as the SLASHED minority,
-            // this incorrectly unlocks collateral that was meant to stay burned
-            // forever. Only matters for a reorg deep enough to disconnect past a
-            // resolved verification — not handled in v1.
-            g_opoiCache.UnlockUTXO(tx.opoiAuditorCollateralIn);
+            // Only release the lock if this vote was never actually burned.
+            if (status != OPOI_AUDITOR_STATUS_SLASHED) {
+                g_opoiCache.UnlockUTXO(tx.opoiAuditorCollateralIn);
+            }
             g_opoiCache.UnmarkAuditorResolved(tx.opoiRequestId);
         }
         return true;

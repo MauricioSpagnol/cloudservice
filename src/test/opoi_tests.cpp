@@ -1067,16 +1067,14 @@ BOOST_AUTO_TEST_CASE(auditor_verifications_undo_via_process_opoi_transaction)
     // ProcessAuditorVerifications itself takes no fUndo parameter and has no
     // undo branch — a reorg doesn't call it in reverse. Instead, collateral
     // undo is handled per-vote by ProcessOPoITransaction's own fUndo branch
-    // for OPOI_AUDITOR_VERIFY_TX_TYPE (opoi.cpp), which erases that Auditor's
-    // vote, unconditionally UnlockUTXO()s their collateral, and
-    // UnmarkAuditorResolved()s the requestId. This test exercises that real
-    // undo path directly, including the documented "known v1 gap": undoing
-    // the SLASHED minority's own vote wrongly releases collateral that was
-    // meant to stay burned forever (see the comment right above
-    // g_opoiCache.UnlockUTXO(tx.opoiAuditorCollateralIn) in
-    // ProcessOPoITransaction's undo branch) — this is accepted, pre-existing
-    // behavior, not a new bug, and this test locks it down rather than
-    // "fixing" it.
+    // for OPOI_AUDITOR_VERIFY_TX_TYPE (opoi.cpp), which now looks up that
+    // Auditor's vote status BEFORE erasing it, only UnlockUTXO()s their
+    // collateral when the vote was NOT SLASHED, and UnmarkAuditorResolved()s
+    // the requestId. This test exercises that real undo path directly and
+    // confirms the fixed behavior: undoing the SLASHED minority's own vote
+    // must leave its collateral permanently burned (locked), matching the
+    // analogous CHALLENGE-undo handling (ch.challengeStatus ==
+    // OPOI_CHALLENGE_SLASHED) just above it in ProcessOPoITransaction.
     Consensus::Params params;
     params.nOPoIMinAuditors = 3;
 
@@ -1100,9 +1098,10 @@ BOOST_AUTO_TEST_CASE(auditor_verifications_undo_via_process_opoi_transaction)
         BOOST_CHECK(v.auditorAddress != "auditor3");
     // ...the resolution is reopened...
     BOOST_CHECK(!g_opoiCache.IsAuditorResolved(reqId));
-    // ...and the burned collateral is (per the known v1 gap) released, not
-    // kept burned.
-    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(c3));
+    // ...and the burned collateral correctly STAYS locked — it was never
+    // unlocked as a SLASHED minority vote, and undoing the vote must not
+    // release it.
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(c3));
 }
 
 // ── ProcessShardPayments (F16 mutation wrapper) ───────────────────────────
