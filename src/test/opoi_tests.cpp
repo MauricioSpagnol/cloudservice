@@ -163,6 +163,49 @@ ModelManifest MakeDenseManifest(const std::string& modelId, uint32_t numLayers, 
     return m;
 }
 
+// A dummy, distinct-per-label collateral UTXO reference — real AuditorVerification
+// records always carry one (see ProcessOPoITransaction's AUDITOR_VERIFY apply
+// branch: fv.auditorCollateral = tx.opoiAuditorCollateralIn), and
+// ProcessAuditorVerifications' entire job is deciding what happens to exactly
+// this UTXO, so the collateral-locking tests below need it non-null.
+COutPoint MakeCollateral(const std::string& label)
+{
+    return COutPoint(HashOf(label), 0);
+}
+
+// Same as MakeVerification (above), but with a real collateral UTXO attached —
+// needed for g_opoiCache.AddAuditorVerification(fv) to actually lock something
+// (AddAuditorVerification's own "if (!fv.auditorCollateral.IsNull())" guard),
+// which is the exact real entry point ProcessOPoITransaction itself uses to
+// apply an AUDITOR_VERIFY tx (see opoi.cpp: "g_opoiCache.AddAuditorVerification(fv);
+// // also locks the collateral").
+AuditorVerification MakeVerificationWithCollateral(const std::string& requestId,
+                                                   const std::string& auditorAddress,
+                                                   uint8_t result, const COutPoint& collateral)
+{
+    AuditorVerification v = MakeVerification(requestId, auditorAddress, result);
+    v.auditorCollateral = collateral;
+    return v;
+}
+
+// A real AUDITOR_VERIFY CTransaction that also carries its collateral UTXO —
+// MakeAuditorVerifyTx (above) deliberately omits opoiAuditorCollateralIn since
+// GetVerifiablePaymentsForBlock never reads it; ProcessOPoITransaction's undo
+// branch for this tx type does (g_opoiCache.UnlockUTXO(tx.opoiAuditorCollateralIn)),
+// so the undo-path test below needs this fuller variant.
+CTransaction MakeAuditorVerifyTxWithCollateral(const std::string& requestId, const std::string& auditorAddress,
+                                               uint8_t result, const COutPoint& collateral)
+{
+    CMutableTransaction mtx;
+    mtx.nVersion                = OPOI_TX_VERSION;
+    mtx.nType                   = OPOI_AUDITOR_VERIFY_TX_TYPE;
+    mtx.opoiRequestId           = requestId;
+    mtx.opoiAuditorAddress      = auditorAddress;
+    mtx.opoiAuditorVerifyResult = result;
+    mtx.opoiAuditorCollateralIn = collateral;
+    return CTransaction(mtx);
+}
+
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(opoi_tests, OPoIPaymentsFixture)
@@ -851,6 +894,356 @@ BOOST_AUTO_TEST_CASE(verifiable_payments_zero_responses_no_op)
 
     auto payments = GetVerifiablePaymentsForBlock(vtx, params);
     BOOST_CHECK(payments.empty());
+}
+
+// ── ProcessAuditorVerifications (F14-C) ───────────────────────────────────
+// Unlike GetShardPaymentsForBlock/GetVerifiablePaymentsForBlock (pure
+// computations returning a vector), this is a mutation: it walks every
+// requestId in g_opoiCache.mapAuditorVerifications, and the moment one first
+// reaches quorum, flips each vote's `status` and calls
+// g_opoiCache.UnlockUTXO/leaves it locked depending on majority agreement,
+// then g_opoiCache.MarkAuditorResolved so it's never reprocessed. Tests below
+// call the real function and then query g_opoiCache directly (IsLockedUTXO,
+// GetAuditorVerifications, IsAuditorResolved) — never reimplementing the
+// unlock/slash decision.
+
+BOOST_AUTO_TEST_CASE(auditor_verifications_no_quorum_stays_pending)
+{
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-av-noquorum";
+    COutPoint c1 = MakeCollateral("c1");
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor1", AUDITOR_VERIFY_PASS, c1));
+
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(c1)); // AddAuditorVerification locks it immediately
+
+    ProcessAuditorVerifications(100, params);
+
+    BOOST_CHECK(!g_opoiCache.IsAuditorResolved(reqId)); // only 1 of 3 required votes in
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(c1)); // untouched — still pending, not unlocked or slashed
+
+    auto verifs = g_opoiCache.GetAuditorVerifications(reqId);
+    BOOST_REQUIRE_EQUAL(verifs.size(), 1u);
+    BOOST_CHECK_EQUAL(verifs[0].status, OPOI_AUDITOR_STATUS_PENDING);
+}
+
+BOOST_AUTO_TEST_CASE(auditor_verifications_quorum_majority_unlocks_winners_slashes_loser)
+{
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-av-majority";
+    COutPoint c1 = MakeCollateral("maj-c1"), c2 = MakeCollateral("maj-c2"), c3 = MakeCollateral("maj-c3");
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor1", AUDITOR_VERIFY_PASS, c1));
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor2", AUDITOR_VERIFY_PASS, c2));
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor3", AUDITOR_VERIFY_FAIL, c3));
+
+    ProcessAuditorVerifications(100, params);
+
+    BOOST_CHECK(g_opoiCache.IsAuditorResolved(reqId));
+    // Majority (PASS) voters get their collateral back...
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(c1));
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(c2));
+    // ...the lone divergent voter's collateral is burned (stays locked forever).
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(c3));
+
+    auto verifs = g_opoiCache.GetAuditorVerifications(reqId);
+    BOOST_REQUIRE_EQUAL(verifs.size(), 3u);
+    for (const auto& v : verifs) {
+        if (v.auditorAddress == "auditor3")
+            BOOST_CHECK_EQUAL(v.status, OPOI_AUDITOR_STATUS_SLASHED);
+        else
+            BOOST_CHECK_EQUAL(v.status, OPOI_AUDITOR_STATUS_COMPLETE);
+    }
+
+    // A later block re-running this (RebuildOPoICache replay, or simply the
+    // next ConnectBlock) must be a no-op: IsAuditorResolved's guard skips the
+    // requestId entirely, so nothing gets re-unlocked or re-slashed.
+    ProcessAuditorVerifications(101, params);
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(c1));
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(c2));
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(c3));
+}
+
+BOOST_AUTO_TEST_CASE(auditor_verifications_tie_resolves_nobody_stays_locked)
+{
+    // A straight 1-vs-1 tie with quorum=2: ComputeAuditorMajority returns -1
+    // (no STRICT majority), so ProcessAuditorVerifications' `if (majority < 0)
+    // continue;` guard means this requestId is left completely untouched —
+    // neither "everyone refunded" nor "everyone slashed", just never resolved
+    // (matches the function's own "Known v1 limitation" comment: quorum
+    // reached but never a majority means the vote just stays pending forever).
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 2;
+
+    const std::string reqId = "req-av-tie";
+    COutPoint c1 = MakeCollateral("tie-c1"), c2 = MakeCollateral("tie-c2");
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor1", AUDITOR_VERIFY_PASS, c1));
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor2", AUDITOR_VERIFY_FAIL, c2));
+
+    ProcessAuditorVerifications(100, params);
+
+    BOOST_CHECK(!g_opoiCache.IsAuditorResolved(reqId));
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(c1)); // still locked, not refunded
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(c2)); // still locked, not slashed either
+
+    auto verifs = g_opoiCache.GetAuditorVerifications(reqId);
+    for (const auto& v : verifs)
+        BOOST_CHECK_EQUAL(v.status, OPOI_AUDITOR_STATUS_PENDING);
+}
+
+BOOST_AUTO_TEST_CASE(auditor_verifications_canary_fail_strikes_miner_and_clears_obligation)
+{
+    // F9-F integration: a canary REQUEST resolving FAIL strikes the
+    // responding miner's stake (not a full slash) and clears any outstanding
+    // canaryObligationDeadline, so ProcessCanaryAudits doesn't double-strike
+    // the same cycle later.
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-av-canary-fail";
+    OPoIRequest req = MakeRequest(reqId, "CANARY_MODEL", 1 * COIN, 0, OPOI_TASK_VERIFIABLE);
+    req.isCanary = 1;
+    g_opoiCache.AddRequest(req);
+    g_opoiCache.AddResponse(MakeResponse(reqId, "canary-miner"));
+
+    OPoIStake stake;
+    stake.SetNull();
+    stake.minerAddress = "canary-miner";
+    stake.amount = 1;
+    stake.stakeStatus = OPOI_STAKE_ACTIVE;
+    stake.canaryStrikes = 0;
+    stake.canaryObligationDeadline = 500; // outstanding obligation
+    g_opoiCache.AddStake(stake);
+
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor1", AUDITOR_VERIFY_FAIL, MakeCollateral("cf-c1")));
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor2", AUDITOR_VERIFY_FAIL, MakeCollateral("cf-c2")));
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor3", AUDITOR_VERIFY_PASS, MakeCollateral("cf-c3")));
+
+    ProcessAuditorVerifications(100, params);
+
+    BOOST_CHECK(g_opoiCache.IsAuditorResolved(reqId));
+    OPoIStake outStake;
+    BOOST_REQUIRE(g_opoiCache.GetStake("canary-miner", outStake));
+    BOOST_CHECK_EQUAL(outStake.canaryStrikes, 1u);
+    BOOST_CHECK_EQUAL(outStake.canaryObligationDeadline, 0u); // cleared, whether PASS or FAIL
+    BOOST_CHECK(outStake.IsActive()); // 1 strike < OPOI_MAX_CANARY_STRIKES(3), not suspended yet
+}
+
+BOOST_AUTO_TEST_CASE(auditor_verifications_canary_third_strike_suspends_stake)
+{
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-av-canary-suspend";
+    OPoIRequest req = MakeRequest(reqId, "CANARY_MODEL", 1 * COIN, 0, OPOI_TASK_VERIFIABLE);
+    req.isCanary = 1;
+    g_opoiCache.AddRequest(req);
+    g_opoiCache.AddResponse(MakeResponse(reqId, "canary-miner2"));
+
+    OPoIStake stake;
+    stake.SetNull();
+    stake.minerAddress = "canary-miner2";
+    stake.amount = 1;
+    stake.stakeStatus = OPOI_STAKE_ACTIVE;
+    stake.canaryStrikes = 2; // already 2 strikes from earlier cycles
+    g_opoiCache.AddStake(stake);
+
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor1", AUDITOR_VERIFY_FAIL, MakeCollateral("s3-c1")));
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor2", AUDITOR_VERIFY_FAIL, MakeCollateral("s3-c2")));
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor3", AUDITOR_VERIFY_PASS, MakeCollateral("s3-c3")));
+
+    ProcessAuditorVerifications(100, params);
+
+    OPoIStake outStake;
+    BOOST_REQUIRE(g_opoiCache.GetStake("canary-miner2", outStake));
+    BOOST_CHECK_EQUAL(outStake.canaryStrikes, 3u);
+    BOOST_CHECK(outStake.IsSuspended());
+}
+
+BOOST_AUTO_TEST_CASE(auditor_verifications_undo_via_process_opoi_transaction)
+{
+    // ProcessAuditorVerifications itself takes no fUndo parameter and has no
+    // undo branch — a reorg doesn't call it in reverse. Instead, collateral
+    // undo is handled per-vote by ProcessOPoITransaction's own fUndo branch
+    // for OPOI_AUDITOR_VERIFY_TX_TYPE (opoi.cpp), which erases that Auditor's
+    // vote, unconditionally UnlockUTXO()s their collateral, and
+    // UnmarkAuditorResolved()s the requestId. This test exercises that real
+    // undo path directly, including the documented "known v1 gap": undoing
+    // the SLASHED minority's own vote wrongly releases collateral that was
+    // meant to stay burned forever (see the comment right above
+    // g_opoiCache.UnlockUTXO(tx.opoiAuditorCollateralIn) in
+    // ProcessOPoITransaction's undo branch) — this is accepted, pre-existing
+    // behavior, not a new bug, and this test locks it down rather than
+    // "fixing" it.
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-av-undo";
+    COutPoint c1 = MakeCollateral("undo-c1"), c2 = MakeCollateral("undo-c2"), c3 = MakeCollateral("undo-c3");
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor1", AUDITOR_VERIFY_PASS, c1));
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor2", AUDITOR_VERIFY_PASS, c2));
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "auditor3", AUDITOR_VERIFY_FAIL, c3));
+
+    ProcessAuditorVerifications(100, params);
+    BOOST_REQUIRE(g_opoiCache.IsAuditorResolved(reqId));
+    BOOST_REQUIRE(g_opoiCache.IsLockedUTXO(c3)); // slashed, burned
+
+    CTransaction undoTx = MakeAuditorVerifyTxWithCollateral(reqId, "auditor3", AUDITOR_VERIFY_FAIL, c3);
+    bool ok = ProcessOPoITransaction(undoTx, 100, /*fUndo=*/true, &params);
+    BOOST_CHECK(ok);
+
+    // The vote itself is gone...
+    auto verifs = g_opoiCache.GetAuditorVerifications(reqId);
+    for (const auto& v : verifs)
+        BOOST_CHECK(v.auditorAddress != "auditor3");
+    // ...the resolution is reopened...
+    BOOST_CHECK(!g_opoiCache.IsAuditorResolved(reqId));
+    // ...and the burned collateral is (per the known v1 gap) released, not
+    // kept burned.
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(c3));
+}
+
+// ── ProcessShardPayments (F16 mutation wrapper) ───────────────────────────
+// GetShardPaymentsForBlock (tested above) is the pure calculation;
+// ProcessShardPayments is the real stateful wrapper that actually calls
+// g_opoiCache.MarkShardPaid for every payment it computes — this is what
+// setPaidShards/IsShardPaid actually get set BY, in production. Tests below
+// call ProcessShardPayments itself (not MarkShardPaid directly) and then
+// query IsShardPaid / re-invoke GetShardPaymentsForBlock to confirm the real
+// mutation took hold and a second pass never double-pays.
+
+BOOST_AUTO_TEST_CASE(process_shard_payments_marks_resolved_shard_paid)
+{
+    Consensus::Params params;
+    params.nOPoIShardMinSubmissions = 1;
+
+    const std::string reqId = "req-psp-resolved";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "SINGLE_SHARD_MODEL", 5 * COIN));
+    g_opoiCache.AddModelManifest(MakeDenseManifest("SINGLE_SHARD_MODEL", 10, 1));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeShardResultTx(reqId, 0, "miner1", HashOf("out0"), 0));
+
+    BOOST_CHECK(!g_opoiCache.IsShardPaid(reqId, 0));
+    ProcessShardPayments(vtx, params);
+    BOOST_CHECK(g_opoiCache.IsShardPaid(reqId, 0));
+}
+
+BOOST_AUTO_TEST_CASE(process_shard_payments_second_call_never_double_pays)
+{
+    // Simulates the same SHARD_RESULT txs still being visible on a *later*
+    // block's re-derivation (e.g. RebuildOPoICache replay) — the real
+    // mutation (setPaidShards, via MarkShardPaid) must make the second call a
+    // total no-op, not just a lucky zero from the pure calculation alone.
+    Consensus::Params params;
+    params.nOPoIShardMinSubmissions = 1;
+
+    const std::string reqId = "req-psp-nodouble";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "NO_MANIFEST_MODEL", 5 * COIN));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeShardResultTx(reqId, 0, "miner1", HashOf("out"), 0));
+
+    ProcessShardPayments(vtx, params);
+    BOOST_REQUIRE(g_opoiCache.IsShardPaid(reqId, 0));
+
+    // Second call (as if processing a later block containing the very same
+    // txs, or a duplicate RebuildOPoICache pass): must find nothing left to pay.
+    auto secondPass = GetShardPaymentsForBlock(vtx, params);
+    BOOST_CHECK(secondPass.empty());
+    ProcessShardPayments(vtx, params); // must not crash or change anything
+    BOOST_CHECK(g_opoiCache.IsShardPaid(reqId, 0));
+}
+
+BOOST_AUTO_TEST_CASE(process_shard_payments_unresolved_shard_not_marked_paid)
+{
+    // Below min submissions -> ComputeShardMajority never resolves -> nothing
+    // computed -> ProcessShardPayments' for-loop over an empty vector never
+    // calls MarkShardPaid.
+    Consensus::Params params;
+    params.nOPoIShardMinSubmissions = 3;
+
+    const std::string reqId = "req-psp-unresolved";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "NO_MANIFEST_MODEL", 5 * COIN));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeShardResultTx(reqId, 0, "miner1", HashOf("out"), 0));
+    vtx.push_back(MakeShardResultTx(reqId, 0, "miner2", HashOf("out"), 0));
+    // Only 2 of the required 3 submissions are in.
+
+    ProcessShardPayments(vtx, params);
+    BOOST_CHECK(!g_opoiCache.IsShardPaid(reqId, 0));
+}
+
+// ── ProcessVerifiableResponsePayments (F14-C mutation wrapper) ────────────
+// The IsResponsePaid/MarkResponsePaid mirror of ProcessShardPayments' tests
+// above, for the Auditor/VERIFIABLE payment path.
+
+BOOST_AUTO_TEST_CASE(process_verifiable_payments_marks_resolved_response_paid)
+{
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-pvp-resolved";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "CODE_MODEL", 5 * COIN, 0, OPOI_TASK_VERIFIABLE));
+    g_opoiCache.AddResponse(MakeResponse(reqId, "miner1"));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor1", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor2", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor3", AUDITOR_VERIFY_FAIL));
+
+    BOOST_CHECK(!g_opoiCache.IsResponsePaid(reqId));
+    ProcessVerifiableResponsePayments(vtx, params);
+    BOOST_CHECK(g_opoiCache.IsResponsePaid(reqId));
+}
+
+BOOST_AUTO_TEST_CASE(process_verifiable_payments_second_call_never_double_pays)
+{
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-pvp-nodouble";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "CODE_MODEL", 5 * COIN, 0, OPOI_TASK_VERIFIABLE));
+    g_opoiCache.AddResponse(MakeResponse(reqId, "miner1"));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor1", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor2", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor3", AUDITOR_VERIFY_PASS));
+
+    ProcessVerifiableResponsePayments(vtx, params);
+    BOOST_REQUIRE(g_opoiCache.IsResponsePaid(reqId));
+
+    auto secondPass = GetVerifiablePaymentsForBlock(vtx, params);
+    BOOST_CHECK(secondPass.empty());
+    ProcessVerifiableResponsePayments(vtx, params); // must not crash or re-mark anything
+    BOOST_CHECK(g_opoiCache.IsResponsePaid(reqId));
+}
+
+BOOST_AUTO_TEST_CASE(process_verifiable_payments_unresolved_response_not_marked_paid)
+{
+    Consensus::Params params; // default nOPoIMinAuditors == 3
+
+    const std::string reqId = "req-pvp-unresolved";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "CODE_MODEL", 5 * COIN, 0, OPOI_TASK_VERIFIABLE));
+    g_opoiCache.AddResponse(MakeResponse(reqId, "miner1"));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor1", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor2", AUDITOR_VERIFY_PASS));
+    // Only 2 of the required 3 Auditors have voted -> no quorum.
+
+    ProcessVerifiableResponsePayments(vtx, params);
+    BOOST_CHECK(!g_opoiCache.IsResponsePaid(reqId));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
