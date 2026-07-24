@@ -76,7 +76,7 @@ CTransaction MakeDummyCoinbase()
 }
 
 OPoIRequest MakeRequest(const std::string& requestId, const std::string& model,
-                        CAmount payment, CAmount feePerToken = 0)
+                        CAmount payment, CAmount feePerToken = 0, int8_t taskType = OPOI_TASK_OPEN)
 {
     OPoIRequest req;
     req.SetNull();
@@ -87,12 +87,62 @@ OPoIRequest MakeRequest(const std::string& requestId, const std::string& model,
     req.maxTokens    = 1000;
     req.payment      = payment;
     req.feePerToken  = feePerToken;
-    req.taskType     = OPOI_TASK_OPEN;
+    req.taskType     = taskType;
     req.blockHeight  = 100;
     req.sigTime      = 1234;
     req.txHash       = HashOf(requestId + ":tx");
     req.status       = OPOI_STATUS_FULFILLED;
     return req;
+}
+
+// Builds a real REVEALed OPoIResponse the way GetVerifiablePaymentsForBlock
+// actually reads one (via g_opoiCache.ListResponses(); only requestId,
+// minerAddress and tokenCount are touched by that function).
+OPoIResponse MakeResponse(const std::string& requestId, const std::string& minerAddress,
+                          uint32_t tokenCount = 0)
+{
+    OPoIResponse resp;
+    resp.SetNull();
+    resp.requestId     = requestId;
+    resp.minerAddress  = minerAddress;
+    resp.responseHash  = HashOf(requestId + ":response");
+    resp.tokenCount    = tokenCount;
+    resp.responsePhase = 1; // REVEAL
+    resp.blockHeight   = 100;
+    resp.sigTime       = 1234;
+    resp.txHash        = HashOf(requestId + ":resptx");
+    return resp;
+}
+
+// A single Auditor verdict, for direct insertion into g_opoiCache (the
+// "already in cache from an earlier block" side of GetVerifiablePaymentsForBlock's
+// combined view) or for feeding straight into ComputeAuditorMajority (the pure
+// function, which never touches requestId at all).
+AuditorVerification MakeVerification(const std::string& requestId, const std::string& auditorAddress,
+                                     uint8_t result)
+{
+    AuditorVerification v;
+    v.SetNull();
+    v.requestId      = requestId;
+    v.auditorAddress = auditorAddress;
+    v.result         = result;
+    return v;
+}
+
+// Builds a real AUDITOR_VERIFY CTransaction the way GetVerifiablePaymentsForBlock
+// actually expects to read one (opoiRequestId, opoiAuditorAddress,
+// opoiAuditorVerifyResult) — the "this block's own not-yet-applied vote" side
+// of its combined view.
+CTransaction MakeAuditorVerifyTx(const std::string& requestId, const std::string& auditorAddress,
+                                 uint8_t result)
+{
+    CMutableTransaction mtx;
+    mtx.nVersion                = OPOI_TX_VERSION;
+    mtx.nType                   = OPOI_AUDITOR_VERIFY_TX_TYPE;
+    mtx.opoiRequestId           = requestId;
+    mtx.opoiAuditorAddress      = auditorAddress;
+    mtx.opoiAuditorVerifyResult = result;
+    return CTransaction(mtx);
 }
 
 // A DENSE, ACTIVE, multi-shard manifest — mirrors the F15-J live-regtest
@@ -503,6 +553,304 @@ BOOST_AUTO_TEST_CASE(titan_collapse_requires_all_conditions)
     Consensus::Params disabledParams;
     disabledParams.nOPoITitanOffloadThresholdGB = 0;
     BOOST_CHECK(!ShouldCollapseToTitanSingleNode(dense, disabledParams));
+}
+
+// ── ComputeAuditorMajority (F14-C) ────────────────────────────────────────
+// Auditor verdicts are PASS/FAIL/TIMEOUT votes (not hash-agreement like
+// ComputeShardMajority), so the majority rule here is a plain STRICT
+// majority (revealed > 2x) of one of the three fixed result values, gated
+// by a quorum floor (minVerifiers) on the count of REVEALED votes — there
+// is no "bucket key" or tie-break-by-count concept the way shard majority
+// has.
+
+BOOST_AUTO_TEST_CASE(auditor_majority_clear_majority_pass)
+{
+    std::vector<AuditorVerification> verifs;
+    verifs.push_back(MakeVerification("req", "auditor1", AUDITOR_VERIFY_PASS));
+    verifs.push_back(MakeVerification("req", "auditor2", AUDITOR_VERIFY_PASS));
+    verifs.push_back(MakeVerification("req", "auditor3", AUDITOR_VERIFY_FAIL));
+
+    int result = ComputeAuditorMajority(verifs, 3);
+    BOOST_CHECK_EQUAL(result, (int)AUDITOR_VERIFY_PASS);
+}
+
+BOOST_AUTO_TEST_CASE(auditor_majority_clear_majority_fail)
+{
+    std::vector<AuditorVerification> verifs;
+    verifs.push_back(MakeVerification("req", "auditor1", AUDITOR_VERIFY_FAIL));
+    verifs.push_back(MakeVerification("req", "auditor2", AUDITOR_VERIFY_FAIL));
+    verifs.push_back(MakeVerification("req", "auditor3", AUDITOR_VERIFY_PASS));
+
+    int result = ComputeAuditorMajority(verifs, 3);
+    BOOST_CHECK_EQUAL(result, (int)AUDITOR_VERIFY_FAIL);
+}
+
+BOOST_AUTO_TEST_CASE(auditor_majority_exact_tie_no_winner)
+{
+    std::vector<AuditorVerification> verifs;
+    verifs.push_back(MakeVerification("req", "auditor1", AUDITOR_VERIFY_PASS));
+    verifs.push_back(MakeVerification("req", "auditor2", AUDITOR_VERIFY_FAIL));
+
+    // Quorum (2) is met, but 1-vs-1 is not a STRICT majority (1 > 2/2=1 is false
+    // for both sides) -> unresolved.
+    int result = ComputeAuditorMajority(verifs, 2);
+    BOOST_CHECK_EQUAL(result, -1);
+}
+
+BOOST_AUTO_TEST_CASE(auditor_majority_three_way_split_no_winner)
+{
+    // All three result values appear exactly once -- exercises the TIMEOUT
+    // branch too, and confirms a plain 1/1/1 split never resolves.
+    std::vector<AuditorVerification> verifs;
+    verifs.push_back(MakeVerification("req", "auditor1", AUDITOR_VERIFY_PASS));
+    verifs.push_back(MakeVerification("req", "auditor2", AUDITOR_VERIFY_FAIL));
+    verifs.push_back(MakeVerification("req", "auditor3", AUDITOR_VERIFY_TIMEOUT));
+
+    int result = ComputeAuditorMajority(verifs, 3);
+    BOOST_CHECK_EQUAL(result, -1);
+}
+
+BOOST_AUTO_TEST_CASE(auditor_majority_below_min_auditors_never_resolves)
+{
+    // Two Auditors genuinely agree, but the configured floor (mirrors
+    // Consensus::Params::nOPoIMinAuditors) requires 3 REVEALED votes.
+    std::vector<AuditorVerification> verifs;
+    verifs.push_back(MakeVerification("req", "auditor1", AUDITOR_VERIFY_PASS));
+    verifs.push_back(MakeVerification("req", "auditor2", AUDITOR_VERIFY_PASS));
+
+    int result = ComputeAuditorMajority(verifs, 3);
+    BOOST_CHECK_EQUAL(result, -1);
+}
+
+BOOST_AUTO_TEST_CASE(auditor_majority_single_vote_is_its_own_majority)
+{
+    std::vector<AuditorVerification> verifs;
+    verifs.push_back(MakeVerification("req", "auditor1", AUDITOR_VERIFY_PASS));
+
+    int result = ComputeAuditorMajority(verifs, 1);
+    BOOST_CHECK_EQUAL(result, (int)AUDITOR_VERIFY_PASS); // 1 > 1/2=0
+}
+
+BOOST_AUTO_TEST_CASE(auditor_majority_empty_input)
+{
+    std::vector<AuditorVerification> verifs;
+    BOOST_CHECK_EQUAL(ComputeAuditorMajority(verifs, 1), -1);
+    BOOST_CHECK_EQUAL(ComputeAuditorMajority(verifs, 0), -1);
+}
+
+// ── GetVerifiablePaymentsForBlock (F14-C) ─────────────────────────────────
+// The VERIFIABLE-task/N-of-M-Auditor sibling of GetShardPaymentsForBlock:
+// pays a RESPONSE's miner in full once its request's Auditor verdicts
+// (cache + this block's own not-yet-applied AUDITOR_VERIFY txs, deduped by
+// auditorAddress) resolve to a strict AUDITOR_VERIFY_PASS majority, and only
+// once per requestId (OPoICache::setPaidResponses via IsResponsePaid).
+
+BOOST_AUTO_TEST_CASE(verifiable_payments_majority_pass_full_payment)
+{
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-verifiable-pass";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "CODE_MODEL", 5 * COIN, 0, OPOI_TASK_VERIFIABLE));
+    g_opoiCache.AddResponse(MakeResponse(reqId, "miner1"));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor1", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor2", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor3", AUDITOR_VERIFY_FAIL));
+
+    auto payments = GetVerifiablePaymentsForBlock(vtx, params);
+    BOOST_REQUIRE_EQUAL(payments.size(), 1u);
+    BOOST_CHECK_EQUAL(payments[0].requestId, reqId);
+    BOOST_CHECK_EQUAL(payments[0].minerAddress, "miner1");
+    BOOST_CHECK_EQUAL(payments[0].amount, 5 * COIN);
+}
+
+BOOST_AUTO_TEST_CASE(verifiable_payments_fee_per_token_added)
+{
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-verifiable-feetoken";
+    CAmount feePerToken = COIN / 10; // 0.1 CS/token
+    g_opoiCache.AddRequest(MakeRequest(reqId, "CODE_MODEL", 2 * COIN, feePerToken, OPOI_TASK_VERIFIABLE));
+    g_opoiCache.AddResponse(MakeResponse(reqId, "miner1", /*tokenCount=*/20));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor1", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor2", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor3", AUDITOR_VERIFY_PASS));
+
+    auto payments = GetVerifiablePaymentsForBlock(vtx, params);
+    BOOST_REQUIRE_EQUAL(payments.size(), 1u);
+    // 2 CS base + 20 tokens * 0.1 CS = 4 CS.
+    BOOST_CHECK_EQUAL(payments[0].amount, 4 * COIN);
+}
+
+BOOST_AUTO_TEST_CASE(verifiable_payments_majority_fail_pays_nothing)
+{
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-verifiable-fail";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "CODE_MODEL", 5 * COIN, 0, OPOI_TASK_VERIFIABLE));
+    g_opoiCache.AddResponse(MakeResponse(reqId, "miner1"));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor1", AUDITOR_VERIFY_FAIL));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor2", AUDITOR_VERIFY_FAIL));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor3", AUDITOR_VERIFY_PASS));
+
+    auto payments = GetVerifiablePaymentsForBlock(vtx, params);
+    BOOST_CHECK(payments.empty()); // majority resolved, but to FAIL, not PASS
+}
+
+BOOST_AUTO_TEST_CASE(verifiable_payments_no_quorum_pays_nothing)
+{
+    Consensus::Params params; // default nOPoIMinAuditors == 3
+
+    const std::string reqId = "req-verifiable-noquorum";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "CODE_MODEL", 5 * COIN, 0, OPOI_TASK_VERIFIABLE));
+    g_opoiCache.AddResponse(MakeResponse(reqId, "miner1"));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor1", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor2", AUDITOR_VERIFY_PASS));
+    // Only 2 of the required 3 Auditors have voted.
+
+    auto payments = GetVerifiablePaymentsForBlock(vtx, params);
+    BOOST_CHECK(payments.empty());
+}
+
+BOOST_AUTO_TEST_CASE(verifiable_payments_already_paid_not_paid_again)
+{
+    // OPoICache::setPaidResponses bookkeeping (IsResponsePaid/MarkResponsePaid):
+    // a requestId already marked paid must never be returned again, even if
+    // its majority still resolves cleanly against fresh votes in this block.
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-verifiable-alreadypaid";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "CODE_MODEL", 5 * COIN, 0, OPOI_TASK_VERIFIABLE));
+    g_opoiCache.AddResponse(MakeResponse(reqId, "miner1"));
+    g_opoiCache.MarkResponsePaid(reqId);
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor1", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor2", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor3", AUDITOR_VERIFY_PASS));
+
+    auto payments = GetVerifiablePaymentsForBlock(vtx, params);
+    BOOST_CHECK(payments.empty());
+}
+
+BOOST_AUTO_TEST_CASE(verifiable_payments_combines_cache_and_block_votes_with_dedup)
+{
+    // Mirrors GetShardPaymentsForBlock's combine-cache-with-this-block's-own-
+    // txs pattern: 1 FAIL + 1 PASS already resolved-into-cache from an earlier
+    // block, this block brings a NEW PASS vote plus a REDUNDANT re-delivery of
+    // the already-cached FAIL vote from auditor1. If the redundant vote were
+    // not deduped by auditorAddress (the "seen" set), revealed would be 4
+    // (FAIL,PASS,FAIL,PASS) and 2 > 4/2=2 would be false for every verdict,
+    // so this majority would wrongly fail to resolve.
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-verifiable-dedup";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "CODE_MODEL", 5 * COIN, 0, OPOI_TASK_VERIFIABLE));
+    g_opoiCache.AddResponse(MakeResponse(reqId, "miner1"));
+    g_opoiCache.AddAuditorVerification(MakeVerification(reqId, "auditor1", AUDITOR_VERIFY_FAIL));
+    g_opoiCache.AddAuditorVerification(MakeVerification(reqId, "auditor2", AUDITOR_VERIFY_PASS));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor3", AUDITOR_VERIFY_PASS)); // new
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor1", AUDITOR_VERIFY_FAIL)); // redundant, must be deduped
+
+    auto payments = GetVerifiablePaymentsForBlock(vtx, params);
+    BOOST_REQUIRE_EQUAL(payments.size(), 1u); // 1 FAIL, 2 PASS out of 3 -> strict PASS majority
+    BOOST_CHECK_EQUAL(payments[0].amount, 5 * COIN);
+}
+
+BOOST_AUTO_TEST_CASE(verifiable_payments_open_task_request_ignored)
+{
+    // OPEN-task requests are paid same-block via the SHARD_RESULT/dense
+    // pipeline (GetShardPaymentsForBlock), never here — even if a stray
+    // Auditor majority happened to resolve PASS for one.
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-verifiable-opentask";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "TEXT_MODEL", 5 * COIN)); // default taskType == OPOI_TASK_OPEN
+    g_opoiCache.AddResponse(MakeResponse(reqId, "miner1"));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor1", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor2", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor3", AUDITOR_VERIFY_PASS));
+
+    auto payments = GetVerifiablePaymentsForBlock(vtx, params);
+    BOOST_CHECK(payments.empty());
+}
+
+BOOST_AUTO_TEST_CASE(verifiable_payments_zero_payment_request_pays_nothing)
+{
+    // req.payment <= 0 -> explicitly skipped, same guard shape as
+    // GetShardPaymentsForBlock's req.payment <= 0 check.
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-verifiable-zeropay";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "CODE_MODEL", 0, 0, OPOI_TASK_VERIFIABLE));
+    g_opoiCache.AddResponse(MakeResponse(reqId, "miner1"));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor1", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor2", AUDITOR_VERIFY_PASS));
+    vtx.push_back(MakeAuditorVerifyTx(reqId, "auditor3", AUDITOR_VERIFY_PASS));
+
+    auto payments = GetVerifiablePaymentsForBlock(vtx, params);
+    BOOST_CHECK(payments.empty());
+}
+
+BOOST_AUTO_TEST_CASE(verifiable_payments_orphan_response_unknown_request_ignored)
+{
+    // A RESPONSE recorded for a requestId that was never registered as a
+    // REQUEST (g_opoiCache.GetRequest fails) must not crash or pay anything —
+    // the mirror image of shard_payments_unknown_request_id_ignored.
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 1;
+
+    g_opoiCache.AddResponse(MakeResponse("no-such-request", "miner1"));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeAuditorVerifyTx("no-such-request", "auditor1", AUDITOR_VERIFY_PASS));
+
+    auto payments = GetVerifiablePaymentsForBlock(vtx, params);
+    BOOST_CHECK(payments.empty());
+}
+
+BOOST_AUTO_TEST_CASE(verifiable_payments_zero_responses_no_op)
+{
+    // A block/cache with a VERIFIABLE request but no RESPONSE at all touches
+    // nothing (ListResponses() is empty, the loop body never runs).
+    Consensus::Params params;
+    const std::string reqId = "req-verifiable-noresponses";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "CODE_MODEL", 5 * COIN, 0, OPOI_TASK_VERIFIABLE));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+
+    auto payments = GetVerifiablePaymentsForBlock(vtx, params);
+    BOOST_CHECK(payments.empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
