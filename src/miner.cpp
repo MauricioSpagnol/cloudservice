@@ -287,6 +287,38 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
 
                 dPriority += (double)100 * nConf;
             }
+
+            // OPoI transactions have empty vin (enforced in CheckOPoITransaction),
+            // so the BOOST_FOREACH above never runs for them and dPriority stays
+            // structurally 0 — same situation Fluxnode txs are in just above,
+            // handled the same way here: an age-based priority that grows the
+            // longer the tx has waited in the mempool (using mempool entry
+            // height as the "confirmations" proxy, since there's no single
+            // collateral UTXO to reference for most OPoI tx types). Without
+            // this, every OPoI tx is permanently tied at (priority=0, fee=0)
+            // with every other one, and CreateNewBlock()'s tie-break for equal
+            // (priority, feeRate) pairs is unspecified (implementation-defined
+            // std::make_heap/pop_heap order, not stable/predictable from the
+            // RPC caller's side — confirmed empirically: identical two-tx-race
+            // setups resolved differently run to run). That non-determinism
+            // is exactly what let a stale OPoI tx keep dodging inclusion
+            // indefinitely (or, just as easily, get selected too early) with
+            // no way to reason about or bound its confirmation latency. This
+            // mirrors the Fluxnode priority formula (100 * age-in-blocks)
+            // immediately above — same shape, same order of magnitude — so an
+            // OPoI tx's relative priority still increases over time the same
+            // way a normal fee-paying tx's does via coin-confirmations,
+            // guaranteeing it eventually outranks freshly-submitted zero-age
+            // competitors instead of being stuck in an unresolvable tie
+            // forever. This is a node-local mining/selection policy choice
+            // only (which mempool tx THIS node prefers to build a candidate
+            // from) — it does not change any block-acceptance/consensus rule,
+            // so it cannot cause a fork or affect what any other node accepts.
+            if (tx.IsOPoITx()) {
+                int nOPoIConf = nHeight - (int)mi->GetHeight();
+                if (nOPoIConf > 0)
+                    dPriority += (double)100 * nOPoIConf;
+            }
             nTotalIn += tx.GetShieldedValueIn();
 
             if (fMissingInputs) continue;
@@ -301,6 +333,21 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
             CFeeRate feeRate(nTotalIn-tx.GetValueOut(), nTxSize);
 
             if (tx.IsFluxnodeTx()) {
+                feeRate = CFeeRate (1 * CENT, nTxSize);
+            }
+
+            // Same reasoning as the dPriority boost above: OPoI txs have no
+            // real vin/vout, so nTotalIn-tx.GetValueOut() is always exactly 0,
+            // meaning feeRate would otherwise be 0 too — which matters once a
+            // block moves past the priority phase into fee-sorted mode
+            // (fSortedByFee), where a genuinely 0 feeRate is what makes a
+            // low/no-priority tx get skipped outright (miner.cpp's free-tx
+            // skip check further down). Giving OPoI txs the same small fixed
+            // feeRate floor Fluxnode already uses keeps them from being
+            // treated as strictly-free once priority alone isn't enough to
+            // win a slot — still a node-local selection-policy value, not a
+            // real fee charged to anyone, exactly like Fluxnode's.
+            if (tx.IsOPoITx()) {
                 feeRate = CFeeRate (1 * CENT, nTxSize);
             }
 
