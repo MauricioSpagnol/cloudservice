@@ -210,6 +210,14 @@ struct Params {
      *  request's model may have. Deeper models must be requested as BATCH. **/
     int         nOPoIMaxPipelineDepth       = 6;
 
+    /** F9-G/F15-M — titan MoE-offload single-node routing preference: a DENSE
+     *  model manifest declaring total_size_bytes over this many GB, with at
+     *  least one ACTIVE titan-tier staker, prefers collapsing its Model
+     *  Execution Graph to one whole-model shard on that titan host instead of
+     *  the normal multi-shard dense pipeline split (see
+     *  ShouldCollapseToTitanSingleNode, opoi.h). 0 = feature disabled. **/
+    int         nOPoITitanOffloadThresholdGB = 200;
+
     /** F11-B/C — per-block caps on REQUEST/RESPONSE tx count, to bound how much
      *  of a block the OPoI subsystem can occupy regardless of fee/priority. **/
     int         nOPoIMaxRequestsPerBlock    = 50;

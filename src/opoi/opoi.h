@@ -44,6 +44,22 @@ static const int8_t OPOI_STAKE_RELEASED    = 3;
 static const int8_t OPOI_STAKE_SLASHED     = 4;
 static const int8_t OPOI_STAKE_SUSPENDED   = 5; // F9-F: 3 canary strikes — re-stake required
 
+// F9-B/F9-G: stake tier values. Purely self-declared via stakeopoi's `tier`
+// param — CheckOPoITransaction's STAKE case has NEVER enforced any bound on
+// this field for 0-3 either (confirmed 2026-07-23 while scoping F9-G: no
+// range check of any kind exists anywhere in this codebase for opoiTier —
+// stake.tier = tx.opoiTier is the entire "validation"). Adding titan=4 here
+// is a naming/documentation formalization for F15-M's routing code to check
+// against, NOT a new validation rule — it does not reduce security below the
+// status quo, since nothing was ever verified for ANY tier. Real hardware
+// attestation for tiers 0-4 would be a separate, dedicated design effort
+// (see the F9-G doc entry in CS COIN OPoI MELHOR IMPLEMENTAÇÃO.txt).
+static const uint8_t OPOI_TIER_LIGHT    = 0; // Gemma 4B      — 4GB+ VRAM
+static const uint8_t OPOI_TIER_DEFAULT  = 1; // Dolphin 8B    — 8GB+ VRAM
+static const uint8_t OPOI_TIER_HIGH     = 2; // Qwen3 32B     — 24GB+ VRAM
+static const uint8_t OPOI_TIER_VERYHIGH = 3; // Llama 3.3 70B — 48GB+ VRAM
+static const uint8_t OPOI_TIER_TITAN    = 4; // F9-G: MoE-offload host — 24GB+ VRAM AND 256GB+ RAM
+
 static const int8_t OPOI_CHALLENGE_OPEN             = 1; // COMMIT received, awaiting REVEAL
 static const int8_t OPOI_CHALLENGE_SLASHED          = 2; // proven fraud (VERIFIABLE + Auditor FAIL) — miner slashed
 static const int8_t OPOI_CHALLENGE_EXPIRED           = 3; // no REVEAL in time, or reveal didn't hold up — challenger slashed
@@ -866,6 +882,18 @@ public:
         return n;
     }
 
+    // F9-G/F15-M: at least one ACTIVE staker self-declared tier == titan.
+    // Same self-declared trust model as any other tier (see OPOI_TIER_TITAN's
+    // doc comment) — used only as a routing PREFERENCE input (opoi_shard.h's
+    // BuildModelExecutionGraph via ShouldCollapseToTitanSingleNode below),
+    // never as a payment/eligibility gate the way IsActiveStaker is.
+    bool HasActiveTitanStaker() const {
+        LOCK(cs);
+        for (const auto& kv : mapStakes)
+            if (kv.second.IsActive() && kv.second.tier == OPOI_TIER_TITAN) return true;
+        return false;
+    }
+
     bool AddModelManifest(const ModelManifest& m) {
         LOCK(cs); mapModelManifests[m.modelId] = m; return true;
     }
@@ -1303,6 +1331,31 @@ public:
 
 // Global instance
 extern OPoICache g_opoiCache;
+
+// F9-G/F15-M: MoE-offload single-node routing preference. Returns true only
+// when ALL of: model m is DENSE with a real multi-shard split (numDenseShards
+// > 1 — MoE/HYBRID already always collapse to one shard regardless, see
+// opoi_shard.h's BuildModelExecutionGraph doc comment, so this can never
+// change anything for them); m declares a total size over
+// nOPoITitanOffloadThresholdGB (0 = feature disabled, or size not declared =
+// unknown = never triggers); and at least one ACTIVE titan-tier staker
+// exists right now. This is a routing PREFERENCE, not a new consensus
+// validation rule on the manifest itself — shardTopologyHash (the only MEG
+// commitment stored on-chain) is computed straight from manifest fields, not
+// from BuildModelExecutionGraph's output (see ComputeShardTopologyHash), so
+// this cannot fork consensus over that hash. It DOES change what shard-index
+// bounds / payment splits a SHARD_RESULT resolves against — the same
+// category of cache-state-dependent consensus input IsActiveStaker() already
+// is throughout this file, deterministic as long as every node evaluates it
+// at the equivalent point while replaying the same chain.
+inline bool ShouldCollapseToTitanSingleNode(const ModelManifest& m, const Consensus::Params& params)
+{
+    if (m.archType != OPOI_ARCH_DENSE || m.numDenseShards <= 1) return false;
+    if (params.nOPoITitanOffloadThresholdGB == 0) return false;
+    uint64_t thresholdBytes = (uint64_t)params.nOPoITitanOffloadThresholdGB * 1024ULL * 1024ULL * 1024ULL;
+    if (m.totalSizeBytes == 0 || m.totalSizeBytes <= thresholdBytes) return false;
+    return g_opoiCache.HasActiveTitanStaker();
+}
 
 // Called from main.cpp ConnectBlock / DisconnectBlock
 bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,

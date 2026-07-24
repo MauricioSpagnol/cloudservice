@@ -616,6 +616,13 @@ public:
         // F15-G — small depth so toy models can actually exercise the rejection path
         consensus.nOPoIMaxPipelineDepth = 3;
 
+        // F9-G/F15-M — regtest: 1GB so the small test GGUFs already used throughout
+        // this project's manual testing (e.g. GEMMA_3_4B.gguf, ~3.3GB) exceed it
+        // easily, without needing a real >200GB model to exercise the titan
+        // single-node routing preference. Mainnet/testnet keep the 200GB default
+        // from consensus/params.h.
+        consensus.nOPoITitanOffloadThresholdGB = 1;
+
         // F11-B/C — low caps so a manual test can actually hit and exercise the
         // rejection path without mining dozens of throwaway REQUEST/RESPONSE txs.
         consensus.nOPoIMaxRequestsPerBlock  = 3;

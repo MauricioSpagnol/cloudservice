@@ -678,7 +678,7 @@ public:
     const std::vector<uint8_t> opoiVrfOutput;               // VRF output (32 bytes, RFC 9381)
     // F9-B: Model tier and Proof-of-Model (STAKE only)
     const std::string          opoiModelId;                 // model identifier e.g. "GEMMA_3_4B"
-    const uint8_t              opoiTier;                    // 0=light/1=default/2=high/3=veryhigh
+    const uint8_t              opoiTier;                    // 0=light/1=default/2=high/3=veryhigh/4=titan(F9-G)
     const uint256              opoiPomRoot;                 // Merkle root of GGUF weights
     // F15-E: which MoE experts this stake hosts (STAKE only; empty if dense-only miner)
     const std::vector<uint32_t> opoiHostedExpertIds;
@@ -705,6 +705,9 @@ public:
     const uint32_t             opoiModelTopKExperts;        // 0 if DENSE
     const std::vector<uint256> opoiModelExpertPomRoots;     // one per expert (empty if DENSE)
     const CAmount              opoiModelMinRewardPerToken;
+    // F9-G/F15-M: total on-disk size of the model's weights in bytes (0 =
+    // not declared). MODEL_REGISTER only — see opoi_model_manifest.h.
+    const uint64_t             opoiModelTotalSizeBytes;
     // F15-A2: Model vote (MODEL_VOTE only) — opoiModelId/opoiRequester reused (voter address)
     const uint8_t              opoiModelVoteApprove;        // 0=reject, 1=approve
     // F15-D: shard boundary result (SHARD_RESULT only) — opoiRequestId/opoiMinerAddress/
@@ -923,6 +926,7 @@ public:
                 READWRITE(*const_cast<uint256*>(&opoiPomRoot));            // backbone POM root
                 READWRITE(*const_cast<std::vector<uint256>*>(&opoiModelExpertPomRoots));
                 READWRITE(*const_cast<CAmount*>(&opoiModelMinRewardPerToken));
+                READWRITE(*const_cast<uint64_t*>(&opoiModelTotalSizeBytes));
             } else if (nType == OPOI_MODEL_VOTE_TX_TYPE) {
                 READWRITE(*const_cast<std::string*>(&opoiModelId));
                 READWRITE(*const_cast<std::string*>(&opoiRequester));       // voter
@@ -1232,6 +1236,7 @@ struct CMutableTransaction
     uint32_t             opoiModelTopKExperts          = 0;
     std::vector<uint256> opoiModelExpertPomRoots;
     CAmount              opoiModelMinRewardPerToken    = 0;
+    uint64_t             opoiModelTotalSizeBytes       = 0; // F9-G/F15-M
     uint8_t              opoiModelVoteApprove          = 0;
     uint32_t             opoiShardIndex                = 0;
 
@@ -1417,6 +1422,7 @@ struct CMutableTransaction
                 READWRITE(opoiPomRoot);
                 READWRITE(opoiModelExpertPomRoots);
                 READWRITE(opoiModelMinRewardPerToken);
+                READWRITE(opoiModelTotalSizeBytes);
             } else if (nType == OPOI_MODEL_VOTE_TX_TYPE) {
                 READWRITE(opoiModelId);
                 READWRITE(opoiRequester);

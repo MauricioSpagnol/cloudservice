@@ -63,12 +63,21 @@ struct ShardDescriptor {
 // dense architectures. SelectTopKExperts/OPOI_SHARD_EXPERT below are now
 // unreachable via this function (kept, not deleted: real, tested consensus
 // code a future per-layer MoE redesign would build on, not dead weight).
-inline std::vector<ShardDescriptor> BuildModelExecutionGraph(const ModelManifest& m)
+// F9-G/F15-M: `collapseToTitanSingleNode` — computed by the caller via
+// opoi.h's ShouldCollapseToTitanSingleNode(manifest, params) — makes a DENSE
+// model with a real multi-shard split collapse to the same single
+// whole-model shard the MoE branch below already always uses, when a titan
+// host is preferred over a distributed constellation (see that function's
+// doc comment for the exact conditions and consensus-safety reasoning).
+// Default false keeps every existing call site's behavior byte-identical
+// unless it explicitly opts in.
+inline std::vector<ShardDescriptor> BuildModelExecutionGraph(const ModelManifest& m,
+                                                              bool collapseToTitanSingleNode = false)
 {
     std::vector<ShardDescriptor> graph;
     if (m.numLayers == 0) return graph;
 
-    if (m.IsMoE()) {
+    if (m.IsMoE() || collapseToTitanSingleNode) {
         ShardDescriptor d;
         d.shardIndex = 0;
         d.shardType  = OPOI_SHARD_DENSE;

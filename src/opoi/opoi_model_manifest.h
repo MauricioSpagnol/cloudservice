@@ -42,6 +42,15 @@ struct ModelManifest {
     uint256     backbonePomRoot;         // Merkle root of dense/backbone weights
     std::vector<uint256> expertPomRoots; // one root per expert (empty if DENSE)
     CAmount     minRewardPerToken;
+    // F9-G/F15-M: total on-disk size of the model's weights in bytes.
+    // Proposer-declared, same trust level as every other manifest field here
+    // (none of them are validated against pomRoot or anything else) — 0
+    // means "not declared" (older registrations, or proposer omitted it),
+    // which always means the titan MoE-offload single-node routing
+    // preference (ShouldCollapseToTitanSingleNode, opoi.h) never triggers
+    // for this model. Purely a routing input, never a reward/eligibility
+    // input.
+    uint64_t    totalSizeBytes;
     std::string proposer;
     uint32_t    proposedHeight;
     uint32_t    voteWindowEndHeight;
@@ -62,6 +71,7 @@ struct ModelManifest {
         READWRITE(numExperts); READWRITE(topKExperts);
         READWRITE(backbonePomRoot); READWRITE(expertPomRoots);
         READWRITE(minRewardPerToken);
+        READWRITE(totalSizeBytes);
         READWRITE(proposer); READWRITE(proposedHeight);
         READWRITE(voteWindowEndHeight); READWRITE(activationHeight);
         READWRITE(txHash); READWRITE(status); READWRITE(shardTopologyHash);
@@ -73,6 +83,7 @@ struct ModelManifest {
         numLayers = 0; numDenseShards = 0; numExperts = 0; topKExperts = 0;
         backbonePomRoot.SetNull(); expertPomRoots.clear();
         minRewardPerToken = 0;
+        totalSizeBytes = 0;
         proposer.clear(); proposedHeight = 0;
         voteWindowEndHeight = 0; activationHeight = 0;
         txHash.SetNull(); status = OPOI_MODEL_STATUS_VOTING;

@@ -667,6 +667,7 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         m.backbonePomRoot      = tx.opoiPomRoot;
         m.expertPomRoots       = tx.opoiModelExpertPomRoots;
         m.minRewardPerToken    = tx.opoiModelMinRewardPerToken;
+        m.totalSizeBytes       = tx.opoiModelTotalSizeBytes;
         m.proposer             = tx.opoiRequester;
         m.proposedHeight       = blockHeight;
         uint32_t voteWindow    = pparams ? pparams->nOPoIModelVoteWindowBlocks : 200;
@@ -1721,7 +1722,10 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
             // entirely — F15-D's generic VRF-eligibility gate above already applies.
             ModelManifest manifest;
             if (g_opoiCache.GetModelManifest(req.model, manifest) && manifest.IsActive()) {
-                auto meg = BuildModelExecutionGraph(manifest);
+                // F9-G/F15-M: same titan single-node routing preference applied
+                // consistently everywhere this manifest's MEG is consulted.
+                bool collapseTitan = ShouldCollapseToTitanSingleNode(manifest, Params().GetConsensus());
+                auto meg = BuildModelExecutionGraph(manifest, collapseTitan);
                 if (tx.opoiShardIndex >= meg.size())
                     return state.DoS(10, error("CheckOPoITransaction(): SHARD_RESULT shardIndex %u out of range for model %s",
                                                tx.opoiShardIndex, manifest.modelId),
@@ -2029,7 +2033,8 @@ int GetEffectiveShardMinSubmissions(const OPoIRequest& req, uint32_t shardIndex,
     if (!g_opoiCache.GetModelManifest(req.model, manifest) || !manifest.IsActive())
         return configuredMin;
 
-    auto meg = BuildModelExecutionGraph(manifest);
+    bool collapseTitan = ShouldCollapseToTitanSingleNode(manifest, params);
+    auto meg = BuildModelExecutionGraph(manifest, collapseTitan);
     if (shardIndex >= meg.size())
         return configuredMin;
 
@@ -2110,7 +2115,8 @@ std::vector<OPoIShardPayment> GetShardPaymentsForBlock(const std::vector<CTransa
         CAmount shardShare = req.payment;
         ModelManifest manifest;
         if (g_opoiCache.GetModelManifest(req.model, manifest) && manifest.IsActive()) {
-            auto meg = BuildModelExecutionGraph(manifest);
+            bool collapseTitan = ShouldCollapseToTitanSingleNode(manifest, params);
+            auto meg = BuildModelExecutionGraph(manifest, collapseTitan);
             uint64_t totalWeight = 0, myWeight = 0;
             bool found = false;
             for (const auto& d : meg) {

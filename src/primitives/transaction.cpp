@@ -254,6 +254,7 @@ CMutableTransaction::CMutableTransaction(const CTransaction& tx) : nVersion(tx.n
                                                                    opoiModelTopKExperts(tx.opoiModelTopKExperts),
                                                                    opoiModelExpertPomRoots(tx.opoiModelExpertPomRoots),
                                                                    opoiModelMinRewardPerToken(tx.opoiModelMinRewardPerToken),
+                                                                   opoiModelTotalSizeBytes(tx.opoiModelTotalSizeBytes),
                                                                    opoiModelVoteApprove(tx.opoiModelVoteApprove),
                                                                    opoiShardIndex(tx.opoiShardIndex)
 {
@@ -301,7 +302,8 @@ CTransaction::CTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION
                                opoiAuditorCollateralIn(),
                                opoiModelArchType(0), opoiModelTotalParams(0), opoiModelActiveParamsPerToken(0),
                                opoiModelNumLayers(0), opoiModelNumDenseShards(0), opoiModelNumExperts(0), opoiModelTopKExperts(0),
-                               opoiModelExpertPomRoots(), opoiModelMinRewardPerToken(0), opoiModelVoteApprove(0),
+                               opoiModelExpertPomRoots(), opoiModelMinRewardPerToken(0), opoiModelTotalSizeBytes(0),
+                               opoiModelVoteApprove(0),
                                opoiShardIndex(0)  { }
 
 CTransaction::CTransaction(const CMutableTransaction &tx) : nVersion(tx.nVersion), fOverwintered(tx.fOverwintered), nVersionGroupId(tx.nVersionGroupId), nExpiryHeight(tx.nExpiryHeight),
@@ -355,6 +357,7 @@ CTransaction::CTransaction(const CMutableTransaction &tx) : nVersion(tx.nVersion
                                                             opoiModelTopKExperts(tx.opoiModelTopKExperts),
                                                             opoiModelExpertPomRoots(tx.opoiModelExpertPomRoots),
                                                             opoiModelMinRewardPerToken(tx.opoiModelMinRewardPerToken),
+                                                            opoiModelTotalSizeBytes(tx.opoiModelTotalSizeBytes),
                                                             opoiModelVoteApprove(tx.opoiModelVoteApprove),
                                                             opoiShardIndex(tx.opoiShardIndex)
 {
@@ -418,6 +421,7 @@ CTransaction::CTransaction(
                               opoiModelTopKExperts(tx.opoiModelTopKExperts),
                               opoiModelExpertPomRoots(tx.opoiModelExpertPomRoots),
                               opoiModelMinRewardPerToken(tx.opoiModelMinRewardPerToken),
+                              opoiModelTotalSizeBytes(tx.opoiModelTotalSizeBytes),
                               opoiModelVoteApprove(tx.opoiModelVoteApprove),
                               opoiShardIndex(tx.opoiShardIndex)
 {
@@ -478,6 +482,7 @@ CTransaction::CTransaction(CMutableTransaction &&tx) : nVersion(tx.nVersion), fO
                                                        opoiModelTopKExperts(tx.opoiModelTopKExperts),
                                                        opoiModelExpertPomRoots(std::move(tx.opoiModelExpertPomRoots)),
                                                        opoiModelMinRewardPerToken(tx.opoiModelMinRewardPerToken),
+                                                       opoiModelTotalSizeBytes(tx.opoiModelTotalSizeBytes),
                                                        opoiModelVoteApprove(tx.opoiModelVoteApprove),
                                                        opoiShardIndex(tx.opoiShardIndex)
 {
@@ -573,6 +578,7 @@ CTransaction& CTransaction::operator=(const CTransaction &tx) {
     *const_cast<uint32_t*>(&opoiModelTopKExperts) = tx.opoiModelTopKExperts;
     *const_cast<std::vector<uint256>*>(&opoiModelExpertPomRoots) = tx.opoiModelExpertPomRoots;
     *const_cast<CAmount*>(&opoiModelMinRewardPerToken) = tx.opoiModelMinRewardPerToken;
+    *const_cast<uint64_t*>(&opoiModelTotalSizeBytes) = tx.opoiModelTotalSizeBytes;
     *const_cast<uint8_t*>(&opoiModelVoteApprove) = tx.opoiModelVoteApprove;
     *const_cast<uint32_t*>(&opoiShardIndex) = tx.opoiShardIndex;
 

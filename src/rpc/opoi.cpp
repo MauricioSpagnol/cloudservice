@@ -133,6 +133,7 @@ static UniValue ModelManifestToUniValue(const ModelManifest& m)
     for (const auto& root : m.expertPomRoots) experts.push_back(root.GetHex());
     obj.pushKV("expert_pom_roots",        experts);
     obj.pushKV("min_reward_per_token",    ValueFromAmount(m.minRewardPerToken));
+    obj.pushKV("total_size_bytes",        (uint64_t)m.totalSizeBytes); // F9-G/F15-M
     obj.pushKV("proposer",                m.proposer);
     obj.pushKV("proposed_height",         (int)m.proposedHeight);
     obj.pushKV("vote_window_end_height",  (int)m.voteWindowEndHeight);
@@ -968,7 +969,9 @@ UniValue stakeopoi(const UniValue& params, bool fHelp)
             "                       e.g. \"GEMMA_3_4B\" — F15-H peer discovery (model_fetch)\n"
             "                       filters candidates by this field, so it must be set for a\n"
             "                       miner to be found as a P2P source for that model_id.\n"
-            "7. tier                (numeric, optional) F9-B: 0/1/2/3\n"
+            "7. tier                (numeric, optional) F9-B/F9-G: 0=light/1=default/2=high/\n"
+            "                       3=veryhigh/4=titan. Purely self-declared (no hardware\n"
+            "                       verification exists for ANY tier, 0-3 included).\n"
             "8. pom_root            (string, optional) F9-B: Merkle root of the GGUF this miner\n"
             "                       proved hosting via Proof-of-Model. Not consensus-enforced\n"
             "                       against anything yet (recorded only).\n"
@@ -1572,6 +1575,9 @@ UniValue registermodelopoi(const UniValue& params, bool fHelp)
             "     \"backbone_pom_root\": \"<hex64>\",     (string, required)\n"
             "     \"expert_pom_roots\": [\"<hex64>\",...], (array, required if MOE/HYBRID)\n"
             "     \"min_reward_per_token\": 0.001       (numeric, optional, default 0)\n"
+            "     \"total_size_bytes\": 3300000000     (numeric, optional, default 0 — F9-G/F15-M:\n"
+            "                       total on-disk size of the model's weights; only input to the\n"
+            "                       titan MoE-offload single-node routing preference, see F15-M)\n"
             "   }\n"
             "2. proposer_address  (string, required) Must be an ACTIVE OPoI staker\n"
             "\nResult:\n"
@@ -1648,6 +1654,9 @@ UniValue registermodelopoi(const UniValue& params, bool fHelp)
     UniValue uvMinReward = find_value(manifest, "min_reward_per_token");
     CAmount minRewardPerToken = uvMinReward.isNull() ? 0 : AmountFromValue(uvMinReward);
 
+    UniValue uvTotalSizeBytes = find_value(manifest, "total_size_bytes");
+    uint64_t totalSizeBytes = uvTotalSizeBytes.isNull() ? 0 : (uint64_t)uvTotalSizeBytes.get_int64();
+
     CMutableTransaction mutTx;
     mutTx.nVersion                       = OPOI_TX_VERSION;
     mutTx.nType                          = OPOI_MODEL_REGISTER_TX_TYPE;
@@ -1663,6 +1672,7 @@ UniValue registermodelopoi(const UniValue& params, bool fHelp)
     mutTx.opoiPomRoot                    = backboneRoot;
     mutTx.opoiModelExpertPomRoots        = expertRoots;
     mutTx.opoiModelMinRewardPerToken     = minRewardPerToken;
+    mutTx.opoiModelTotalSizeBytes        = totalSizeBytes;
     mutTx.opoiSigTime                    = (uint32_t)GetTime();
 
     std::string sigMsg = modelId + proposerAddr + strprintf("%d", (int)archType) + backboneRoot.GetHex();
@@ -1825,8 +1835,13 @@ UniValue getmodelgraph(const UniValue& params, bool fHelp)
     if (!g_opoiCache.GetModelManifest(params[0].get_str(), m))
         throw std::runtime_error("Model manifest not found for: " + params[0].get_str());
 
+    // F9-G/F15-M: titan single-node routing preference — same check used by
+    // every consensus call site (opoi.cpp), so this RPC's view of the MEG
+    // always matches what actually gets validated/paid.
+    bool collapseTitan = ShouldCollapseToTitanSingleNode(m, Params().GetConsensus());
+
     UniValue shards(UniValue::VARR);
-    for (const auto& d : BuildModelExecutionGraph(m)) {
+    for (const auto& d : BuildModelExecutionGraph(m, collapseTitan)) {
         UniValue s(UniValue::VOBJ);
         s.pushKV("shard_index", (int)d.shardIndex);
         s.pushKV("shard_type",  d.shardType == OPOI_SHARD_DENSE ? "DENSE" : "EXPERT");
@@ -1842,6 +1857,7 @@ UniValue getmodelgraph(const UniValue& params, bool fHelp)
     UniValue ret(UniValue::VOBJ);
     ret.pushKV("model_id",           m.modelId);
     ret.pushKV("shard_topology_hash",m.shardTopologyHash.GetHex());
+    ret.pushKV("titan_single_node",  collapseTitan); // F9-G/F15-M
     ret.pushKV("shards",             shards);
     return ret;
 }
