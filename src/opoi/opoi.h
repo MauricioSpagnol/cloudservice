@@ -220,6 +220,14 @@ struct OPoIStake {
     uint32_t    responsesSlashed;
     // F9-F: Canary audit tracking
     uint8_t     canaryStrikes;    // strikes from failed canary audits (3 = suspended)
+    // F9-F: periodic, protocol-driven canary obligation (ProcessCanaryAudits
+    // in opoi.cpp) — block height by which this staker must get a genuine
+    // canary REQUEST+RESPONSE resolved PASS, once deterministically selected
+    // "on the hook". 0 = no active obligation. Cleared on PASS or on a FAIL
+    // (either already gives a strike via ProcessAuditorVerifications), and
+    // by ProcessCanaryAudits itself (with a strike) if the deadline passes
+    // unresolved — see either site for the full rationale.
+    uint32_t    canaryObligationDeadline;
     // F10-D: pubkey recovered from the STAKE tx signature — needed for VRF
     // eligibility verification (VRF needs the actual point, not just its hash).
     CPubKey     minerPubKey;
@@ -237,7 +245,8 @@ struct OPoIStake {
         READWRITE(blockHeight); READWRITE(lastRenewalHeight); READWRITE(sigTime); READWRITE(txHash);
         READWRITE(stakeStatus); READWRITE(unstakeHeight); READWRITE(unstakeTxHash);
         READWRITE(responsesTotal); READWRITE(responsesChallenged); READWRITE(responsesSlashed);
-        READWRITE(canaryStrikes); READWRITE(minerPubKey); READWRITE(hostedExpertIds);
+        READWRITE(canaryStrikes); READWRITE(canaryObligationDeadline);
+        READWRITE(minerPubKey); READWRITE(hostedExpertIds);
         READWRITE(endpoint);
     }
 
@@ -251,13 +260,15 @@ struct OPoIStake {
         blockHeight = 0; lastRenewalHeight = 0; sigTime = 0; txHash.SetNull();
         stakeStatus = OPOI_STAKE_ACTIVE; unstakeHeight = 0; unstakeTxHash.SetNull();
         responsesTotal = 0; responsesChallenged = 0; responsesSlashed = 0;
-        canaryStrikes = 0; minerPubKey = CPubKey();
+        canaryStrikes = 0; canaryObligationDeadline = 0; minerPubKey = CPubKey();
     }
     bool IsNull()      const { return minerAddress.empty(); }
     bool IsActive()    const { return stakeStatus == OPOI_STAKE_ACTIVE; }
     bool IsUnstaking() const { return stakeStatus == OPOI_STAKE_UNSTAKING; }
     bool IsSlashed()   const { return stakeStatus == OPOI_STAKE_SLASHED; }
     bool IsSuspended() const { return stakeStatus == OPOI_STAKE_SUSPENDED; }
+    // F9-F: true while a periodic canary obligation is outstanding.
+    bool HasCanaryObligation() const { return canaryObligationDeadline != 0; }
 
     // F10-C: Compute reputation score 0-100
     int ReputationScore() const {
@@ -1393,6 +1404,20 @@ void ProcessResponseCommitWindows(uint32_t blockHeight, const Consensus::Params&
 // STAKE, if never renewed) without a RENEW tx. Recoverable at any time via
 // RENEW (see ProcessOPoITransaction), never slashed.
 void ProcessStakeRenewals(uint32_t blockHeight, const Consensus::Params& params);
+
+// F9-F: called from ConnectBlock (and RebuildOPoICache replay), same
+// convention as ProcessStakeRenewals above. Every nOPoICanaryAuditFrequency
+// blocks, deterministically selects one currently-ACTIVE staker to be "on
+// the hook" for a genuine canary REQUEST+RESPONSE(PASS) within
+// nOPoICanaryResponseWindow blocks (see canaryObligationDeadline on
+// OPoIStake) — and, in the same call, strikes any staker whose previous
+// obligation's deadline already passed unresolved (mirrors the FAIL-strike
+// ProcessAuditorVerifications already applies for a manually-submitted
+// canary, same OPOI_MAX_CANARY_STRIKES suspend threshold). Selection is a
+// pure function of blockHeight and the (already address-sorted, since
+// mapStakes is a std::map<std::string,...>) set of ACTIVE stakers — no
+// blockhash/wall-clock/randomness involved, so every node's view agrees.
+void ProcessCanaryAudits(uint32_t blockHeight, const Consensus::Params& params);
 
 // Called from ConnectBlock to verify OPoI miner payments in the coinbase tx.
 // For each RESPONSE tx in the block, verifies the coinbase has an output paying

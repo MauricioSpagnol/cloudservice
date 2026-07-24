@@ -196,6 +196,18 @@ public:
         // F9-E — periodic stake renewal (liveness proof, no slash on expiry)
         consensus.nOPoIStakeRenewalBlocks   = 20160;        // ~6 days at 25s/block
 
+        // F9-F — canary audit obligation (periodic, protocol-driven)
+        // Bug caught live in regtest testing (2026-07-24): the window must
+        // comfortably exceed nOPoIResponseCommitWindowBlocks (144 on mainnet)
+        // — a canary RESPONSE goes through the SAME commit-reveal cycle as
+        // any other RESPONSE (F10-B), so a window <= the commit window would
+        // make it mathematically impossible to ever land a REVEAL, let alone
+        // the AUDITOR_VERIFY + resolution after it, before the deadline. 200
+        // leaves ~56 blocks of headroom after the 144-block commit window
+        // closes for REVEAL + AUDITOR_VERIFY + resolution to land.
+        consensus.nOPoICanaryAuditFrequency = 1000;         // ~7 hours at 25s/block
+        consensus.nOPoICanaryResponseWindow = 200;          // ~83 minutes to PASS once on the hook
+
         // F11-A — REQUEST budget floor scaled by declared prompt size
         consensus.nOPoIFeeBase              = 100000;       // 0.001 CS
         consensus.nOPoIFeePerToken          = 10000;        // 0.0001 CS per estimated prompt token
@@ -404,6 +416,10 @@ public:
         // F9-E — periodic stake renewal (liveness proof, no slash on expiry)
         consensus.nOPoIStakeRenewalBlocks   = 200;          // ~83 minutes on testnet
 
+        // F9-F — canary audit obligation (periodic, protocol-driven; testnet — shorter cycle)
+        consensus.nOPoICanaryAuditFrequency = 500;          // ~3.5 hours on testnet
+        consensus.nOPoICanaryResponseWindow = 60;           // ~25 minutes to PASS once on the hook
+
         // F11-A — REQUEST budget floor scaled by declared prompt size
         consensus.nOPoIFeeBase              = 100000;       // 0.001 CS
         consensus.nOPoIFeePerToken          = 10000;        // 0.0001 CS per estimated prompt token
@@ -590,6 +606,13 @@ public:
 
         // F9-E — periodic stake renewal (regtest — fast, easy to cross with `generate`)
         consensus.nOPoIStakeRenewalBlocks   = 10;
+
+        // F9-F — canary audit obligation (regtest — fast, easy to cross with `generate`)
+        // Must clear nOPoIResponseCommitWindowBlocks (3) with real margin for
+        // REVEAL + AUDITOR_VERIFY + resolution to land afterward — see the
+        // mainnet/testnet comment above for the live bug this was caught by.
+        consensus.nOPoICanaryAuditFrequency = 14;
+        consensus.nOPoICanaryResponseWindow = 12;
 
         // F11-A — REQUEST budget floor scaled by declared prompt size (regtest — cheap)
         consensus.nOPoIFeeBase              = 10000;

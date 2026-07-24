@@ -4040,6 +4040,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         g_opoiCache.PruneExpiredPendingDeliveries();
         ProcessResponseCommitWindows((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessStakeRenewals((uint32_t)pindex->nHeight, chainparams.GetConsensus());
+        ProcessCanaryAudits((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessModelVotingWindows((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessShardPayments(block.vtx, chainparams.GetConsensus());
         ProcessVerifiableResponsePayments(block.vtx, chainparams.GetConsensus());

@@ -926,6 +926,8 @@ static UniValue OPoIStakeToUniValue(const OPoIStake& s)
     // F9-E/F9-F: renewal + canary-strike visibility
     obj.pushKV("last_renewal_height",   (int)s.lastRenewalHeight);
     obj.pushKV("canary_strikes",        (int)s.canaryStrikes);
+    // F9-F: periodic, protocol-driven canary obligation (see getcanaryobligation)
+    obj.pushKV("canary_obligation_deadline", (int)s.canaryObligationDeadline);
     return obj;
 }
 
@@ -1436,6 +1438,49 @@ UniValue getopoistake(const UniValue& params, bool fHelp)
     if (!g_opoiCache.GetStake(params[0].get_str(), stake))
         throw std::runtime_error("OPoI stake not found for: " + params[0].get_str());
     return OPoIStakeToUniValue(stake);
+}
+
+// ── getcanaryobligation (F9-F) ─────────────────────────────────────────────────
+//
+// Lets miner-side software discover it's "on the hook" for the periodic,
+// protocol-driven canary audit (ProcessCanaryAudits in opoi.cpp) without
+// needing any out-of-band signal — poll this for your own staked address(es)
+// each block/cycle. Distinct from the older, manually-triggered canary path
+// (submitopoirequest ... is_canary=true), which still works independently of
+// whether an obligation is outstanding.
+
+UniValue getcanaryobligation(const UniValue& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw std::runtime_error(
+            "getcanaryobligation \"miner_address\"\n"
+            "\nF9-F: check whether a staked miner is currently \"on the hook\" for the\n"
+            "periodic canary audit obligation, and if so, by which block height they\n"
+            "must get a genuine canary REQUEST+RESPONSE resolved PASS.\n"
+            "\nArguments:\n"
+            "1. miner_address  (string, required)\n"
+            "\nResult:\n"
+            "{\n"
+            "  \"miner_address\": \"...\",\n"
+            "  \"has_obligation\": true|false,\n"
+            "  \"deadline_height\": n,     (0 if has_obligation is false)\n"
+            "  \"current_height\": n\n"
+            "}\n"
+            "\nExamples:\n"
+            + HelpExampleCli("getcanaryobligation", "\"t1MinerAddr...\"")
+            + HelpExampleRpc("getcanaryobligation", "\"t1MinerAddr...\"")
+        );
+
+    OPoIStake stake;
+    if (!g_opoiCache.GetStake(params[0].get_str(), stake))
+        throw std::runtime_error("OPoI stake not found for: " + params[0].get_str());
+
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("miner_address",    stake.minerAddress);
+    obj.pushKV("has_obligation",   stake.HasCanaryObligation());
+    obj.pushKV("deadline_height",  (int)stake.canaryObligationDeadline);
+    obj.pushKV("current_height",   chainActive.Height());
+    return obj;
 }
 
 // ── listopoichallenges ────────────────────────────────────────────────────────
@@ -2598,6 +2643,7 @@ static const CRPCCommand commands[] =
     { "opoi",   "revealchallenge",    &revealchallenge,     false },
     { "opoi",   "listopoistakes",     &listopoistakes,      false },
     { "opoi",   "getopoistake",       &getopoistake,        false },
+    { "opoi",   "getcanaryobligation", &getcanaryobligation, false },
     { "opoi",   "listopoichallenges", &listopoichallenges,  false },
     // F15-A/A2 — Model Manifest governance
     { "opoi",   "registermodelopoi",  &registermodelopoi,   false },

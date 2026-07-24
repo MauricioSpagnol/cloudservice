@@ -233,6 +233,22 @@ struct Params {
      *  RENEW tx, never slashed (0 = disabled). **/
     int         nOPoIStakeRenewalBlocks     = 0;
 
+    /** F9-F — canary audit obligation: the periodic, protocol-driven half of
+     *  canary auditing. Canary-marked REQUEST/RESPONSE validation and the
+     *  strike-on-FAIL mechanism (canaryStrikes on OPoIStake) already exist
+     *  and work today, but only when SOMEONE manually submits a canary
+     *  REQUEST via submitopoirequest is_canary=true — nothing forced one to
+     *  ever exist. This closes that gap: every nOPoICanaryAuditFrequency
+     *  blocks, ProcessCanaryAudits (opoi.cpp) deterministically selects one
+     *  currently-ACTIVE staker to be "on the hook" — they must get a real
+     *  canary REQUEST+RESPONSE(PASS) resolved within the next
+     *  nOPoICanaryResponseWindow blocks (canaryObligationDeadline on
+     *  OPoIStake) or take a strike, same OPOI_MAX_CANARY_STRIKES suspend
+     *  threshold the manual path already uses. 0 = disabled (manual canary
+     *  audits still work independently either way). **/
+    int         nOPoICanaryAuditFrequency  = 0;
+    int         nOPoICanaryResponseWindow  = 0;
+
     /** F11-A — minimum REQUEST budget (opoiPayment), scaled by the
      *  requester's own declared prompt size (opoiPromptTokenCount):
      *  min(payment) = nOPoIFeeBase + promptTokenCount * nOPoIFeePerToken.

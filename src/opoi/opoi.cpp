@@ -534,6 +534,7 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         stake.responsesChallenged  = 0;
         stake.responsesSlashed     = 0;
         stake.canaryStrikes        = 0;
+        stake.canaryObligationDeadline = 0;
         // F10-D: recover the signer's pubkey so VRF eligibility can be verified later.
         // (Same sigMsg formula CheckOPoITransaction uses to verify this STAKE's signature.)
         {
@@ -758,6 +759,7 @@ void RebuildOPoICache()
                 ProcessExpiredRequests((uint32_t)pindex->nHeight, params);
                 ProcessResponseCommitWindows((uint32_t)pindex->nHeight, params);
                 ProcessStakeRenewals((uint32_t)pindex->nHeight, params);
+                ProcessCanaryAudits((uint32_t)pindex->nHeight, params);
                 ProcessModelVotingWindows((uint32_t)pindex->nHeight, params);
                 ProcessShardPayments(block.vtx, params);
                 ProcessVerifiableResponsePayments(block.vtx, params);
@@ -928,6 +930,69 @@ void ProcessStakeRenewals(uint32_t blockHeight, const Consensus::Params& params)
         LogPrintf("OPoI: stake renewal overdue for %s at height %u — suspended until RENEW\n",
                   stake.minerAddress, blockHeight);
     }
+}
+
+// ── ProcessCanaryAudits (F9-F) ─────────────────────────────────────────────────
+//
+// Called from ConnectBlock (and RebuildOPoICache replay), same convention as
+// ProcessStakeRenewals above. Two sweeps over mapStakes in a fixed order —
+// expire-then-select — so a stake's own obligation from a PREVIOUS cycle is
+// always resolved (strike, if missed) before it could ever be picked for a
+// NEW one in this same call:
+//
+//   1. Expire: any stake whose canaryObligationDeadline is set and has now
+//      passed gets a canary strike here — exactly the same
+//      OPOI_MAX_CANARY_STRIKES-suspends-the-stake behavior a manually-
+//      triggered FAIL already produces in ProcessAuditorVerifications (which
+//      is also what clears canaryObligationDeadline on a PASS, or on a FAIL
+//      that lands before this sweep ever sees the deadline pass — so a
+//      resolved obligation, either way, never double-strikes here).
+//   2. Select: every nOPoICanaryAuditFrequency blocks, deterministically
+//      pick ONE currently-ACTIVE staker to be "on the hook" until
+//      blockHeight + nOPoICanaryResponseWindow. mapStakes is a
+//      std::map<std::string, OPoIStake> — already ordered by address
+//      string — so collecting ACTIVE addresses by iterating it in place
+//      gives the same stable order the design calls for, with no separate
+//      sort step; index = (blockHeight / frequency) % activeCount is a pure
+//      function of blockHeight and that ordered set, deliberately NOT
+//      blockhash/wall-clock/random-based, so every node's view of the chain
+//      always agrees on who's on the hook.
+//
+// One-directional like ProcessStakeRenewals/ProcessExpiredRequests: not
+// reversed on reorg (same accepted v1 gap, documented there too).
+void ProcessCanaryAudits(uint32_t blockHeight, const Consensus::Params& params)
+{
+    if (params.nOPoICanaryAuditFrequency <= 0) return;
+    LOCK(g_opoiCache.cs);
+
+    // 1. Strike any obligation whose deadline has already passed unresolved.
+    for (auto& kv : g_opoiCache.mapStakes) {
+        OPoIStake& stake = kv.second;
+        if (stake.canaryObligationDeadline == 0) continue;
+        if (blockHeight <= stake.canaryObligationDeadline) continue;
+        stake.canaryObligationDeadline = 0;
+        ++stake.canaryStrikes;
+        bool suspend = stake.canaryStrikes >= OPOI_MAX_CANARY_STRIKES && stake.IsActive();
+        if (suspend) stake.stakeStatus = OPOI_STAKE_SUSPENDED;
+        LogPrintf("OPoI: canary obligation MISSED for %s at height %u — strike #%u%s\n",
+                  stake.minerAddress, blockHeight, (unsigned)stake.canaryStrikes,
+                  suspend ? " — stake SUSPENDED (3 strikes)" : "");
+    }
+
+    // 2. Select this cycle's obligated staker, deterministically.
+    if ((uint32_t)blockHeight % (uint32_t)params.nOPoICanaryAuditFrequency != 0) return;
+
+    std::vector<std::string> activeAddrs;
+    for (const auto& kv : g_opoiCache.mapStakes)
+        if (kv.second.IsActive()) activeAddrs.push_back(kv.first);
+    if (activeAddrs.empty()) return;
+
+    size_t idx = (size_t)((blockHeight / (uint32_t)params.nOPoICanaryAuditFrequency) % activeAddrs.size());
+    const std::string& chosen = activeAddrs[idx];
+    OPoIStake& stake = g_opoiCache.mapStakes[chosen];
+    stake.canaryObligationDeadline = blockHeight + (uint32_t)std::max(1, params.nOPoICanaryResponseWindow);
+    LogPrintf("OPoI: canary obligation ASSIGNED to %s at height %u — must PASS a canary by height %u\n",
+              chosen, blockHeight, stake.canaryObligationDeadline);
 }
 
 // ── ProcessModelVotingWindows (F15-A2) ────────────────────────────────────────
@@ -2270,6 +2335,17 @@ void ProcessAuditorVerifications(uint32_t blockHeight, const Consensus::Params& 
         // v1 gap, same class already accepted just above for the
         // minority-Auditor unlock: not reversed on a reorg deep enough to
         // disconnect past this resolution.
+        //
+        // F9-F (periodic obligation): whichever way a canary resolves here —
+        // FAIL or PASS — it must also clear canaryObligationDeadline if the
+        // responding miner currently has one outstanding. A FAIL already
+        // strikes right here, so leaving the deadline set would let
+        // ProcessCanaryAudits strike the SAME cycle a second time once the
+        // deadline passes; a PASS is exactly what discharges the obligation
+        // in the first place (see the doc's TESTE F9-F, passo 5). A canary
+        // resolving for a miner with NO outstanding obligation (the older,
+        // manually-triggered path, unrelated to any periodic cycle) simply
+        // finds canaryObligationDeadline already 0 — a harmless no-op either way.
         if (majority == AUDITOR_VERIFY_FAIL) {
             OPoIRequest req;
             if (g_opoiCache.GetRequest(requestId, req) && req.isCanary) {
@@ -2278,12 +2354,26 @@ void ProcessAuditorVerifications(uint32_t blockHeight, const Consensus::Params& 
                     auto stakeIt = g_opoiCache.mapStakes.find(respIt->second.minerAddress);
                     if (stakeIt != g_opoiCache.mapStakes.end()) {
                         ++stakeIt->second.canaryStrikes;
+                        stakeIt->second.canaryObligationDeadline = 0;
                         bool suspend = stakeIt->second.canaryStrikes >= OPOI_MAX_CANARY_STRIKES
                                     && stakeIt->second.IsActive();
                         if (suspend) stakeIt->second.stakeStatus = OPOI_STAKE_SUSPENDED;
                         LogPrintf("OPoI: canary strike #%u for %s at height %u%s\n",
                                   (unsigned)stakeIt->second.canaryStrikes, respIt->second.minerAddress,
                                   blockHeight, suspend ? " — stake SUSPENDED (3 strikes)" : "");
+                    }
+                }
+            }
+        } else if (majority == AUDITOR_VERIFY_PASS) {
+            OPoIRequest req;
+            if (g_opoiCache.GetRequest(requestId, req) && req.isCanary) {
+                auto respIt = g_opoiCache.mapResponses.find(requestId);
+                if (respIt != g_opoiCache.mapResponses.end()) {
+                    auto stakeIt = g_opoiCache.mapStakes.find(respIt->second.minerAddress);
+                    if (stakeIt != g_opoiCache.mapStakes.end() && stakeIt->second.HasCanaryObligation()) {
+                        stakeIt->second.canaryObligationDeadline = 0;
+                        LogPrintf("OPoI: canary obligation CLEARED for %s at height %u (PASS)\n",
+                                  respIt->second.minerAddress, blockHeight);
                     }
                 }
             }
