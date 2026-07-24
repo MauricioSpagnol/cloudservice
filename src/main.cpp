@@ -3438,6 +3438,37 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
 {
     AssertLockHeld(cs_main);
 
+    // OPoI: unlike the UTXO set (sandboxed via the local CCoinsViewCache `view`,
+    // only Flush()'d into the real chainstate once the caller sees this function
+    // return true), g_opoiCache is a global singleton that ProcessOPoITransaction's
+    // apply path mutates directly and immediately, tx by tx, as the loop below
+    // runs. If this call ultimately fails partway through — an OPoI tx's own later
+    // validation (e.g. the STAKE min-collateral/spent check further down), or a
+    // completely unrelated later tx/block-level check (script verification queued
+    // via control.Wait(), the coinbase-value check, etc.) — the block never
+    // actually connects, and DisconnectBlock/ProcessOPoITransaction's undo path
+    // never runs for it either (undo only ever fires for a block that DID connect
+    // and was LATER disconnected). Without this guard, every OPoI tx already
+    // applied earlier in this same call stays permanently and silently stuck in
+    // the global cache — e.g. a STAKE whose own collateral lock happened, then a
+    // later tx/check in the same block failed, leaving that stake ACTIVE and its
+    // collateral UTXO locked forever even though the block was rejected. This
+    // mirrors ProcessOPoITransaction's own fUndo=true branch (the same one
+    // DisconnectBlock uses) against whatever was applied so far, the moment this
+    // function is about to return without having reached the very end.
+    std::vector<CTransaction> vAppliedOPoITxs;
+    bool fOPoIConnectCommitted = false;
+    struct OPoIConnectGuard {
+        std::vector<CTransaction>& v;
+        bool& fCommitted;
+        uint32_t nHeight;
+        ~OPoIConnectGuard() {
+            if (fCommitted) return;
+            for (auto it = v.rbegin(); it != v.rend(); ++it)
+                ProcessOPoITransaction(*it, nHeight, /*fUndo=*/true);
+        }
+    } opoiConnectGuard{vAppliedOPoITxs, fOPoIConnectCommitted, (uint32_t)pindex->nHeight};
+
     // Special case for the genesis block: skip all validation (coinbase is pre-Overwinter
     // and unspendable). Must come before CheckBlock to avoid coinbase-script-size rejection.
     // Also set upgrade flags so RewindBlockIndex considers genesis sufficiently validated.
@@ -3691,8 +3722,12 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                 ProcessCSAppTransaction(tx, (uint32_t)pindex->nHeight);
 
             // Process OPoI transactions — only on real connect, not TestBlockValidity or VerifyDB
-            if (!fJustCheck && !fIsVerifying && tx.IsOPoITx())
+            if (!fJustCheck && !fIsVerifying && tx.IsOPoITx()) {
                 ProcessOPoITransaction(tx, (uint32_t)pindex->nHeight, /*fUndo=*/false, &chainparams.GetConsensus());
+                // Tracked so opoiConnectGuard can undo it if this ConnectBlock call
+                // ends up failing later (see guard comment above).
+                vAppliedOPoITxs.push_back(tx);
+            }
             if (!view.HaveShieldedRequirements(tx))
                 return state.DoS(100, error("ConnectBlock(): JoinSplit requirements not met"),
                                  REJECT_INVALID, "bad-txns-joinsplit-requirements-not-met");
@@ -3746,16 +3781,31 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             CCoins coins;
             if (!view.GetCoins(tx.opoiCollateralIn.hash, coins) ||
                 tx.opoiCollateralIn.n >= coins.vout.size() ||
-                coins.vout[tx.opoiCollateralIn.n].IsNull())
+                coins.vout[tx.opoiCollateralIn.n].IsNull()) {
+                // Unlike a CheckOPoITransaction() rejection (caught by
+                // CreateNewBlock()'s dry-run TestBlockValidity, and evicted from
+                // the mempool by miner.cpp's self-heal path), this check only
+                // runs on a REAL connect (!fJustCheck) — so a STAKE tx whose
+                // collateral gets spent by something else after it entered the
+                // mempool sails through the dry-run every time, gets mined for
+                // real (burning actual PoW), and only fails here. Without
+                // marking it, this exact tx would keep getting selected and
+                // keep burning a full mining cycle on every subsequent attempt,
+                // forever — ConnectTip() evicts it once tagged here, mirroring
+                // what miner.cpp already does for the dry-run case.
+                state.SetInvalidTx(tx);
                 return state.DoS(100, error("ConnectBlock(): STAKE collateral UTXO %s:%u not found or spent",
                                             tx.opoiCollateralIn.hash.GetHex(), tx.opoiCollateralIn.n),
                                  REJECT_INVALID, "bad-txns-opoi-stake-no-utxo");
-            if (coins.vout[tx.opoiCollateralIn.n].nValue < chainparams.GetConsensus().nOPoIMinStake)
+            }
+            if (coins.vout[tx.opoiCollateralIn.n].nValue < chainparams.GetConsensus().nOPoIMinStake) {
+                state.SetInvalidTx(tx);
                 return state.DoS(100, error("ConnectBlock(): STAKE collateral %s:%u value %s < minStake %s",
                                             tx.opoiCollateralIn.hash.GetHex(), tx.opoiCollateralIn.n,
                                             FormatMoney(coins.vout[tx.opoiCollateralIn.n].nValue),
                                             FormatMoney(chainparams.GetConsensus().nOPoIMinStake)),
                                  REJECT_INVALID, "bad-txns-opoi-stake-amount-too-low");
+            }
         }
 
         txdata.emplace_back(tx);
@@ -3868,6 +3918,12 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
 
     if (fJustCheck)
         return true;
+
+    // Past this point nothing left in this function can reject the block itself
+    // (only unrecoverable disk/I/O failures, already handled the same way the
+    // UTXO set itself is — no rollback attempted) — so any OPoI txs applied above
+    // are here to stay. See opoiConnectGuard above.
+    fOPoIConnectCommitted = true;
 
     // Write undo information to disk
     if (pindex->GetUndoPos().IsNull() || !pindex->IsValid(BLOCK_VALID_SCRIPTS))
@@ -4280,6 +4336,23 @@ bool static ConnectTip(CValidationState& state, const CChainParams& chainparams,
         if (!rv) {
             if (state.IsInvalid())
                 InvalidBlockFound(pindexNew, state, chainparams);
+            // Mirrors miner.cpp's CreateNewBlock() self-heal: some OPoI checks
+            // (e.g. a STAKE tx whose collateral gets spent by something else
+            // after entering the mempool) can only be caught here, on a REAL
+            // connect — CreateNewBlock()'s dry-run TestBlockValidity() skips
+            // them (fJustCheck), so the offending tx sails through every
+            // candidate build, gets mined for real, and fails only at this
+            // point. Without evicting it here, it would keep getting selected
+            // and keep burning a full real mining cycle on every subsequent
+            // attempt, forever, since nothing else ever removes it from the
+            // mempool. ConnectBlock() tags the culprit via SetInvalidTx() when
+            // it identifies one; evict it now that this real connect failed.
+            if (state.IsInvalidTx()) {
+                LogPrintf("Removing transaction from mempool that caused a mined block to fail ConnectBlock(). %s\n",
+                          state.GetInvalidTx().GetHash().GetHex());
+                std::list<CTransaction> removed;
+                mempool.remove(state.GetInvalidTx(), removed, false);
+            }
             return error("ConnectTip(): ConnectBlock %s failed", pindexNew->GetBlockHash().ToString());
         }
         mapBlockSource.erase(pindexNew->GetBlockHash());
