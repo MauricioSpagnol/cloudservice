@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <string>
+#include <utility>
 #include <vector>
 #include "uint256.h"
 #include "hash.h"
@@ -43,41 +44,75 @@ struct ShardDescriptor {
 // Splits numLayers as evenly as possible across numDenseShards stages.
 // e.g. numLayers=56, numDenseShards=4 -> [0,14) [14,28) [28,42) [42,56)
 //      numLayers=10, numDenseShards=3 -> [0,4) [4,7) [7,10)  (remainder to earlier shards)
+static inline std::vector<std::pair<uint32_t, uint32_t>> SplitLayerRanges(uint32_t numLayers,
+                                                                           uint32_t numShards)
+{
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    if (numShards == 0) return ranges;
+    ranges.reserve(numShards);
+    uint32_t base      = numLayers / numShards;
+    uint32_t remainder = numLayers % numShards;
+    uint32_t cursor    = 0;
+    for (uint32_t i = 0; i < numShards; i++) {
+        uint32_t size = base + (i < remainder ? 1 : 0); // distribute remainder to the first shards
+        ranges.push_back({cursor, cursor + size});
+        cursor += size;
+    }
+    return ranges;
+}
+
+// D2 (2026-07-26): MoE/HYBRID (m.IsMoE()) real per-(layer_range, expert_id)
+// dispatch. Earlier interim scope (B1, 2026-07-24/25) ran the ENTIRE MoE
+// model on one miner as a single DENSE-typed shard, because a static
+// per-expert shard node can only ever gate on a proxy for what the real
+// router picked (see the old SelectTopKExperts placeholder below) — no way
+// existed yet to verify a distributed per-expert split was honest. That gap
+// is closed by moving routing-choice verification OFF-CHAIN: an Auditor
+// replica re-runs its own router over the same input and checks the
+// primary's committed choice (routerLogitsHash) is within an acceptable
+// margin (routing-trace-pinned model — see CS COIN OPoI MELHOR
+// IMPLEMENTAÇÃO.txt, "ESCOPO DE IMPLEMENTAÇÃO DO D2"), the exact same
+// margin/quantization scheme already used for the B1/B3-lite dense path.
+// Disputes resolve via the existing AuditorVerification/
+// ComputeAuditorMajority majority mechanism (opoi.h ~604-631) — no new
+// on-chain consensus primitive was needed.
 //
-// MoE/HYBRID (m.IsMoE()): a real MoE forward pass routes per-layer, per-token
-// (see cs-miner's shard_model_moe.rs doc comment) — there is no way to split
-// that across network boundaries into "N dense shards + one shard per
-// expert" the way the DENSE case above does; a static per-expert shard node
-// can only ever gate on a proxy for what the real router picked (see the old
-// SelectTopKExperts placeholder below), never the real per-token decision.
-// Current scope (interim, until a real per-layer distributed MoE redesign):
-// one miner runs the ENTIRE MoE model — embedding through every layer's real
-// router+experts through the output — as a single DENSE-typed shard covering
-// [0, numLayers). numDenseShards/numExperts/topKExperts stay on the
-// manifest (still validated at MODEL_REGISTER) but are unused here; N-of-M
-// consensus over this one shard is the exact same mechanism a DENSE model's
-// shard already uses, so no new consensus code path was needed for this.
-// This does give up the "MoE hardware doesn't scale with total model size"
-// thesis for MoE specifically (a MoE checkpoint must now fit one miner) —
-// dense pipeline-parallelism above is unaffected and still delivers that for
-// dense architectures. SelectTopKExperts/OPOI_SHARD_EXPERT below are now
-// unreachable via this function (kept, not deleted: real, tested consensus
-// code a future per-layer MoE redesign would build on, not dead weight).
+// Layout: split numLayers into layer ranges exactly like the DENSE-only
+// branch below (a MoE model still runs attention/router/norms per layer
+// range as ordinary DENSE compute — only the FFN is expert-routed); then,
+// for each range in order, emit one EXPERT node per expert (0..numExperts)
+// scoped to that range. Dense shards are ordered first across all ranges
+// (matching ShardDescriptor's doc comment above), then experts grouped by
+// range in the same order as their enclosing dense shard. Total nodes =
+// numDenseShards + numDenseShards * numExperts.
+//
+// numDenseShards==0 is possible for a manifest registered before this
+// change (the field went unused for MoE previously) — treated as 1 range
+// covering the whole model rather than silently returning an empty graph,
+// so an old registration doesn't regress to "no shards at all".
+//
+// SelectTopKExperts/OPOI_SHARD_EXPERT below are no longer unreachable via
+// this function, but SelectTopKExperts itself is NOT called from
+// CheckOPoITransaction's EXPERT branch anymore (see opoi.cpp) — routing
+// selection is verified off-chain now, as above.
 // F9-G/F15-M: `collapseToTitanSingleNode` — computed by the caller via
 // opoi.h's ShouldCollapseToTitanSingleNode(manifest, params) — makes a DENSE
-// model with a real multi-shard split collapse to the same single
-// whole-model shard the MoE branch below already always uses, when a titan
-// host is preferred over a distributed constellation (see that function's
-// doc comment for the exact conditions and consensus-safety reasoning).
-// Default false keeps every existing call site's behavior byte-identical
-// unless it explicitly opts in.
+// model with a real multi-shard split collapse to a single whole-model
+// shard when a titan host is preferred over a distributed constellation
+// (see that function's doc comment for the exact conditions and
+// consensus-safety reasoning). ShouldCollapseToTitanSingleNode always
+// returns false for MoE/HYBRID manifests (archType != DENSE), so real call
+// sites never pass true for a MoE model — this parameter is honored as-is
+// (still collapses if a caller ever does) purely for parity with the DENSE
+// path. Default false keeps every existing call site's behavior
+// byte-identical unless it explicitly opts in.
 inline std::vector<ShardDescriptor> BuildModelExecutionGraph(const ModelManifest& m,
                                                               bool collapseToTitanSingleNode = false)
 {
     std::vector<ShardDescriptor> graph;
     if (m.numLayers == 0) return graph;
 
-    if (m.IsMoE() || collapseToTitanSingleNode) {
+    if (collapseToTitanSingleNode) {
         ShardDescriptor d;
         d.shardIndex = 0;
         d.shardType  = OPOI_SHARD_DENSE;
@@ -88,22 +123,63 @@ inline std::vector<ShardDescriptor> BuildModelExecutionGraph(const ModelManifest
         return graph;
     }
 
+    if (m.IsMoE()) {
+        uint32_t denseShards = (m.numDenseShards > 0) ? m.numDenseShards : 1;
+        auto ranges = SplitLayerRanges(m.numLayers, denseShards);
+
+        uint32_t shardIndex = 0;
+        for (uint32_t i = 0; i < denseShards; i++) {
+            ShardDescriptor d;
+            d.shardIndex = shardIndex++;
+            d.shardType  = OPOI_SHARD_DENSE;
+            d.layerStart = ranges[i].first;
+            d.layerEnd   = ranges[i].second;
+            d.expertId   = 0;
+            graph.push_back(d);
+        }
+        for (uint32_t i = 0; i < denseShards; i++) {
+            for (uint32_t e = 0; e < m.numExperts; e++) {
+                ShardDescriptor d;
+                d.shardIndex = shardIndex++;
+                d.shardType  = OPOI_SHARD_EXPERT;
+                d.layerStart = ranges[i].first;
+                d.layerEnd   = ranges[i].second;
+                d.expertId   = e;
+                graph.push_back(d);
+            }
+        }
+        return graph;
+    }
+
     if (m.numDenseShards == 0) return graph;
-    uint32_t base      = m.numLayers / m.numDenseShards;
-    uint32_t remainder = m.numLayers % m.numDenseShards;
-    uint32_t cursor    = 0;
+    auto ranges = SplitLayerRanges(m.numLayers, m.numDenseShards);
     for (uint32_t i = 0; i < m.numDenseShards; i++) {
-        uint32_t size = base + (i < remainder ? 1 : 0); // distribute remainder to the first shards
         ShardDescriptor d;
         d.shardIndex = i;
         d.shardType  = OPOI_SHARD_DENSE;
-        d.layerStart = cursor;
-        d.layerEnd   = cursor + size;
+        d.layerStart = ranges[i].first;
+        d.layerEnd   = ranges[i].second;
         d.expertId   = 0;
         graph.push_back(d);
-        cursor += size;
     }
     return graph;
+}
+
+// D2: defense-in-depth bounds check for an EXPERT ShardDescriptor against
+// its manifest. `d` is always derived straight from `m` by
+// BuildModelExecutionGraph above (expertId is always < m.numExperts,
+// layerStart/layerEnd always fall inside [0, m.numLayers) by construction),
+// so this should never fail in practice — but CheckOPoITransaction is
+// consensus-critical code, and it consumes `d` at a distance from where it
+// was built (via g_opoiCache.GetModelManifest + a freshly recomputed MEG),
+// so it re-validates the invariant explicitly here rather than silently
+// trusting it forever. Only meaningful for shardType == OPOI_SHARD_EXPERT.
+inline bool IsExpertShardWithinManifestBounds(const ShardDescriptor& d, const ModelManifest& m)
+{
+    if (d.expertId >= m.numExperts) return false;
+    if (d.layerEnd > m.numLayers) return false;
+    if (d.layerStart >= d.layerEnd) return false;
+    return true;
 }
 
 // Deterministic commitment to the graph shape. Any node with the same
@@ -119,22 +195,27 @@ inline uint256 ComputeShardTopologyHash(const ModelManifest& m)
 // F15-H (real MoE routing, first slice): deterministically selects which
 // `topK` of `numExperts` are "active" for a given (requestId, promptHash).
 //
-// Currently unreachable: BuildModelExecutionGraph no longer emits
-// OPOI_SHARD_EXPERT nodes (see its doc comment — MoE now runs whole-model on
-// one miner as a single DENSE-typed shard), so CheckOPoITransaction's
-// `d.shardType == OPOI_SHARD_EXPERT` branch below that calls this can never
-// trigger via that path. Left in place, not deleted: real, cross-verified
-// (Rust expert_router.rs) consensus code a future per-layer distributed MoE
-// redesign would need again, not unused debris from an abandoned attempt.
+// B2 investigation (2026-07-24, see CS COIN OPoI MELHOR IMPLEMENTAÇÃO.txt)
+// measured this hash-proxy's agreement with a real trained router at 7.2%
+// token/layer exact-match — WORSE than the 16.7% random baseline for that
+// experiment's (numExperts=4, topK=2) shape. It is not a usable stand-in for
+// real routing. D2 (2026-07-26) made BuildModelExecutionGraph emit real
+// OPOI_SHARD_EXPERT nodes again (see its doc comment), but deliberately does
+// NOT call this function from CheckOPoITransaction's EXPERT branch to gate
+// them — doing so would reject the overwhelming majority of legitimate
+// EXPERT submissions. Routing-choice correctness is now verified OFF-CHAIN
+// instead, by Auditor replicas re-running their own router and checking the
+// primary's committed choice (routerLogitsHash) is within an acceptable
+// margin (routing-trace-pinned model, same doc section); disputes resolve
+// via the existing AuditorVerification/ComputeAuditorMajority mechanism.
+// Left in place, not deleted: real, cross-verified (Rust expert_router.rs)
+// consensus code a future per-layer distributed MoE redesign might still
+// want, not unused debris from an abandoned attempt — just intentionally
+// uncalled from the consensus validation path today.
 //
 // This stands in for a real router (a DenseShard boundary computing actual
 // top-k logits over model weights) — no such runtime exists yet on either
-// side of this codebase. It is still consensus-relevant: every node MUST
-// compute the identical selection, because it gates which EXPERT shard
-// submissions are valid (see F15-E's hosting gate, extended here to also
-// require the expert be selected, not merely hosted). cs-miner mirrors this
-// exact algorithm in Rust (expert_router.rs) so it only attempts shards that
-// will actually be accepted.
+// side of this codebase.
 //
 // Algorithm: hash (requestId || promptHash || "EXPERT"+i) for each candidate
 // expert i, sort ascending by the raw 32-byte digest (plain lexicographic

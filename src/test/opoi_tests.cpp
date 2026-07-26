@@ -163,6 +163,27 @@ ModelManifest MakeDenseManifest(const std::string& modelId, uint32_t numLayers, 
     return m;
 }
 
+// D2 (2026-07-26): an ACTIVE MoE manifest — mirrors MakeDenseManifest above,
+// used by BuildModelExecutionGraph's decollapsed per-(layer_range,
+// expert_id) EXPERT node tests and by IsExpertShardWithinManifestBounds's
+// tests below.
+ModelManifest MakeMoeManifest(const std::string& modelId, uint32_t numLayers, uint32_t numDenseShards,
+                              uint32_t numExperts, uint32_t topKExperts)
+{
+    ModelManifest m;
+    m.SetNull();
+    m.modelId         = modelId;
+    m.archType        = OPOI_ARCH_MOE;
+    m.totalParams     = 1;
+    m.numLayers       = numLayers;
+    m.numDenseShards  = numDenseShards;
+    m.numExperts      = numExperts;
+    m.topKExperts     = topKExperts;
+    m.status          = OPOI_MODEL_STATUS_ACTIVE;
+    m.activationHeight = 1;
+    return m;
+}
+
 // A dummy, distinct-per-label collateral UTXO reference — real AuditorVerification
 // records always carry one (see ProcessOPoITransaction's AUDITOR_VERIFY apply
 // branch: fv.auditorCollateral = tx.opoiAuditorCollateralIn), and
@@ -384,6 +405,35 @@ BOOST_AUTO_TEST_CASE(shard_payments_weighted_multi_shard_matches_live_regtest_sc
     BOOST_CHECK_EQUAL(total, 9 * COIN); // exact, no rounding leakage
 }
 
+BOOST_AUTO_TEST_CASE(shard_payments_moe_expert_shard_resolves_and_pays)
+{
+    // D2 (2026-07-26) regression: GetShardPaymentsForBlock's weighted split
+    // (opoi.cpp: "w = shardType==DENSE ? layerEnd-layerStart : 1") must keep
+    // working now that BuildModelExecutionGraph actually reaches the
+    // OPOI_SHARD_EXPERT branch for a MoE manifest. 8 layers / 2 dense shards
+    // (weight 4 each) / 3 experts per range (weight 1 each) -> total weight
+    // 4+4+1*6 = 14. This resolves shardIndex 2 (the FIRST expert of the
+    // FIRST layer range, per meg_moe_emits_dense_shards_first_then_grouped_
+    // experts above) and checks it gets exactly its 1/14 share.
+    Consensus::Params params;
+    params.nOPoIShardMinSubmissions = 1;
+
+    const std::string reqId = "req-moe-expert";
+    g_opoiCache.AddRequest(MakeRequest(reqId, "MOE_8L_2S_3E_PAY", 14 * COIN));
+    g_opoiCache.AddModelManifest(MakeMoeManifest("MOE_8L_2S_3E_PAY", 8, 2, 3, 2));
+
+    std::vector<CTransaction> vtx;
+    vtx.push_back(MakeDummyCoinbase());
+    vtx.push_back(MakeShardResultTx(reqId, /*shardIndex=*/2, "expertHost1", HashOf("expert-out"), 0));
+
+    auto payments = GetShardPaymentsForBlock(vtx, params);
+    BOOST_REQUIRE_EQUAL(payments.size(), 1u);
+    BOOST_CHECK_EQUAL(payments[0].requestId, reqId);
+    BOOST_CHECK_EQUAL(payments[0].shardIndex, 2u);
+    BOOST_CHECK_EQUAL(payments[0].minerAddress, "expertHost1");
+    BOOST_CHECK_EQUAL(payments[0].amount, CAmount(14 * COIN / 14)); // weight 1 of 14
+}
+
 BOOST_AUTO_TEST_CASE(shard_payments_majority_vs_minority_same_shard)
 {
     // Standalone version of priority item 3: several miners submit for the
@@ -571,8 +621,12 @@ BOOST_AUTO_TEST_CASE(titan_collapse_requires_all_conditions)
 
     BOOST_CHECK(ShouldCollapseToTitanSingleNode(dense, params)); // now all conditions hold
 
-    // MoE never collapses via this path (opoi_shard.h already always
-    // collapses MoE to one shard) — must stay false regardless of staker/size.
+    // MoE never collapses via THIS path — ShouldCollapseToTitanSingleNode
+    // gates on archType == DENSE, so it stays false for MoE regardless of
+    // staker/size (D2, 2026-07-26: BuildModelExecutionGraph no longer
+    // collapses MoE to one shard either way — see its own tests below —
+    // but that's an orthogonal fact; this function's own DENSE-only gate is
+    // what's under test here).
     ModelManifest moe = dense;
     moe.archType = OPOI_ARCH_MOE;
     BOOST_CHECK(!ShouldCollapseToTitanSingleNode(moe, params));
@@ -596,6 +650,128 @@ BOOST_AUTO_TEST_CASE(titan_collapse_requires_all_conditions)
     Consensus::Params disabledParams;
     disabledParams.nOPoITitanOffloadThresholdGB = 0;
     BOOST_CHECK(!ShouldCollapseToTitanSingleNode(dense, disabledParams));
+}
+
+// ── BuildModelExecutionGraph — D2 MoE decollapse (2026-07-26) ─────────────
+// Real per-(layer_range, expert_id) EXPERT nodes, replacing the earlier B1
+// interim scope (single whole-model DENSE shard for any m.IsMoE()). See
+// opoi_shard.h's doc comment on BuildModelExecutionGraph for the full
+// rationale (off-chain Auditor verification makes this safe now).
+
+BOOST_AUTO_TEST_CASE(meg_moe_emits_dense_shards_first_then_grouped_experts)
+{
+    // 8 layers / 2 dense shards ([0,4) [4,8)), 3 experts each ->
+    // 2 DENSE + 2*3 EXPERT = 8 nodes total. Dense shards ordered first
+    // (shardIndex 0-1), then experts grouped by their enclosing layer
+    // range in order (shardIndex 2-4 -> range [0,4), 5-7 -> range [4,8)).
+    ModelManifest m = MakeMoeManifest("MOE_8L_2S_3E", /*numLayers=*/8, /*numDenseShards=*/2,
+                                      /*numExperts=*/3, /*topKExperts=*/2);
+    auto meg = BuildModelExecutionGraph(m);
+    BOOST_REQUIRE_EQUAL(meg.size(), 8u);
+
+    BOOST_CHECK_EQUAL((int)meg[0].shardType, (int)OPOI_SHARD_DENSE);
+    BOOST_CHECK_EQUAL(meg[0].layerStart, 0u); BOOST_CHECK_EQUAL(meg[0].layerEnd, 4u);
+    BOOST_CHECK_EQUAL((int)meg[1].shardType, (int)OPOI_SHARD_DENSE);
+    BOOST_CHECK_EQUAL(meg[1].layerStart, 4u); BOOST_CHECK_EQUAL(meg[1].layerEnd, 8u);
+
+    for (uint32_t i = 2; i <= 4; i++) {
+        BOOST_CHECK_EQUAL((int)meg[i].shardType, (int)OPOI_SHARD_EXPERT);
+        BOOST_CHECK_EQUAL(meg[i].layerStart, 0u); BOOST_CHECK_EQUAL(meg[i].layerEnd, 4u);
+        BOOST_CHECK_EQUAL(meg[i].expertId, i - 2);
+    }
+    for (uint32_t i = 5; i <= 7; i++) {
+        BOOST_CHECK_EQUAL((int)meg[i].shardType, (int)OPOI_SHARD_EXPERT);
+        BOOST_CHECK_EQUAL(meg[i].layerStart, 4u); BOOST_CHECK_EQUAL(meg[i].layerEnd, 8u);
+        BOOST_CHECK_EQUAL(meg[i].expertId, i - 5);
+    }
+    // shardIndex matches position exactly, as everywhere else in this file.
+    for (uint32_t i = 0; i < meg.size(); i++)
+        BOOST_CHECK_EQUAL(meg[i].shardIndex, i);
+}
+
+BOOST_AUTO_TEST_CASE(meg_moe_zero_dense_shards_falls_back_to_one_range)
+{
+    // A manifest registered before D2 (numDenseShards unused for MoE then)
+    // must not silently collapse to an empty graph -> treated as 1 range
+    // covering the whole model.
+    ModelManifest m = MakeMoeManifest("MOE_LEGACY", /*numLayers=*/12, /*numDenseShards=*/0,
+                                      /*numExperts=*/4, /*topKExperts=*/2);
+    auto meg = BuildModelExecutionGraph(m);
+    BOOST_REQUIRE_EQUAL(meg.size(), 1u + 4u); // 1 dense range + 4 experts
+
+    BOOST_CHECK_EQUAL((int)meg[0].shardType, (int)OPOI_SHARD_DENSE);
+    BOOST_CHECK_EQUAL(meg[0].layerStart, 0u); BOOST_CHECK_EQUAL(meg[0].layerEnd, 12u);
+    for (uint32_t i = 1; i <= 4; i++) {
+        BOOST_CHECK_EQUAL((int)meg[i].shardType, (int)OPOI_SHARD_EXPERT);
+        BOOST_CHECK_EQUAL(meg[i].layerStart, 0u); BOOST_CHECK_EQUAL(meg[i].layerEnd, 12u);
+        BOOST_CHECK_EQUAL(meg[i].expertId, i - 1);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(meg_moe_zero_layers_still_empty)
+{
+    ModelManifest m = MakeMoeManifest("MOE_EMPTY", /*numLayers=*/0, /*numDenseShards=*/2,
+                                      /*numExperts=*/4, /*topKExperts=*/2);
+    BOOST_CHECK(BuildModelExecutionGraph(m).empty());
+}
+
+BOOST_AUTO_TEST_CASE(meg_titan_collapse_flag_still_wins_over_moe_decollapse)
+{
+    // Direct callers that explicitly force collapseToTitanSingleNode=true
+    // still get the single whole-model shard, even for a MoE manifest —
+    // ShouldCollapseToTitanSingleNode itself never actually produces true
+    // for MoE (see titan_collapse_requires_all_conditions above), but
+    // BuildModelExecutionGraph's own parameter contract doesn't second-guess
+    // an explicit caller override.
+    ModelManifest m = MakeMoeManifest("MOE_FORCED_COLLAPSE", 8, 2, 3, 2);
+    auto meg = BuildModelExecutionGraph(m, /*collapseToTitanSingleNode=*/true);
+    BOOST_REQUIRE_EQUAL(meg.size(), 1u);
+    BOOST_CHECK_EQUAL((int)meg[0].shardType, (int)OPOI_SHARD_DENSE);
+    BOOST_CHECK_EQUAL(meg[0].layerStart, 0u);
+    BOOST_CHECK_EQUAL(meg[0].layerEnd, 8u);
+}
+
+// ── IsExpertShardWithinManifestBounds — D2 defense-in-depth check ─────────
+// Feeds CheckOPoITransaction's EXPERT-branch validation (opoi.cpp) — see
+// its call site there. Exercised directly here since CheckOPoITransaction
+// itself needs a live chain/mempool/signature setup this file doesn't
+// build (see the file's header comment on scope).
+
+BOOST_AUTO_TEST_CASE(expert_bounds_valid_descriptor_from_real_meg_passes)
+{
+    ModelManifest m = MakeMoeManifest("MOE_BOUNDS_OK", 8, 2, 3, 2);
+    auto meg = BuildModelExecutionGraph(m);
+    for (const auto& d : meg) {
+        if (d.shardType != OPOI_SHARD_EXPERT) continue;
+        BOOST_CHECK(IsExpertShardWithinManifestBounds(d, m));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(expert_bounds_expert_id_out_of_range_rejected)
+{
+    ModelManifest m = MakeMoeManifest("MOE_BOUNDS_BADEXPERT", 8, 2, 3, 2);
+    ShardDescriptor d;
+    d.shardIndex = 99; d.shardType = OPOI_SHARD_EXPERT;
+    d.layerStart = 0; d.layerEnd = 4; d.expertId = 3; // numExperts == 3, valid ids are 0..2
+    BOOST_CHECK(!IsExpertShardWithinManifestBounds(d, m));
+}
+
+BOOST_AUTO_TEST_CASE(expert_bounds_layer_end_past_num_layers_rejected)
+{
+    ModelManifest m = MakeMoeManifest("MOE_BOUNDS_BADLAYEREND", 8, 2, 3, 2);
+    ShardDescriptor d;
+    d.shardIndex = 99; d.shardType = OPOI_SHARD_EXPERT;
+    d.layerStart = 4; d.layerEnd = 9; d.expertId = 0; // numLayers == 8
+    BOOST_CHECK(!IsExpertShardWithinManifestBounds(d, m));
+}
+
+BOOST_AUTO_TEST_CASE(expert_bounds_empty_layer_range_rejected)
+{
+    ModelManifest m = MakeMoeManifest("MOE_BOUNDS_EMPTYRANGE", 8, 2, 3, 2);
+    ShardDescriptor d;
+    d.shardIndex = 99; d.shardType = OPOI_SHARD_EXPERT;
+    d.layerStart = 4; d.layerEnd = 4; d.expertId = 0; // layerStart >= layerEnd
+    BOOST_CHECK(!IsExpertShardWithinManifestBounds(d, m));
 }
 
 // ── ComputeAuditorMajority (F14-C) ────────────────────────────────────────

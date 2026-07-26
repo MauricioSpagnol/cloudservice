@@ -1154,15 +1154,15 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
         // deeper than nOPoIMaxPipelineDepth, an INTERACTIVE request cannot use it —
         // commit-reveal adds +1 block per sequential shard, so a deep pipeline would
         // blow past any reasonable interactive latency budget. BATCH has no such limit.
-        // MoE/HYBRID manifests are excluded: BuildModelExecutionGraph always gives
-        // them exactly one real shard now (whole-model per miner, see opoi_shard.h),
-        // so numDenseShards no longer reflects the real pipeline depth for them —
-        // gating on it here would reject MoE INTERACTIVE requests for a chain length
-        // (numDenseShards) that isn't actually executed.
+        // D2 (2026-07-26): MoE/HYBRID manifests are NO LONGER excluded here.
+        // BuildModelExecutionGraph used to always collapse them to exactly one
+        // whole-model shard (so numDenseShards didn't reflect real pipeline depth),
+        // but now decollapses MoE into numDenseShards real sequential dense
+        // boundaries (each fanning out to per-layer-range EXPERT nodes) — the same
+        // interactive-latency reasoning above applies to them again.
         if (!fIsVerifying) {
             ModelManifest manifest;
             if (g_opoiCache.GetModelManifest(tx.opoiModel, manifest) && manifest.IsActive()
-                && !manifest.IsMoE()
                 && tx.opoiTaskClass == OPOI_TASKCLASS_INTERACTIVE
                 && (int)manifest.numDenseShards > Params().GetConsensus().nOPoIMaxPipelineDepth)
                 return state.DoS(10, error("CheckOPoITransaction(): REQUEST model %s pipeline too deep "
@@ -1808,24 +1808,55 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                                      REJECT_INVALID, "bad-txns-opoi-shard-index-out-of-range");
                 const ShardDescriptor& d = meg[tx.opoiShardIndex];
                 if (d.shardType == OPOI_SHARD_EXPERT) {
+                    // D2 (2026-07-26): defense-in-depth — d.expertId/layerStart/layerEnd
+                    // are always manifest-derived by BuildModelExecutionGraph, but this
+                    // is consensus-critical validation, so re-check the invariant
+                    // explicitly rather than trusting it silently. See
+                    // IsExpertShardWithinManifestBounds's doc comment (opoi_shard.h).
+                    if (!IsExpertShardWithinManifestBounds(d, manifest))
+                        return state.DoS(100, error("CheckOPoITransaction(): SHARD_RESULT EXPERT shard %u out of "
+                                                   "manifest bounds (expertId=%u layerStart=%u layerEnd=%u numExperts=%u "
+                                                   "numLayers=%u) for model %s",
+                                                   tx.opoiShardIndex, d.expertId, d.layerStart, d.layerEnd,
+                                                   manifest.numExperts, manifest.numLayers, manifest.modelId),
+                                         REJECT_INVALID, "bad-txns-opoi-shard-expert-bounds");
+
                     OPoIStake stake;
                     if (!g_opoiCache.GetStake(tx.opoiMinerAddress, stake) || !stake.HostsExpert(d.expertId))
                         return state.DoS(10, error("CheckOPoITransaction(): SHARD_RESULT miner %s does not host expert %u",
                                                    tx.opoiMinerAddress, d.expertId),
                                          REJECT_INVALID, "bad-txns-opoi-shard-expert-not-hosted");
 
-                    // F15-H (real routing, first slice): hosting the expert is necessary
-                    // but not sufficient — it must also have been SELECTED for this
-                    // request's token by the (placeholder) router. Without this, any
-                    // miner hosting any expert could submit for a shard the router never
-                    // routed to, defeating the entire point of MoE (only topK experts of
-                    // numExperts should ever do work for a given request).
-                    auto selected = SelectTopKExperts(tx.opoiRequestId, req.promptHash,
-                                                       manifest.numExperts, manifest.topKExperts);
-                    if (std::find(selected.begin(), selected.end(), d.expertId) == selected.end())
-                        return state.DoS(10, error("CheckOPoITransaction(): SHARD_RESULT expert %u not selected "
-                                                   "by router for request %s", d.expertId, tx.opoiRequestId),
-                                         REJECT_INVALID, "bad-txns-opoi-shard-expert-not-selected");
+                    // D2 (2026-07-26): a real EXPERT shard MUST carry a routing-trace
+                    // commitment — routerLogitsHash (tx.opoiCommitment) is what an
+                    // off-chain Auditor replica checks its own router's choice against
+                    // (routing-trace-pinned model). Before this change EXPERT shards were
+                    // unreachable (BuildModelExecutionGraph never emitted them), so this
+                    // was never enforced; a null commitment here would leave Auditors
+                    // nothing to verify a real routing decision against.
+                    if (tx.opoiCommitment.IsNull())
+                        return state.DoS(10, error("CheckOPoITransaction(): SHARD_RESULT EXPERT shard %u missing "
+                                                   "routerLogitsHash (routing-trace commitment) for model %s",
+                                                   tx.opoiShardIndex, manifest.modelId),
+                                         REJECT_INVALID, "bad-txns-opoi-shard-expert-no-router-hash");
+
+                    // D2 (2026-07-26): the old F15-H "SelectTopKExperts hash-proxy must
+                    // match" gate that used to live here has been REMOVED. B2
+                    // investigation (2026-07-24, see CS COIN OPoI MELHOR
+                    // IMPLEMENTAÇÃO.txt) empirically measured the hash-proxy's agreement
+                    // with a real trained router at 7.2% — WORSE than the 16.7% random
+                    // baseline — so gating real EXPERT submissions on it would reject
+                    // the overwhelming majority of legitimate work, defeating the whole
+                    // point of distributed MoE dispatch. Routing-choice correctness is
+                    // now verified OFF-CHAIN instead: Auditor replicas re-run their own
+                    // router over the same input and check the primary's committed
+                    // choice (routerLogitsHash, populated at ApplyOPoITransaction from
+                    // tx.opoiCommitment) is within an acceptable margin
+                    // (routing-trace-pinned model, same doc section). Disputes between
+                    // primary and replica(s) resolve via the existing
+                    // AuditorVerification/ComputeAuditorMajority mechanism below — not a
+                    // new on-chain consensus primitive. SelectTopKExperts itself is left
+                    // in place in opoi_shard.h, simply no longer called from here.
                 }
             }
         }

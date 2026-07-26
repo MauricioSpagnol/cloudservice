@@ -1345,9 +1345,11 @@ extern OPoICache g_opoiCache;
 
 // F9-G/F15-M: MoE-offload single-node routing preference. Returns true only
 // when ALL of: model m is DENSE with a real multi-shard split (numDenseShards
-// > 1 — MoE/HYBRID already always collapse to one shard regardless, see
-// opoi_shard.h's BuildModelExecutionGraph doc comment, so this can never
-// change anything for them); m declares a total size over
+// > 1 — this function's own archType check below excludes MoE/HYBRID
+// unconditionally, so it can never return true for them regardless of what
+// BuildModelExecutionGraph does with those manifests — see opoi_shard.h's
+// doc comment there for the D2, 2026-07-26 decollapse of MoE into real
+// per-expert nodes, an orthogonal, later change); m declares a total size over
 // nOPoITitanOffloadThresholdGB (0 = feature disabled, or size not declared =
 // unknown = never triggers); and at least one ACTIVE titan-tier staker
 // exists right now. This is a routing PREFERENCE, not a new consensus
