@@ -430,9 +430,25 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
             // so undoing this tx must not unlock it either. PENDING (quorum
             // never reached) and COMPLETE (majority — already unlocked as a
             // reward) both unlock harmlessly here as before.
+            //
+            // D2 routing-trace dispute (2026-07-26): a shard-scoped
+            // verification (tx.opoiShardIndex != OPOI_AUDITOR_VERIFY_NO_SHARD)
+            // lives in mapShardAuditorVerifications instead — same erase
+            // logic, different backing map, and it is deliberately NOT run
+            // through UnmarkAuditorResolved below: that bookkeeping
+            // (setResolvedAuditorVerifications) is only ever set by
+            // ProcessAuditorVerifications, which only ever walks
+            // mapAuditorVerifications (whole-response) — calling it here for
+            // a shard-scoped tx would incorrectly clear a DIFFERENT,
+            // already-resolved whole-response verdict for the same requestId.
             int8_t status = OPOI_AUDITOR_STATUS_PENDING;
-            auto it = g_opoiCache.mapAuditorVerifications.find(tx.opoiRequestId);
-            if (it != g_opoiCache.mapAuditorVerifications.end()) {
+            bool isShardScoped = (tx.opoiShardIndex != OPOI_AUDITOR_VERIFY_NO_SHARD);
+            auto& verifMap = isShardScoped ? g_opoiCache.mapShardAuditorVerifications
+                                           : g_opoiCache.mapAuditorVerifications;
+            std::string key = isShardScoped ? OPoICache::ShardKey(tx.opoiRequestId, tx.opoiShardIndex)
+                                            : tx.opoiRequestId;
+            auto it = verifMap.find(key);
+            if (it != verifMap.end()) {
                 auto& verifs = it->second;
                 for (const auto& v : verifs) {
                     if (v.auditorAddress == tx.opoiAuditorAddress) {
@@ -448,7 +464,8 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
             if (status != OPOI_AUDITOR_STATUS_SLASHED) {
                 g_opoiCache.UnlockUTXO(tx.opoiAuditorCollateralIn);
             }
-            g_opoiCache.UnmarkAuditorResolved(tx.opoiRequestId);
+            if (!isShardScoped)
+                g_opoiCache.UnmarkAuditorResolved(tx.opoiRequestId);
         }
         return true;
     }
@@ -740,9 +757,20 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         fv.blockHeight     = blockHeight;
         fv.txHash          = tx.GetHash();
         fv.status          = OPOI_AUDITOR_STATUS_PENDING;
-        g_opoiCache.AddAuditorVerification(fv); // also locks the collateral
-        LogPrintf("OPoI: AUDITOR_VERIFY for %s by %s (result=%d) at height %u\n",
-                  tx.opoiRequestId, tx.opoiAuditorAddress, (int)tx.opoiAuditorVerifyResult, blockHeight);
+        fv.shardIndex      = tx.opoiShardIndex;
+        // D2 routing-trace dispute (2026-07-26): route to the shard-scoped
+        // map when this verification targets one specific shard rather than
+        // the whole RESPONSE — see mapShardAuditorVerifications' doc comment
+        // (opoi.h) for why these are kept in a wholly separate map.
+        if (tx.opoiShardIndex == OPOI_AUDITOR_VERIFY_NO_SHARD)
+            g_opoiCache.AddAuditorVerification(fv); // also locks the collateral
+        else
+            g_opoiCache.AddShardAuditorVerification(tx.opoiRequestId, tx.opoiShardIndex, fv); // also locks the collateral
+        std::string shardSuffix = (tx.opoiShardIndex == OPOI_AUDITOR_VERIFY_NO_SHARD)
+                                 ? "" : strprintf(" shard %u", tx.opoiShardIndex);
+        LogPrintf("OPoI: AUDITOR_VERIFY for %s%s by %s (result=%d) at height %u\n",
+                  tx.opoiRequestId, shardSuffix,
+                  tx.opoiAuditorAddress, (int)tx.opoiAuditorVerifyResult, blockHeight);
     }
 
     return true;
@@ -1896,13 +1924,40 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
             return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY missing collateralIn"),
                              REJECT_INVALID, "bad-txns-opoi-auditor-no-collateral");
         if (!fIsVerifying) {
-            // Only tasks the requester flagged VERIFIABLE (F14-B) get an on-chain
-            // verdict — an Auditor has nothing to check on an OPEN (prose) task.
             OPoIRequest req;
-            if (!g_opoiCache.GetRequest(tx.opoiRequestId, req) || !req.IsVerifiable())
-                return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY for non-VERIFIABLE/unknown request %s",
+            if (!g_opoiCache.GetRequest(tx.opoiRequestId, req))
+                return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY for unknown request %s",
                                            tx.opoiRequestId),
                                  REJECT_INVALID, "bad-txns-opoi-auditor-not-verifiable");
+            if (tx.opoiShardIndex == OPOI_AUDITOR_VERIFY_NO_SHARD) {
+                // Whole-response verification (original, still fully supported
+                // shape): only tasks the requester flagged VERIFIABLE (F14-B) get
+                // an on-chain verdict — an Auditor has nothing to check on an
+                // OPEN (prose) task.
+                if (!req.IsVerifiable())
+                    return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY for non-VERIFIABLE request %s",
+                                               tx.opoiRequestId),
+                                     REJECT_INVALID, "bad-txns-opoi-auditor-not-verifiable");
+            } else {
+                // D2 routing-trace dispute (2026-07-26): a shard-scoped
+                // verification checks one EXPERT/DENSE shard's routing-trace
+                // commitment, not the whole RESPONSE — it is allowed regardless
+                // of whether the request itself is VERIFIABLE-tier (req.IsVerifiable()
+                // is about grading the final answer; this is about routing
+                // honesty for one shard, an orthogonal concern). Instead, bounds-
+                // check shardIndex against the request's model MEG, the same
+                // pattern SHARD_RESULT's own validation above already uses.
+                ModelManifest manifest;
+                if (!g_opoiCache.GetModelManifest(req.model, manifest) || !manifest.IsActive())
+                    return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY shard-scoped for request %s "
+                                               "with unknown/inactive model", tx.opoiRequestId),
+                                     REJECT_INVALID, "bad-txns-opoi-auditor-shard-unknown-model");
+                bool collapseTitan = ShouldCollapseToTitanSingleNode(manifest, Params().GetConsensus());
+                if (!IsAuditorVerificationShardIndexValid(tx.opoiShardIndex, manifest, collapseTitan))
+                    return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY shardIndex %u out of range "
+                                               "for model %s", tx.opoiShardIndex, manifest.modelId),
+                                     REJECT_INVALID, "bad-txns-opoi-auditor-shard-index-out-of-range");
+            }
             // Collateral must not already be locked by another stake/audit.
             if (g_opoiCache.IsLockedUTXO(tx.opoiAuditorCollateralIn)) {
                 if (IsHarmlessRedelivery(tx.opoiAuditorCollateralIn, tx.GetHash()))
@@ -1916,10 +1971,20 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
         }
         // Verify the Auditor owns the collateral address — same shape as STAKE's
         // ownership proof (opoi.cpp, OPOI_STAKE_TX_TYPE above).
+        //
+        // D2 routing-trace dispute (2026-07-26): sigMsg now also covers
+        // opoiShardIndex. Without this, the signature would only ever bind
+        // (auditorAddress, requestId, collateral) — a relay could flip a
+        // validly-signed tx's shardIndex to any other value (including the
+        // whole-response sentinel, or a different shard) without invalidating
+        // the signature, since the field wasn't part of what was signed. This
+        // matches the existing SHARD_RESULT precedent, whose own sigMsg
+        // already includes tx.opoiShardIndex for the identical reason.
         {
             std::string sigMsg = tx.opoiAuditorAddress + tx.opoiRequestId
                                + tx.opoiAuditorCollateralIn.hash.GetHex()
-                               + strprintf("%u", tx.opoiAuditorCollateralIn.n);
+                               + strprintf("%u", tx.opoiAuditorCollateralIn.n)
+                               + strprintf("%u", tx.opoiShardIndex);
             if (!VerifyOPoISig(tx.opoiAuditorAddress, sigMsg, tx.opoiSig))
                 return state.DoS(100, error("CheckOPoITransaction(): AUDITOR_VERIFY invalid signature for %s",
                                             tx.opoiAuditorAddress),

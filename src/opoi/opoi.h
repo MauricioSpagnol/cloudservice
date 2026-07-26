@@ -451,19 +451,35 @@ struct AuditorVerification {
     uint32_t    blockHeight;
     uint256     txHash;
     int8_t      status;          // PENDING / COMPLETE / SLASHED
+    // D2 routing-trace dispute (2026-07-26): OPOI_AUDITOR_VERIFY_NO_SHARD
+    // (the default, via SetNull() below) means this record grades the whole
+    // RESPONSE — the original, still fully supported shape, and the only one
+    // g_opoiCache.mapAuditorVerifications/AddAuditorVerification/
+    // GetAuditorVerifications/GetAuditorMajorityResult ever see. Any other
+    // value targets one specific shard's routing-trace commitment instead —
+    // those live in the separate g_opoiCache.mapShardAuditorVerifications /
+    // AddShardAuditorVerification / GetShardAuditorVerifications /
+    // GetShardAuditorMajorityResult, never mixed with whole-response records.
+    // In-class initializer (not just SetNull()) so a plain `AuditorVerification
+    // fv;` followed by manual field assignment (as ProcessOPoITransaction's
+    // AUDITOR_VERIFY apply branch does, never calling SetNull()) can't leave
+    // this as stack garbage — same bug class already found once for
+    // OPoIRequest::commitWindowClosed and OPoIStake's reputation fields.
+    uint32_t    shardIndex = OPOI_AUDITOR_VERIFY_NO_SHARD;
+    bool IsShardScoped() const { return shardIndex != OPOI_AUDITOR_VERIFY_NO_SHARD; }
 
     ADD_SERIALIZE_METHODS;
     template <typename Stream, typename Operation>
     inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(requestId); READWRITE(auditorAddress); READWRITE(result);
         READWRITE(auditorCollateral); READWRITE(blockHeight); READWRITE(txHash);
-        READWRITE(status);
+        READWRITE(status); READWRITE(shardIndex);
     }
 
     void SetNull() {
         requestId.clear(); auditorAddress.clear(); result = AUDITOR_VERIFY_PASS;
         auditorCollateral.SetNull(); blockHeight = 0; txHash.SetNull();
-        status = OPOI_AUDITOR_STATUS_PENDING;
+        status = OPOI_AUDITOR_STATUS_PENDING; shardIndex = OPOI_AUDITOR_VERIFY_NO_SHARD;
     }
     bool IsNull() const { return requestId.empty(); }
 };
@@ -671,6 +687,29 @@ public:
     // Key = requestId, value = all AuditorVerification records for that request
     std::map<std::string, std::vector<AuditorVerification>> mapAuditorVerifications;
 
+    // D2 routing-trace dispute (2026-07-26): per-(requestId, shardIndex)
+    // Auditor verifications — targets ONE EXPERT/DENSE shard's routing-trace
+    // commitment rather than the whole RESPONSE (AuditorVerification::
+    // IsShardScoped()). Deliberately a SEPARATE parallel map rather than a
+    // repurposed mapAuditorVerifications key, so every existing
+    // whole-response call site (AddAuditorVerification/GetAuditorVerifications/
+    // GetAuditorMajorityResult/ListAllAuditorVerifications, and
+    // ProcessAuditorVerifications' whole economic-resolution loop in
+    // opoi.cpp) keeps iterating over EXACTLY the entries it always has —
+    // nothing shard-scoped can ever appear there, so whole-response behavior
+    // is provably unchanged rather than merely "should still work". Keyed
+    // the same way mapShardResults already is (see ShardKey below).
+    //
+    // Known v1 limitation (mirrors ProcessAuditorVerifications' own "known v1
+    // limitation" doc comment for the whole-response case): entries here are
+    // NOT yet resolved by ProcessAuditorVerifications — that function only
+    // ever walks mapAuditorVerifications — so a shard-scoped Auditor's
+    // collateral locks (AddShardAuditorVerification, same as the
+    // whole-response path) but has no automatic unlock/slash path yet. Wiring
+    // real economic resolution for shard-level routing disputes is a
+    // follow-up increment, not part of this schema/lookup extension.
+    std::map<std::string, std::vector<AuditorVerification>> mapShardAuditorVerifications;
+
     // F15-A: Model Manifests (dense/MoE/hybrid) — modelId → manifest
     std::map<std::string, ModelManifest> mapModelManifests;
     // F15-A2: votes cast per model — modelId → voterAddress → record
@@ -732,6 +771,7 @@ public:
         mapResponseCommitTxHash.clear();
         mapStakes.clear(); mapChallenges.clear();
         mapLockedUTXOs.clear(); mapAuditorVerifications.clear();
+        mapShardAuditorVerifications.clear();
         mapModelManifests.clear(); mapModelVotes.clear();
         mapCoordinatorClaims.clear(); mapShardResults.clear();
         setPaidShards.clear(); setResolvedAuditorVerifications.clear();
@@ -1208,6 +1248,54 @@ public:
         for (const auto& kv : mapAuditorVerifications)
             result.push_back(kv);
         return result;
+    }
+
+    // ── D2 routing-trace dispute: shard-scoped Auditor verification ─────────
+    // Mirrors AddAuditorVerification/GetAuditorVerifications/
+    // GetAuditorMajorityResult exactly (same one-vote-per-Auditor rule, same
+    // collateral-locking side effect, same ComputeAuditorMajority reuse) —
+    // the only difference is the key: ShardKey(requestId, shardIndex) instead
+    // of plain requestId, and a separate backing map
+    // (mapShardAuditorVerifications) so these records never mix with
+    // whole-response ones. See that map's doc comment above for why a
+    // separate map was chosen over repurposing mapAuditorVerifications's key.
+
+    bool AddShardAuditorVerification(const std::string& requestId, uint32_t shardIndex,
+                                     const AuditorVerification& fv) {
+        LOCK(cs);
+        auto& verifs = mapShardAuditorVerifications[ShardKey(requestId, shardIndex)];
+        for (const auto& existing : verifs)
+            if (existing.auditorAddress == fv.auditorAddress) return true; // one vote per Auditor
+        verifs.push_back(fv);
+        // Lock Auditor's collateral — same side effect as the whole-response
+        // path (AddAuditorVerification above); see mapShardAuditorVerifications'
+        // doc comment for the known v1 limitation (no automatic unlock yet).
+        if (!fv.auditorCollateral.IsNull()) {
+            mapLockedUTXOs[fv.auditorCollateral] = fv.auditorAddress;
+            mapLockingTxHash[fv.auditorCollateral] = fv.txHash;
+        }
+        return true;
+    }
+
+    // Returns all AuditorVerification records for one specific shard of a request
+    std::vector<AuditorVerification> GetShardAuditorVerifications(const std::string& requestId,
+                                                                   uint32_t shardIndex) const {
+        LOCK(cs);
+        auto it = mapShardAuditorVerifications.find(ShardKey(requestId, shardIndex));
+        if (it == mapShardAuditorVerifications.end()) return {};
+        return it->second;
+    }
+
+    // Returns the majority Auditor result for one specific shard, or -1 if no
+    // quorum yet. Returns AUDITOR_VERIFY_PASS/FAIL/TIMEOUT or -1 — same
+    // ComputeAuditorMajority primitive the whole-response
+    // GetAuditorMajorityResult above uses, just fed this shard's own vector.
+    int GetShardAuditorMajorityResult(const std::string& requestId, uint32_t shardIndex,
+                                      int minVerifiers) const {
+        LOCK(cs);
+        auto it = mapShardAuditorVerifications.find(ShardKey(requestId, shardIndex));
+        if (it == mapShardAuditorVerifications.end()) return -1;
+        return ComputeAuditorMajority(it->second, minVerifiers);
     }
 
     // "Resolved" bookkeeping (mirrors setPaidShards): a requestId's Auditor

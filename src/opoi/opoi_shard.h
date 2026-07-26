@@ -182,6 +182,30 @@ inline bool IsExpertShardWithinManifestBounds(const ShardDescriptor& d, const Mo
     return true;
 }
 
+// D2 routing-trace dispute (2026-07-26): bounds-check a shard-scoped
+// AuditorVerification's target shardIndex against a model's MEG — the exact
+// same "does this index exist in the graph" check CheckOPoITransaction's
+// SHARD_RESULT branch already does inline (`tx.opoiShardIndex >= meg.size()`
+// in opoi.cpp), extracted into its own pure function here so
+// AUDITOR_VERIFY_TX_TYPE's new shard-scoped branch can reuse it verbatim —
+// and, just as importantly, so it is directly unit-testable
+// (src/test/opoi_tests.cpp) the same way IsExpertShardWithinManifestBounds
+// above already is: CheckOPoITransaction itself needs a live
+// chain/mempool/signature setup this test file deliberately doesn't build
+// (see its header comment on scope).
+//
+// Deliberately has no opinion on OPOI_AUDITOR_VERIFY_NO_SHARD (the
+// whole-response sentinel, declared in primitives/transaction.h) — that
+// branch belongs at the call site (CheckOPoITransaction's AUDITOR_VERIFY
+// case), not here, so this function stays a plain "is this index in range"
+// check with no dependency on transaction.h.
+inline bool IsAuditorVerificationShardIndexValid(uint32_t shardIndex, const ModelManifest& m,
+                                                 bool collapseToTitanSingleNode)
+{
+    auto meg = BuildModelExecutionGraph(m, collapseToTitanSingleNode);
+    return shardIndex < meg.size();
+}
+
 // Deterministic commitment to the graph shape. Any node with the same
 // ModelManifest fields computes the identical hash — nothing here depends on
 // data supplied only by the proposer, so there is nothing to "fake".

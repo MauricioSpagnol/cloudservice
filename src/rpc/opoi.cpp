@@ -2238,10 +2238,10 @@ UniValue getshardresult(const UniValue& params, bool fHelp)
 
 UniValue submitauditorverification(const UniValue& params, bool fHelp)
 {
-    if (fHelp || params.size() != 5)
+    if (fHelp || params.size() < 5 || params.size() > 6)
         throw std::runtime_error(
             "submitauditorverification \"auditor_address\" \"request_id\" \"result\""
-            " \"collateral_txid\" collateral_vout\n"
+            " \"collateral_txid\" collateral_vout ( shard_index )\n"
             "\nSubmit an Auditor's verdict on a VERIFIABLE request's RESPONSE (F14-B),\n"
             "checked against the REQUEST's test suite. Permissionless — any address\n"
             "that locks the required collateral may audit, no OPoI stake required.\n"
@@ -2251,12 +2251,24 @@ UniValue submitauditorverification(const UniValue& params, bool fHelp)
             "is resolved (ProcessAuditorVerifications): Auditors matching the majority\n"
             "get their collateral unlocked, the minority stay locked forever (slashed).\n"
             "The underlying RESPONSE is only paid if the majority is PASS.\n"
+            "\nD2 (2026-07-26): if shard_index is given, this verdict instead targets ONE\n"
+            "EXPERT/DENSE shard's routing-trace commitment (routerLogitsHash) rather than\n"
+            "the whole RESPONSE — an Auditor replica re-runs its own router over the same\n"
+            "input and reports whether the primary's committed routing choice was\n"
+            "admissible or divergent. Valid regardless of whether the request itself is\n"
+            "VERIFIABLE-tier (routing honesty is orthogonal to grading the final answer).\n"
+            "These shard-scoped verdicts feed a SEPARATE per-shard majority\n"
+            "(getauditorverifications' request_id-only view never includes them) and are\n"
+            "not yet auto-resolved by ProcessAuditorVerifications (known v1 limitation,\n"
+            "see mapShardAuditorVerifications' doc comment in opoi.h).\n"
             "\nArguments:\n"
             "1. auditor_address  (string, required) Address casting this verdict\n"
-            "2. request_id       (string, required) The VERIFIABLE request being audited\n"
+            "2. request_id       (string, required) The request being audited\n"
             "3. result           (string, required) PASS, FAIL, or TIMEOUT\n"
             "4. collateral_txid  (string, required) TXID of the Auditor's collateral UTXO\n"
             "5. collateral_vout  (numeric, required) Output index of the collateral UTXO\n"
+            "6. shard_index      (numeric, optional) Index into the request's model graph\n"
+            "                    (see getmodelgraph) — omit for a whole-response verdict\n"
             "\nResult:\n"
             "{ txid, request_id, auditor_address, result }\n"
             "\nExamples:\n"
@@ -2273,6 +2285,13 @@ UniValue submitauditorverification(const UniValue& params, bool fHelp)
     uint256     colTxid;
     colTxid.SetHex(params[3].get_str());
     uint32_t    colVout     = (uint32_t)params[4].get_int();
+    bool        shardScoped = (params.size() >= 6);
+    uint32_t    shardIndex  = OPOI_AUDITOR_VERIFY_NO_SHARD;
+    if (shardScoped) {
+        int64_t si = params[5].get_int64();
+        if (si < 0) throw std::runtime_error("shard_index must not be negative");
+        shardIndex = (uint32_t)si;
+    }
 
     if (auditorAddr.empty()) throw std::runtime_error("auditor_address must not be empty");
     if (requestId.empty())   throw std::runtime_error("request_id must not be empty");
@@ -2287,8 +2306,21 @@ UniValue submitauditorverification(const UniValue& params, bool fHelp)
     OPoIRequest req;
     if (!g_opoiCache.GetRequest(requestId, req))
         throw JSONRPCError(RPC_INVALID_PARAMETER, "unknown request_id: " + requestId);
-    if (!req.IsVerifiable())
-        throw JSONRPCError(RPC_INVALID_PARAMETER, requestId + " is not a VERIFIABLE task — nothing for an Auditor to check");
+    if (!shardScoped) {
+        if (!req.IsVerifiable())
+            throw JSONRPCError(RPC_INVALID_PARAMETER, requestId + " is not a VERIFIABLE task — nothing for an Auditor to check");
+    } else {
+        // D2: shard-scoped verdicts don't require VERIFIABLE — bounds-check
+        // shardIndex against the request's model MEG instead, same pattern
+        // CheckOPoITransaction's own consensus-level check uses (opoi.cpp).
+        ModelManifest manifest;
+        if (!g_opoiCache.GetModelManifest(req.model, manifest) || !manifest.IsActive())
+            throw JSONRPCError(RPC_INVALID_PARAMETER, requestId + "'s model has no ACTIVE manifest to validate shard_index against");
+        bool collapseTitan = ShouldCollapseToTitanSingleNode(manifest, Params().GetConsensus());
+        if (!IsAuditorVerificationShardIndexValid(shardIndex, manifest, collapseTitan))
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                strprintf("shard_index %u out of range for model %s", shardIndex, manifest.modelId));
+    }
 
     // Look up the UTXO to get its value (same pattern as stakeopoi).
     COutPoint colOut(colTxid, colVout);
@@ -2315,8 +2347,17 @@ UniValue submitauditorverification(const UniValue& params, bool fHelp)
     mutTx.opoiAuditorVerifyResult= result;
     mutTx.opoiAuditorCollateralIn= colOut;
     mutTx.opoiSigTime            = (uint32_t)GetTime();
+    // D2 (2026-07-26): explicit either way — never rely on
+    // CMutableTransaction's own generic opoiShardIndex default (0, meant for
+    // SHARD_RESULT's shard 0) to mean "whole response" here.
+    mutTx.opoiShardIndex         = shardIndex;
 
-    std::string sigMsg = auditorAddr + requestId + colTxid.GetHex() + strprintf("%u", colVout);
+    // D2 (2026-07-26): sigMsg now covers shardIndex too — see
+    // CheckOPoITransaction's matching AUDITOR_VERIFY signature check
+    // (opoi.cpp) for why (anti-tamper: without this, a relay could flip a
+    // validly-signed verdict's shard target after the fact).
+    std::string sigMsg = auditorAddr + requestId + colTxid.GetHex() + strprintf("%u", colVout)
+                        + strprintf("%u", shardIndex);
     std::string errMsg;
     if (!SignWithAddress(auditorAddr, sigMsg, mutTx.opoiSig, errMsg))
         throw JSONRPCError(RPC_WALLET_ERROR, "Failed to sign: " + errMsg);
@@ -2339,21 +2380,32 @@ UniValue submitauditorverification(const UniValue& params, bool fHelp)
 
 UniValue getauditorverifications(const UniValue& params, bool fHelp)
 {
-    if (fHelp || params.size() != 1)
+    if (fHelp || params.size() < 1 || params.size() > 2)
         throw std::runtime_error(
-            "getauditorverifications \"request_id\"\n"
+            "getauditorverifications \"request_id\" ( shard_index )\n"
             "\nList all Auditor verdicts for a request and the resolved majority.\n"
+            "\nD2 (2026-07-26): if shard_index is given, lists the SEPARATE per-shard\n"
+            "verdicts targeting that one EXPERT/DENSE shard's routing-trace commitment\n"
+            "instead (see submitauditorverification) — never mixed with whole-response\n"
+            "verdicts, which is what this RPC returns when shard_index is omitted.\n"
             "\nArguments:\n"
-            "1. request_id  (string, required)\n"
+            "1. request_id   (string, required)\n"
+            "2. shard_index  (numeric, optional) Index into the request's model graph\n"
             "\nExamples:\n"
             + HelpExampleCli("getauditorverifications", "\"uuid\"")
         );
 
     std::string requestId = params[0].get_str();
+    bool shardScoped = (params.size() >= 2);
+    uint32_t shardIndex = shardScoped ? (uint32_t)params[1].get_int64() : OPOI_AUDITOR_VERIFY_NO_SHARD;
     int minAuditors = Params().GetConsensus().nOPoIMinAuditors;
 
+    std::vector<AuditorVerification> list = shardScoped
+        ? g_opoiCache.GetShardAuditorVerifications(requestId, shardIndex)
+        : g_opoiCache.GetAuditorVerifications(requestId);
+
     UniValue verifs(UniValue::VARR);
-    for (const auto& fv : g_opoiCache.GetAuditorVerifications(requestId)) {
+    for (const auto& fv : list) {
         UniValue obj(UniValue::VOBJ);
         obj.pushKV("auditor_address", fv.auditorAddress);
         std::string resultStr = fv.result == AUDITOR_VERIFY_PASS ? "PASS"
@@ -2367,13 +2419,16 @@ UniValue getauditorverifications(const UniValue& params, bool fHelp)
         verifs.push_back(obj);
     }
 
-    int majority = g_opoiCache.GetAuditorMajorityResult(requestId, minAuditors);
+    int majority = shardScoped
+        ? g_opoiCache.GetShardAuditorMajorityResult(requestId, shardIndex, minAuditors)
+        : g_opoiCache.GetAuditorMajorityResult(requestId, minAuditors);
     std::string majorityStr = majority < 0 ? ""
                             : majority == AUDITOR_VERIFY_PASS ? "PASS"
                             : majority == AUDITOR_VERIFY_FAIL ? "FAIL" : "TIMEOUT";
 
     UniValue ret(UniValue::VOBJ);
     ret.pushKV("request_id",     requestId);
+    if (shardScoped) ret.pushKV("shard_index", (int)shardIndex);
     ret.pushKV("verifications",  verifs);
     ret.pushKV("resolved",       majority >= 0);
     ret.pushKV("majority_result",majorityStr);

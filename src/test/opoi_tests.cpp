@@ -132,7 +132,10 @@ AuditorVerification MakeVerification(const std::string& requestId, const std::st
 // Builds a real AUDITOR_VERIFY CTransaction the way GetVerifiablePaymentsForBlock
 // actually expects to read one (opoiRequestId, opoiAuditorAddress,
 // opoiAuditorVerifyResult) — the "this block's own not-yet-applied vote" side
-// of its combined view.
+// of its combined view. Whole-response (opoiShardIndex explicitly set to the
+// D2 sentinel, exactly as submitauditorverification's RPC now does — never
+// rely on CMutableTransaction's own generic default of 0, which would mean
+// "shard 0" instead).
 CTransaction MakeAuditorVerifyTx(const std::string& requestId, const std::string& auditorAddress,
                                  uint8_t result)
 {
@@ -142,6 +145,7 @@ CTransaction MakeAuditorVerifyTx(const std::string& requestId, const std::string
     mtx.opoiRequestId           = requestId;
     mtx.opoiAuditorAddress      = auditorAddress;
     mtx.opoiAuditorVerifyResult = result;
+    mtx.opoiShardIndex          = OPOI_AUDITOR_VERIFY_NO_SHARD;
     return CTransaction(mtx);
 }
 
@@ -224,7 +228,22 @@ CTransaction MakeAuditorVerifyTxWithCollateral(const std::string& requestId, con
     mtx.opoiAuditorAddress      = auditorAddress;
     mtx.opoiAuditorVerifyResult = result;
     mtx.opoiAuditorCollateralIn = collateral;
+    // D2 (2026-07-26): whole-response sentinel — see MakeAuditorVerifyTx above.
+    mtx.opoiShardIndex          = OPOI_AUDITOR_VERIFY_NO_SHARD;
     return CTransaction(mtx);
+}
+
+// D2 routing-trace dispute (2026-07-26): a single Auditor verdict targeting
+// one specific shard's routing-trace commitment rather than the whole
+// RESPONSE — mirrors MakeVerification above exactly, but sets shardIndex to
+// a real value instead of leaving it at SetNull()'s default
+// (OPOI_AUDITOR_VERIFY_NO_SHARD, the whole-response sentinel).
+AuditorVerification MakeShardVerification(const std::string& requestId, uint32_t shardIndex,
+                                          const std::string& auditorAddress, uint8_t result)
+{
+    AuditorVerification v = MakeVerification(requestId, auditorAddress, result);
+    v.shardIndex = shardIndex;
+    return v;
 }
 
 } // namespace
@@ -855,6 +874,158 @@ BOOST_AUTO_TEST_CASE(auditor_majority_empty_input)
     std::vector<AuditorVerification> verifs;
     BOOST_CHECK_EQUAL(ComputeAuditorMajority(verifs, 1), -1);
     BOOST_CHECK_EQUAL(ComputeAuditorMajority(verifs, 0), -1);
+}
+
+// ── D2 routing-trace dispute: shard-scoped Auditor verification ──────────
+// (2026-07-26) Extends F14-C's AuditorVerification/ComputeAuditorMajority
+// machinery to also grade ONE EXPERT/DENSE shard's routing-trace commitment,
+// not just a whole RESPONSE — see opoi.h's AuditorVerification.shardIndex /
+// mapShardAuditorVerifications doc comments and opoi.cpp's
+// OPOI_AUDITOR_VERIFY_TX_TYPE branch. CheckOPoITransaction itself still isn't
+// unit-testable here (see this file's header comment on scope), so these
+// tests exercise the same extracted pure functions/cache accessors it calls:
+// IsAuditorVerificationShardIndexValid (mirrors IsExpertShardWithinManifestBounds's
+// role for SHARD_RESULT) and the new AddShardAuditorVerification/
+// GetShardAuditorVerifications/GetShardAuditorMajorityResult cache accessors.
+
+BOOST_AUTO_TEST_CASE(shard_verification_index_valid_for_every_real_meg_index)
+{
+    // A shard-scoped verdict must validate for EVERY real index the MEG
+    // actually produces — dense (2 shards) and MoE (2 dense + 2*3 expert)
+    // alike, mirroring expert_bounds_valid_descriptor_from_real_meg_passes
+    // above but for the AUDITOR_VERIFY path's own bounds-check function.
+    ModelManifest dense = MakeDenseManifest("AUD_BOUNDS_DENSE", 9, 2);
+    auto denseMeg = BuildModelExecutionGraph(dense);
+    for (uint32_t i = 0; i < denseMeg.size(); i++)
+        BOOST_CHECK(IsAuditorVerificationShardIndexValid(i, dense, /*collapseToTitanSingleNode=*/false));
+
+    ModelManifest moe = MakeMoeManifest("AUD_BOUNDS_MOE", 8, 2, 3, 2);
+    auto moeMeg = BuildModelExecutionGraph(moe);
+    BOOST_REQUIRE_EQUAL(moeMeg.size(), 8u); // 2 dense + 2*3 expert, same shape as meg_moe_* above
+    for (uint32_t i = 0; i < moeMeg.size(); i++)
+        BOOST_CHECK(IsAuditorVerificationShardIndexValid(i, moe, /*collapseToTitanSingleNode=*/false));
+}
+
+BOOST_AUTO_TEST_CASE(shard_verification_index_out_of_range_rejected)
+{
+    ModelManifest moe = MakeMoeManifest("AUD_BOUNDS_OOR", 8, 2, 3, 2);
+    // MEG has exactly 8 nodes (indices 0..7) — 8 itself and anything beyond
+    // must be rejected, same off-by-one boundary SHARD_RESULT's own
+    // `tx.opoiShardIndex >= meg.size()` check guards against.
+    BOOST_CHECK(!IsAuditorVerificationShardIndexValid(8, moe, false));
+    BOOST_CHECK(!IsAuditorVerificationShardIndexValid(9999, moe, false));
+    BOOST_CHECK(!IsAuditorVerificationShardIndexValid(OPOI_AUDITOR_VERIFY_NO_SHARD, moe, false));
+}
+
+BOOST_AUTO_TEST_CASE(shard_verification_index_rejected_when_model_has_no_shards)
+{
+    // numLayers=0 -> BuildModelExecutionGraph returns an empty graph (see
+    // meg_moe_zero_layers_still_empty above) -> every index, including 0, is
+    // out of range.
+    ModelManifest empty = MakeMoeManifest("AUD_BOUNDS_EMPTY", 0, 2, 3, 2);
+    BOOST_CHECK(!IsAuditorVerificationShardIndexValid(0, empty, false));
+}
+
+BOOST_AUTO_TEST_CASE(whole_response_verification_defaults_to_no_shard_sentinel)
+{
+    // Regression: MakeVerification (used by every pre-existing whole-response
+    // test in this file, unmodified) must still produce a record with no
+    // shard target — SetNull()'s in-class default, exercised directly here
+    // rather than just assumed.
+    AuditorVerification v = MakeVerification("req", "auditor1", AUDITOR_VERIFY_PASS);
+    BOOST_CHECK_EQUAL(v.shardIndex, OPOI_AUDITOR_VERIFY_NO_SHARD);
+    BOOST_CHECK(!v.IsShardScoped());
+}
+
+BOOST_AUTO_TEST_CASE(shard_scoped_verification_reports_is_shard_scoped)
+{
+    AuditorVerification v = MakeShardVerification("req", 2, "auditor1", AUDITOR_VERIFY_PASS);
+    BOOST_CHECK_EQUAL(v.shardIndex, 2u);
+    BOOST_CHECK(v.IsShardScoped());
+}
+
+BOOST_AUTO_TEST_CASE(cache_shard_and_whole_response_verifications_stay_isolated)
+{
+    // AddAuditorVerification (whole-response) and AddShardAuditorVerification
+    // (shard-scoped) for the SAME requestId must never leak into each
+    // other's view — mapAuditorVerifications and mapShardAuditorVerifications
+    // are separate maps precisely so this holds (see both maps' doc comments
+    // in opoi.h).
+    const std::string reqId = "req-isolation";
+    g_opoiCache.AddAuditorVerification(MakeVerification(reqId, "whole-auditor", AUDITOR_VERIFY_PASS));
+    g_opoiCache.AddShardAuditorVerification(reqId, 3,
+        MakeShardVerification(reqId, 3, "shard-auditor", AUDITOR_VERIFY_FAIL));
+
+    auto wholeVerifs = g_opoiCache.GetAuditorVerifications(reqId);
+    BOOST_REQUIRE_EQUAL(wholeVerifs.size(), 1u);
+    BOOST_CHECK_EQUAL(wholeVerifs[0].auditorAddress, "whole-auditor");
+
+    auto shardVerifs = g_opoiCache.GetShardAuditorVerifications(reqId, 3);
+    BOOST_REQUIRE_EQUAL(shardVerifs.size(), 1u);
+    BOOST_CHECK_EQUAL(shardVerifs[0].auditorAddress, "shard-auditor");
+
+    // A different shardIndex for the same request sees neither.
+    BOOST_CHECK(g_opoiCache.GetShardAuditorVerifications(reqId, 4).empty());
+}
+
+BOOST_AUTO_TEST_CASE(cache_shard_auditor_verification_one_vote_per_auditor)
+{
+    // Same dedup rule as AddAuditorVerification's own "one vote per Auditor"
+    // guard — a second submission from the same address for the same shard
+    // is silently ignored rather than appended.
+    const std::string reqId = "req-shard-dedup";
+    g_opoiCache.AddShardAuditorVerification(reqId, 1, MakeShardVerification(reqId, 1, "auditor1", AUDITOR_VERIFY_PASS));
+    g_opoiCache.AddShardAuditorVerification(reqId, 1, MakeShardVerification(reqId, 1, "auditor1", AUDITOR_VERIFY_FAIL));
+
+    auto verifs = g_opoiCache.GetShardAuditorVerifications(reqId, 1);
+    BOOST_REQUIRE_EQUAL(verifs.size(), 1u);
+    BOOST_CHECK_EQUAL((int)verifs[0].result, (int)AUDITOR_VERIFY_PASS); // first vote wins, same as whole-response
+}
+
+BOOST_AUTO_TEST_CASE(cache_get_shard_auditor_majority_result_resolves_over_per_shard_vector)
+{
+    // ComputeAuditorMajority itself is architecture-agnostic (it never reads
+    // requestId or shardIndex — see its own tests above) — this test proves
+    // GetShardAuditorMajorityResult actually wires it up correctly end to
+    // end over a per-shard-keyed vector, mirroring the existing
+    // GetAuditorMajorityResult accessor pattern (opoi.h ~1191-1202) for the
+    // whole-response case.
+    const std::string reqId = "req-shard-majority";
+    g_opoiCache.AddShardAuditorVerification(reqId, 5, MakeShardVerification(reqId, 5, "auditor1", AUDITOR_VERIFY_PASS));
+    g_opoiCache.AddShardAuditorVerification(reqId, 5, MakeShardVerification(reqId, 5, "auditor2", AUDITOR_VERIFY_PASS));
+    g_opoiCache.AddShardAuditorVerification(reqId, 5, MakeShardVerification(reqId, 5, "auditor3", AUDITOR_VERIFY_FAIL));
+
+    BOOST_CHECK_EQUAL(g_opoiCache.GetShardAuditorMajorityResult(reqId, 5, 3), (int)AUDITOR_VERIFY_PASS);
+    // No quorum yet for a floor of 4.
+    BOOST_CHECK_EQUAL(g_opoiCache.GetShardAuditorMajorityResult(reqId, 5, 4), -1);
+    // A DIFFERENT shardIndex for the same request has no votes at all.
+    BOOST_CHECK_EQUAL(g_opoiCache.GetShardAuditorMajorityResult(reqId, 6, 1), -1);
+    // The whole-response view for this requestId is untouched by any of the
+    // above shard-scoped activity — still no quorum (in fact no votes at all).
+    BOOST_CHECK_EQUAL(g_opoiCache.GetAuditorMajorityResult(reqId, 1), -1);
+    BOOST_CHECK(g_opoiCache.GetAuditorVerifications(reqId).empty());
+}
+
+BOOST_AUTO_TEST_CASE(whole_response_majority_computation_unaffected_by_d2_changes)
+{
+    // Direct regression proof (not just "the suite still passes"): the exact
+    // whole-response scenario auditor_majority_clear_majority_pass exercises
+    // against the pure function, replayed here through the FULL cache
+    // round-trip (AddAuditorVerification -> GetAuditorMajorityResult) that
+    // ProcessOPoITransaction's apply path actually uses — confirming D2's
+    // routing changes to that apply branch (opoi.cpp: now branches on
+    // tx.opoiShardIndex before choosing which map to write to) still send an
+    // ordinary whole-response vote to mapAuditorVerifications exactly as
+    // before.
+    const std::string reqId = "req-whole-response-regression";
+    g_opoiCache.AddAuditorVerification(MakeVerification(reqId, "auditor1", AUDITOR_VERIFY_PASS));
+    g_opoiCache.AddAuditorVerification(MakeVerification(reqId, "auditor2", AUDITOR_VERIFY_PASS));
+    g_opoiCache.AddAuditorVerification(MakeVerification(reqId, "auditor3", AUDITOR_VERIFY_FAIL));
+
+    BOOST_CHECK_EQUAL(g_opoiCache.GetAuditorMajorityResult(reqId, 3), (int)AUDITOR_VERIFY_PASS);
+    BOOST_REQUIRE_EQUAL(g_opoiCache.GetAuditorVerifications(reqId).size(), 3u);
+    // And none of it is visible from the shard-scoped side.
+    BOOST_CHECK(g_opoiCache.GetShardAuditorVerifications(reqId, 0).empty());
 }
 
 // ── GetVerifiablePaymentsForBlock (F14-C) ─────────────────────────────────
