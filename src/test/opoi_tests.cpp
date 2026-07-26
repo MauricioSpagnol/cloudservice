@@ -246,6 +246,40 @@ AuditorVerification MakeShardVerification(const std::string& requestId, uint32_t
     return v;
 }
 
+// D2 shard-scoped resolution (2026-07-26 follow-up): same as
+// MakeShardVerification above, but with a real collateral UTXO attached —
+// needed for g_opoiCache.AddShardAuditorVerification(...) to actually lock
+// something, mirroring MakeVerificationWithCollateral's role for the
+// whole-response case exactly.
+AuditorVerification MakeShardVerificationWithCollateral(const std::string& requestId, uint32_t shardIndex,
+                                                        const std::string& auditorAddress,
+                                                        uint8_t result, const COutPoint& collateral)
+{
+    AuditorVerification v = MakeShardVerification(requestId, shardIndex, auditorAddress, result);
+    v.auditorCollateral = collateral;
+    return v;
+}
+
+// D2 shard-scoped resolution (2026-07-26 follow-up): a real shard-scoped
+// AUDITOR_VERIFY CTransaction with its collateral attached — mirrors
+// MakeAuditorVerifyTxWithCollateral above exactly, but with a real
+// opoiShardIndex instead of the OPOI_AUDITOR_VERIFY_NO_SHARD sentinel, for
+// exercising ProcessOPoITransaction's isShardScoped undo branch directly.
+CTransaction MakeShardAuditorVerifyTxWithCollateral(const std::string& requestId, uint32_t shardIndex,
+                                                    const std::string& auditorAddress,
+                                                    uint8_t result, const COutPoint& collateral)
+{
+    CMutableTransaction mtx;
+    mtx.nVersion                = OPOI_TX_VERSION;
+    mtx.nType                   = OPOI_AUDITOR_VERIFY_TX_TYPE;
+    mtx.opoiRequestId           = requestId;
+    mtx.opoiAuditorAddress      = auditorAddress;
+    mtx.opoiAuditorVerifyResult = result;
+    mtx.opoiAuditorCollateralIn = collateral;
+    mtx.opoiShardIndex          = shardIndex;
+    return CTransaction(mtx);
+}
+
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(opoi_tests, OPoIPaymentsFixture)
@@ -1449,6 +1483,289 @@ BOOST_AUTO_TEST_CASE(auditor_verifications_undo_via_process_opoi_transaction)
     // unlocked as a SLASHED minority vote, and undoing the vote must not
     // release it.
     BOOST_CHECK(g_opoiCache.IsLockedUTXO(c3));
+}
+
+// ── ProcessAuditorVerifications: D2 shard-scoped resolution (2026-07-26) ──
+// Follow-up to the D2 schema/lookup extension (606b0c1): ProcessAuditorVerifications
+// now ALSO resolves shard-scoped Auditor disputes (mapShardAuditorVerifications,
+// AuditorVerification::IsShardScoped()), in a second loop that mirrors the
+// whole-response loop above exactly (same ComputeAuditorMajority-driven
+// unlock-majority/burn-minority treatment) but guarded by a wholly separate
+// "resolved" set — setResolvedShardAuditorVerifications via
+// IsShardAuditorResolved/MarkShardAuditorResolved, keyed by
+// ShardKey(requestId, shardIndex) rather than plain requestId. Tests below
+// mirror the whole-response ProcessAuditorVerifications tests above one for
+// one, plus two tests specifically proving the whole-response and
+// shard-scoped resolution tracks for the SAME requestId never interfere with
+// each other.
+
+BOOST_AUTO_TEST_CASE(shard_auditor_verifications_no_quorum_stays_pending)
+{
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-sav-noquorum";
+    COutPoint c1 = MakeCollateral("sav-c1");
+    g_opoiCache.AddShardAuditorVerification(reqId, 2,
+        MakeShardVerificationWithCollateral(reqId, 2, "auditor1", AUDITOR_VERIFY_PASS, c1));
+
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(c1)); // AddShardAuditorVerification locks it immediately
+
+    ProcessAuditorVerifications(100, params);
+
+    BOOST_CHECK(!g_opoiCache.IsShardAuditorResolved(reqId, 2)); // only 1 of 3 required votes in
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(c1)); // untouched — still pending
+
+    auto verifs = g_opoiCache.GetShardAuditorVerifications(reqId, 2);
+    BOOST_REQUIRE_EQUAL(verifs.size(), 1u);
+    BOOST_CHECK_EQUAL(verifs[0].status, OPOI_AUDITOR_STATUS_PENDING);
+}
+
+BOOST_AUTO_TEST_CASE(shard_auditor_verifications_quorum_majority_unlocks_winners_slashes_loser_once)
+{
+    // Covers both the "majority unlocked / minority slashed" resolution and
+    // the "only resolves once" guarantee in one flow, mirroring
+    // auditor_verifications_quorum_majority_unlocks_winners_slashes_loser
+    // above exactly, but for a shard-scoped dispute.
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-sav-majority";
+    const uint32_t shardIndex = 4;
+    COutPoint c1 = MakeCollateral("sav-maj-c1"), c2 = MakeCollateral("sav-maj-c2"), c3 = MakeCollateral("sav-maj-c3");
+    g_opoiCache.AddShardAuditorVerification(reqId, shardIndex,
+        MakeShardVerificationWithCollateral(reqId, shardIndex, "auditor1", AUDITOR_VERIFY_PASS, c1));
+    g_opoiCache.AddShardAuditorVerification(reqId, shardIndex,
+        MakeShardVerificationWithCollateral(reqId, shardIndex, "auditor2", AUDITOR_VERIFY_PASS, c2));
+    g_opoiCache.AddShardAuditorVerification(reqId, shardIndex,
+        MakeShardVerificationWithCollateral(reqId, shardIndex, "auditor3", AUDITOR_VERIFY_FAIL, c3));
+
+    ProcessAuditorVerifications(100, params);
+
+    BOOST_CHECK(g_opoiCache.IsShardAuditorResolved(reqId, shardIndex));
+    // Majority (PASS) voters get their collateral back...
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(c1));
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(c2));
+    // ...the lone divergent voter's collateral is burned (slashed, stays locked forever).
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(c3));
+
+    auto verifs = g_opoiCache.GetShardAuditorVerifications(reqId, shardIndex);
+    BOOST_REQUIRE_EQUAL(verifs.size(), 3u);
+    for (const auto& v : verifs) {
+        if (v.auditorAddress == "auditor3")
+            BOOST_CHECK_EQUAL(v.status, OPOI_AUDITOR_STATUS_SLASHED);
+        else
+            BOOST_CHECK_EQUAL(v.status, OPOI_AUDITOR_STATUS_COMPLETE);
+    }
+
+    // A later block re-running this (RebuildOPoICache replay, or simply the
+    // next ConnectBlock) must be a no-op: IsShardAuditorResolved's guard skips
+    // this (requestId, shardIndex) entirely, so nothing gets re-unlocked or
+    // re-slashed — same "resolves exactly once" guarantee the whole-response
+    // path has via IsAuditorResolved.
+    ProcessAuditorVerifications(101, params);
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(c1));
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(c2));
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(c3));
+}
+
+BOOST_AUTO_TEST_CASE(shard_auditor_verifications_tie_resolves_nobody_stays_locked)
+{
+    // Mirrors auditor_verifications_tie_resolves_nobody_stays_locked above:
+    // a straight tie never produces a strict majority, so
+    // ProcessAuditorVerifications' `if (majority < 0) continue;` guard
+    // leaves this shard's dispute completely untouched.
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 2;
+
+    const std::string reqId = "req-sav-tie";
+    const uint32_t shardIndex = 1;
+    COutPoint c1 = MakeCollateral("sav-tie-c1"), c2 = MakeCollateral("sav-tie-c2");
+    g_opoiCache.AddShardAuditorVerification(reqId, shardIndex,
+        MakeShardVerificationWithCollateral(reqId, shardIndex, "auditor1", AUDITOR_VERIFY_PASS, c1));
+    g_opoiCache.AddShardAuditorVerification(reqId, shardIndex,
+        MakeShardVerificationWithCollateral(reqId, shardIndex, "auditor2", AUDITOR_VERIFY_FAIL, c2));
+
+    ProcessAuditorVerifications(100, params);
+
+    BOOST_CHECK(!g_opoiCache.IsShardAuditorResolved(reqId, shardIndex));
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(c1)); // still locked, not refunded
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(c2)); // still locked, not slashed either
+
+    auto verifs = g_opoiCache.GetShardAuditorVerifications(reqId, shardIndex);
+    for (const auto& v : verifs)
+        BOOST_CHECK_EQUAL(v.status, OPOI_AUDITOR_STATUS_PENDING);
+}
+
+BOOST_AUTO_TEST_CASE(shard_auditor_resolution_independent_from_whole_response_same_request_id)
+{
+    // The critical D2-follow-up safety property: a whole-response dispute AND
+    // a shard-scoped dispute for the SAME requestId must resolve completely
+    // independently. Resolving the shard-scoped one must not mark/touch the
+    // whole-response resolution (or its collateral) for that requestId, and
+    // vice versa.
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-independent";
+    const uint32_t shardIndex = 7;
+
+    // Whole-response votes: unanimous PASS -> resolves immediately.
+    COutPoint wc1 = MakeCollateral("indep-whole-c1");
+    COutPoint wc2 = MakeCollateral("indep-whole-c2");
+    COutPoint wc3 = MakeCollateral("indep-whole-c3");
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "w-auditor1", AUDITOR_VERIFY_PASS, wc1));
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "w-auditor2", AUDITOR_VERIFY_PASS, wc2));
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "w-auditor3", AUDITOR_VERIFY_PASS, wc3));
+
+    // Shard-scoped votes for the SAME requestId: only 2 of 3 in so far — not
+    // yet at quorum.
+    COutPoint sc1 = MakeCollateral("indep-shard-c1");
+    COutPoint sc2 = MakeCollateral("indep-shard-c2");
+    g_opoiCache.AddShardAuditorVerification(reqId, shardIndex,
+        MakeShardVerificationWithCollateral(reqId, shardIndex, "s-auditor1", AUDITOR_VERIFY_FAIL, sc1));
+    g_opoiCache.AddShardAuditorVerification(reqId, shardIndex,
+        MakeShardVerificationWithCollateral(reqId, shardIndex, "s-auditor2", AUDITOR_VERIFY_FAIL, sc2));
+
+    ProcessAuditorVerifications(100, params);
+
+    // Whole-response resolved (unanimous PASS, quorum met)...
+    BOOST_CHECK(g_opoiCache.IsAuditorResolved(reqId));
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(wc1));
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(wc2));
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(wc3));
+    // ...while the shard-scoped dispute for the SAME requestId is untouched —
+    // not enough votes yet, and NOT resolved just because the whole-response
+    // side resolved.
+    BOOST_CHECK(!g_opoiCache.IsShardAuditorResolved(reqId, shardIndex));
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(sc1));
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(sc2));
+
+    // Now bring the shard-scoped dispute to quorum (3rd vote, matching the
+    // existing FAIL majority) and re-run.
+    COutPoint sc3 = MakeCollateral("indep-shard-c3");
+    g_opoiCache.AddShardAuditorVerification(reqId, shardIndex,
+        MakeShardVerificationWithCollateral(reqId, shardIndex, "s-auditor3", AUDITOR_VERIFY_PASS, sc3));
+    ProcessAuditorVerifications(101, params);
+
+    BOOST_CHECK(g_opoiCache.IsShardAuditorResolved(reqId, shardIndex));
+    // s-auditor1/2 voted FAIL, which is the majority (2 of 3) -> their
+    // collateral unlocks; s-auditor3 (PASS, the lone minority) stays locked.
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(sc1));
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(sc2));
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(sc3));
+    auto shardVerifs = g_opoiCache.GetShardAuditorVerifications(reqId, shardIndex);
+    BOOST_REQUIRE_EQUAL(shardVerifs.size(), 3u);
+    for (const auto& v : shardVerifs) {
+        if (v.auditorAddress == "s-auditor3")
+            BOOST_CHECK_EQUAL(v.status, OPOI_AUDITOR_STATUS_SLASHED);
+        else
+            BOOST_CHECK_EQUAL(v.status, OPOI_AUDITOR_STATUS_COMPLETE);
+    }
+    // The whole-response resolution and its (already-unlocked) collateral
+    // remain completely unaffected by any of the shard-scoped activity above.
+    BOOST_CHECK(g_opoiCache.IsAuditorResolved(reqId));
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(wc1));
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(wc2));
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(wc3));
+}
+
+BOOST_AUTO_TEST_CASE(shard_auditor_verification_undo_via_process_opoi_transaction)
+{
+    // Mirrors auditor_verifications_undo_via_process_opoi_transaction above
+    // exactly, but for the isShardScoped branch of ProcessOPoITransaction's
+    // AUDITOR_VERIFY undo handling: undoing a shard-scoped vote must call
+    // UnmarkShardAuditorResolved (not UnmarkAuditorResolved), reopening ONLY
+    // the shard-scoped resolution, and must leave a SLASHED vote's collateral
+    // permanently burned rather than releasing it.
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-sav-undo";
+    const uint32_t shardIndex = 9;
+    COutPoint c1 = MakeCollateral("sav-undo-c1"), c2 = MakeCollateral("sav-undo-c2"), c3 = MakeCollateral("sav-undo-c3");
+    g_opoiCache.AddShardAuditorVerification(reqId, shardIndex,
+        MakeShardVerificationWithCollateral(reqId, shardIndex, "auditor1", AUDITOR_VERIFY_PASS, c1));
+    g_opoiCache.AddShardAuditorVerification(reqId, shardIndex,
+        MakeShardVerificationWithCollateral(reqId, shardIndex, "auditor2", AUDITOR_VERIFY_PASS, c2));
+    g_opoiCache.AddShardAuditorVerification(reqId, shardIndex,
+        MakeShardVerificationWithCollateral(reqId, shardIndex, "auditor3", AUDITOR_VERIFY_FAIL, c3));
+
+    ProcessAuditorVerifications(100, params);
+    BOOST_REQUIRE(g_opoiCache.IsShardAuditorResolved(reqId, shardIndex));
+    BOOST_REQUIRE(g_opoiCache.IsLockedUTXO(c3)); // slashed, burned
+
+    CTransaction undoTx = MakeShardAuditorVerifyTxWithCollateral(reqId, shardIndex, "auditor3", AUDITOR_VERIFY_FAIL, c3);
+    bool ok = ProcessOPoITransaction(undoTx, 100, /*fUndo=*/true, &params);
+    BOOST_CHECK(ok);
+
+    // The vote itself is gone...
+    auto verifs = g_opoiCache.GetShardAuditorVerifications(reqId, shardIndex);
+    for (const auto& v : verifs)
+        BOOST_CHECK(v.auditorAddress != "auditor3");
+    // ...the shard-scoped resolution is reopened...
+    BOOST_CHECK(!g_opoiCache.IsShardAuditorResolved(reqId, shardIndex));
+    // ...and the burned collateral correctly STAYS locked — it was never
+    // unlocked as a SLASHED minority vote, and undoing the vote must not
+    // release it.
+    BOOST_CHECK(g_opoiCache.IsLockedUTXO(c3));
+}
+
+BOOST_AUTO_TEST_CASE(shard_auditor_verification_undo_does_not_touch_whole_response_resolution)
+{
+    // Symmetric counterpart of shard_auditor_resolution_independent_from_whole_response_same_request_id:
+    // proves the undo path's independence too. A whole-response resolution
+    // for a requestId must survive completely untouched when a shard-scoped
+    // AUDITOR_VERIFY tx for that SAME requestId is undone — this is exactly
+    // what ProcessOPoITransaction's `isShardScoped` branch (calling
+    // UnmarkShardAuditorResolved instead of UnmarkAuditorResolved) is for.
+    Consensus::Params params;
+    params.nOPoIMinAuditors = 3;
+
+    const std::string reqId = "req-undo-independent";
+    const uint32_t shardIndex = 6;
+
+    // Whole-response: unanimous PASS, resolves immediately.
+    COutPoint wc1 = MakeCollateral("undo-indep-whole-c1");
+    COutPoint wc2 = MakeCollateral("undo-indep-whole-c2");
+    COutPoint wc3 = MakeCollateral("undo-indep-whole-c3");
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "w-auditor1", AUDITOR_VERIFY_PASS, wc1));
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "w-auditor2", AUDITOR_VERIFY_PASS, wc2));
+    g_opoiCache.AddAuditorVerification(MakeVerificationWithCollateral(reqId, "w-auditor3", AUDITOR_VERIFY_PASS, wc3));
+
+    // Shard-scoped: unanimous PASS too, also resolves.
+    COutPoint sc1 = MakeCollateral("undo-indep-shard-c1");
+    COutPoint sc2 = MakeCollateral("undo-indep-shard-c2");
+    COutPoint sc3 = MakeCollateral("undo-indep-shard-c3");
+    g_opoiCache.AddShardAuditorVerification(reqId, shardIndex,
+        MakeShardVerificationWithCollateral(reqId, shardIndex, "s-auditor1", AUDITOR_VERIFY_PASS, sc1));
+    g_opoiCache.AddShardAuditorVerification(reqId, shardIndex,
+        MakeShardVerificationWithCollateral(reqId, shardIndex, "s-auditor2", AUDITOR_VERIFY_PASS, sc2));
+    g_opoiCache.AddShardAuditorVerification(reqId, shardIndex,
+        MakeShardVerificationWithCollateral(reqId, shardIndex, "s-auditor3", AUDITOR_VERIFY_PASS, sc3));
+
+    ProcessAuditorVerifications(100, params);
+    BOOST_REQUIRE(g_opoiCache.IsAuditorResolved(reqId));
+    BOOST_REQUIRE(g_opoiCache.IsShardAuditorResolved(reqId, shardIndex));
+
+    // Undo one shard-scoped vote (s-auditor3, COMPLETE — a harmless-to-unlock
+    // majority vote, same as the whole-response undo test's "PENDING/COMPLETE
+    // both unlock harmlessly" case).
+    CTransaction undoTx = MakeShardAuditorVerifyTxWithCollateral(reqId, shardIndex, "s-auditor3", AUDITOR_VERIFY_PASS, sc3);
+    BOOST_CHECK(ProcessOPoITransaction(undoTx, 100, /*fUndo=*/true, &params));
+
+    // Only the shard-scoped resolution reopened...
+    BOOST_CHECK(!g_opoiCache.IsShardAuditorResolved(reqId, shardIndex));
+    // ...the whole-response resolution for the SAME requestId is entirely
+    // untouched: still resolved, its votes and collateral state unchanged.
+    BOOST_CHECK(g_opoiCache.IsAuditorResolved(reqId));
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(wc1));
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(wc2));
+    BOOST_CHECK(!g_opoiCache.IsLockedUTXO(wc3));
+    auto wholeVerifs = g_opoiCache.GetAuditorVerifications(reqId);
+    BOOST_REQUIRE_EQUAL(wholeVerifs.size(), 3u);
+    for (const auto& v : wholeVerifs)
+        BOOST_CHECK_EQUAL(v.status, OPOI_AUDITOR_STATUS_COMPLETE);
 }
 
 // ── ProcessShardPayments (F16 mutation wrapper) ───────────────────────────

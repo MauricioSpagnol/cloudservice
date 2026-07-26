@@ -700,14 +700,13 @@ public:
     // is provably unchanged rather than merely "should still work". Keyed
     // the same way mapShardResults already is (see ShardKey below).
     //
-    // Known v1 limitation (mirrors ProcessAuditorVerifications' own "known v1
-    // limitation" doc comment for the whole-response case): entries here are
-    // NOT yet resolved by ProcessAuditorVerifications — that function only
-    // ever walks mapAuditorVerifications — so a shard-scoped Auditor's
-    // collateral locks (AddShardAuditorVerification, same as the
-    // whole-response path) but has no automatic unlock/slash path yet. Wiring
-    // real economic resolution for shard-level routing disputes is a
-    // follow-up increment, not part of this schema/lookup extension.
+    // D2 follow-up (2026-07-26): entries here ARE now resolved automatically
+    // — ProcessAuditorVerifications (opoi.cpp) walks this map too, in its own
+    // loop separate from mapAuditorVerifications's, computing each
+    // (requestId, shardIndex)'s majority via GetShardAuditorMajorityResult and
+    // unlocking/slashing collateral exactly like the whole-response loop does,
+    // guarded by setResolvedShardAuditorVerifications (IsShardAuditorResolved/
+    // MarkShardAuditorResolved below) so it only ever fires once per shard.
     std::map<std::string, std::vector<AuditorVerification>> mapShardAuditorVerifications;
 
     // F15-A: Model Manifests (dense/MoE/hybrid) — modelId → manifest
@@ -730,6 +729,20 @@ public:
     // (majority reached, collateral released/slashed) — prevents re-resolving
     // (and re-unlocking already-unlocked collateral) on a later block.
     std::set<std::string> setResolvedAuditorVerifications;
+
+    // D2 shard-scoped resolution (2026-07-26 follow-up): the exact same
+    // "resolved exactly once" bookkeeping as setResolvedAuditorVerifications
+    // above, but for shard-scoped Auditor disputes (mapShardAuditorVerifications)
+    // — keyed by ShardKey(requestId, shardIndex) instead of plain requestId,
+    // same as mapShardResults/setPaidShards are keyed relative to
+    // mapResponses/setPaidResponses. Deliberately a SEPARATE set rather than
+    // reusing setResolvedAuditorVerifications's key space: a shard-scoped
+    // resolution for (requestId, shardIndex) must never be confused with, or
+    // interfere with, the whole-response resolution for the SAME requestId —
+    // see ProcessOPoITransaction's AUDITOR_VERIFY undo-path handling (opoi.cpp)
+    // for why that independence is load-bearing (undoing one must never
+    // incorrectly clear the other's resolved state).
+    std::set<std::string> setResolvedShardAuditorVerifications;
 
     // F14-C: requestIds whose VERIFIABLE RESPONSE has already been paid —
     // see IsResponsePaid/MarkResponsePaid/UnmarkResponsePaid below.
@@ -775,6 +788,7 @@ public:
         mapModelManifests.clear(); mapModelVotes.clear();
         mapCoordinatorClaims.clear(); mapShardResults.clear();
         setPaidShards.clear(); setResolvedAuditorVerifications.clear();
+        setResolvedShardAuditorVerifications.clear();
         setPaidResponses.clear(); setPaidChallengerRewards.clear();
         mapPendingDeliveries.clear(); setKnownOPoIDataHashes.clear();
         mapContentByKey.clear();
@@ -1268,8 +1282,10 @@ public:
             if (existing.auditorAddress == fv.auditorAddress) return true; // one vote per Auditor
         verifs.push_back(fv);
         // Lock Auditor's collateral — same side effect as the whole-response
-        // path (AddAuditorVerification above); see mapShardAuditorVerifications'
-        // doc comment for the known v1 limitation (no automatic unlock yet).
+        // path (AddAuditorVerification above); unlocked/slashed automatically
+        // once quorum resolves this (requestId, shardIndex), same as the
+        // whole-response path (see ProcessAuditorVerifications' shard-scoped
+        // loop in opoi.cpp).
         if (!fv.auditorCollateral.IsNull()) {
             mapLockedUTXOs[fv.auditorCollateral] = fv.auditorAddress;
             mapLockingTxHash[fv.auditorCollateral] = fv.txHash;
@@ -1309,6 +1325,21 @@ public:
     void MarkAuditorResolved(const std::string& requestId) {
         LOCK(cs);
         setResolvedAuditorVerifications.insert(requestId);
+    }
+
+    // D2 shard-scoped resolution (2026-07-26 follow-up): mirrors
+    // IsAuditorResolved/MarkAuditorResolved exactly, but keyed by
+    // ShardKey(requestId, shardIndex) against the separate
+    // setResolvedShardAuditorVerifications set — see that set's doc comment
+    // above for why it's kept independent from setResolvedAuditorVerifications.
+    bool IsShardAuditorResolved(const std::string& requestId, uint32_t shardIndex) const {
+        LOCK(cs);
+        return setResolvedShardAuditorVerifications.count(ShardKey(requestId, shardIndex)) > 0;
+    }
+
+    void MarkShardAuditorResolved(const std::string& requestId, uint32_t shardIndex) {
+        LOCK(cs);
+        setResolvedShardAuditorVerifications.insert(ShardKey(requestId, shardIndex));
     }
 
     // ── OPoI relay: pending deliveries ────────────────────────────────────────
@@ -1401,6 +1432,18 @@ public:
     void UnmarkAuditorResolved(const std::string& requestId) {
         LOCK(cs);
         setResolvedAuditorVerifications.erase(requestId);
+    }
+
+    // D2 shard-scoped resolution (2026-07-26 follow-up): mirrors
+    // UnmarkAuditorResolved exactly, but for the shard-scoped set — called
+    // from ProcessOPoITransaction's AUDITOR_VERIFY undo branch when
+    // tx.opoiShardIndex is real (isShardScoped), instead of
+    // UnmarkAuditorResolved (which stays reserved for whole-response undo,
+    // keeping the two resolution tracks independent — see
+    // setResolvedShardAuditorVerifications' doc comment above).
+    void UnmarkShardAuditorResolved(const std::string& requestId, uint32_t shardIndex) {
+        LOCK(cs);
+        setResolvedShardAuditorVerifications.erase(ShardKey(requestId, shardIndex));
     }
 
     // ── Phase 3: challenges ───────────────────────────────────────────────────
@@ -1597,6 +1640,13 @@ void ProcessVerifiableResponsePayments(const std::vector<CTransaction>& vtx, con
 // (unlock majority collateral, slash minority). See opoi.cpp for full rationale.
 // Order relative to ProcessVerifiableResponsePayments (above) doesn't matter —
 // GetVerifiablePaymentsForBlock recomputes the majority itself either way.
+//
+// D2 follow-up (2026-07-26): also resolves shard-scoped Auditor disputes
+// (mapShardAuditorVerifications, keyed by ShardKey(requestId, shardIndex))
+// in its own internal loop, same unlock-majority/burn-minority treatment,
+// guarded by setResolvedShardAuditorVerifications instead of
+// setResolvedAuditorVerifications so the two resolution tracks never
+// interfere with each other for the same requestId. See opoi.cpp.
 void ProcessAuditorVerifications(uint32_t blockHeight, const Consensus::Params& params);
 
 // ── Phase 5: challenger rewards ───────────────────────────────────────────────

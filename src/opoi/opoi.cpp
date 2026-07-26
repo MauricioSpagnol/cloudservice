@@ -434,13 +434,22 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
             // D2 routing-trace dispute (2026-07-26): a shard-scoped
             // verification (tx.opoiShardIndex != OPOI_AUDITOR_VERIFY_NO_SHARD)
             // lives in mapShardAuditorVerifications instead — same erase
-            // logic, different backing map, and it is deliberately NOT run
-            // through UnmarkAuditorResolved below: that bookkeeping
+            // logic, different backing map. It is deliberately NOT run through
+            // UnmarkAuditorResolved below: that bookkeeping
             // (setResolvedAuditorVerifications) is only ever set by
-            // ProcessAuditorVerifications, which only ever walks
-            // mapAuditorVerifications (whole-response) — calling it here for
-            // a shard-scoped tx would incorrectly clear a DIFFERENT,
+            // ProcessAuditorVerifications' whole-response loop, which only
+            // ever walks mapAuditorVerifications — calling it here for a
+            // shard-scoped tx would incorrectly clear a DIFFERENT,
             // already-resolved whole-response verdict for the same requestId.
+            //
+            // D2 resolution follow-up (2026-07-26): a shard-scoped tx instead
+            // gets its OWN symmetric undo — UnmarkShardAuditorResolved(requestId,
+            // shardIndex) — reopening ProcessAuditorVerifications' shard-scoped
+            // loop (which marks setResolvedShardAuditorVerifications, a
+            // wholly separate set) so a reorg that removes the vote that
+            // tipped a shard's quorum correctly makes that shard eligible to
+            // resolve again, exactly mirroring what UnmarkAuditorResolved does
+            // for the whole-response case, in its own independent key space.
             int8_t status = OPOI_AUDITOR_STATUS_PENDING;
             bool isShardScoped = (tx.opoiShardIndex != OPOI_AUDITOR_VERIFY_NO_SHARD);
             auto& verifMap = isShardScoped ? g_opoiCache.mapShardAuditorVerifications
@@ -466,6 +475,8 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
             }
             if (!isShardScoped)
                 g_opoiCache.UnmarkAuditorResolved(tx.opoiRequestId);
+            else
+                g_opoiCache.UnmarkShardAuditorResolved(tx.opoiRequestId, tx.opoiShardIndex);
         }
         return true;
     }
@@ -2406,6 +2417,24 @@ void ProcessVerifiableResponsePayments(const std::vector<CTransaction>& vtx, con
 // — same "never resolves = never pays" behavior the rest of OPoI already has.
 // A quorum-degradation policy mirroring F15-F (GetEffectiveShardMinSubmissions)
 // would be a reasonable follow-up, not implemented here.
+//
+// D2 follow-up (2026-07-26): a second loop below does the exact same thing
+// for shard-scoped Auditor disputes (mapShardAuditorVerifications, one
+// specific EXPERT/DENSE shard's routing-trace commitment rather than the
+// whole RESPONSE — see AuditorVerification::IsShardScoped()/opoi.h's doc
+// comments). Kept as a genuinely separate loop over a separate map, guarded
+// by a separate "resolved" set (setResolvedShardAuditorVerifications via
+// IsShardAuditorResolved/MarkShardAuditorResolved) rather than folded into
+// the loop above, for the same reason mapShardAuditorVerifications itself is
+// a separate map: so the whole-response resolution above stays provably
+// unchanged rather than merely "should still work" once shard-scoped votes
+// exist for the same requestId. It deliberately does NOT replicate the
+// canary-strike/obligation-clearing side effect below (the block guarded by
+// `if (majority == AUDITOR_VERIFY_FAIL) ... req.isCanary ...`): that logic
+// identifies "the responding miner" via mapResponses, a whole-RESPONSE
+// concept with no shard-scoped equivalent — a shard's result can come from
+// many miners (mapShardResults/ShardResultSubmission), not one responder to
+// strike.
 
 void ProcessAuditorVerifications(uint32_t blockHeight, const Consensus::Params& params)
 {
@@ -2485,6 +2514,49 @@ void ProcessAuditorVerifications(uint32_t blockHeight, const Consensus::Params& 
                 }
             }
         }
+    }
+
+    // D2 shard-scoped resolution (2026-07-26 follow-up) — see this function's
+    // header comment above for the full rationale. Mirrors the whole-response
+    // loop above exactly: same majority computation (ComputeAuditorMajority,
+    // fed this shard's own vector via GetShardAuditorMajorityResult), same
+    // unlock-majority/burn-minority collateral treatment, same "resolved
+    // exactly once" guard — just over mapShardAuditorVerifications (keyed by
+    // ShardKey(requestId, shardIndex)) instead of mapAuditorVerifications
+    // (keyed by plain requestId), and marking
+    // setResolvedShardAuditorVerifications instead of
+    // setResolvedAuditorVerifications.
+    for (auto& kv : g_opoiCache.mapShardAuditorVerifications) {
+        auto& verifs = kv.second;
+        // A shard-scoped requestId's votes can all have been undone (reorg)
+        // while the map key itself lingers empty — same shape
+        // ComputeAuditorMajority already handles gracefully (0 revealed votes
+        // never reaches quorum), but skip explicitly rather than dereference
+        // verifs.front() below on an empty vector.
+        if (verifs.empty()) continue;
+
+        const std::string& requestId = verifs.front().requestId;
+        uint32_t shardIndex = verifs.front().shardIndex;
+        if (g_opoiCache.IsShardAuditorResolved(requestId, shardIndex)) continue;
+
+        int majority = ComputeAuditorMajority(verifs, params.nOPoIMinAuditors);
+        if (majority < 0) continue; // no quorum yet
+
+        for (auto& fv : verifs) {
+            if ((int)fv.result == majority) {
+                g_opoiCache.UnlockUTXO(fv.auditorCollateral);
+                fv.status = OPOI_AUDITOR_STATUS_COMPLETE;
+            } else {
+                // Collateral stays locked permanently (burned) — same as the
+                // whole-response case above.
+                fv.status = OPOI_AUDITOR_STATUS_SLASHED;
+                LogPrintf("OPoI: SLASH shard-auditor %s — verdict %d disagreed with majority %d for "
+                          "request %s shard %u at height %u — collateral %s:%u permanently locked\n",
+                          fv.auditorAddress, (int)fv.result, majority, requestId, shardIndex,
+                          blockHeight, fv.auditorCollateral.hash.GetHex(), fv.auditorCollateral.n);
+            }
+        }
+        g_opoiCache.MarkShardAuditorResolved(requestId, shardIndex);
     }
 }
 
