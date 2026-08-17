@@ -398,7 +398,12 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_P2SHNODES].nActivationHeight = Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
 
         consensus.vUpgrades[Consensus::UPGRADE_OPOI].nProtocolVersion = 170020;
-        consensus.vUpgrades[Consensus::UPGRADE_OPOI].nActivationHeight = 5000;
+        // Lowered from 5000 (2026-08-17): this local/dev testnet had zero
+        // seed nodes and zero external participants at the time (confirmed
+        // — vSeeds/pnSeed6_test empty), so this was the right moment to fix
+        // it, before any real partner (e.g. a pool operator) joins and the
+        // height becomes load-bearing for someone else's chain state.
+        consensus.vUpgrades[Consensus::UPGRADE_OPOI].nActivationHeight = 50;
 
         // OPoI Phase 3 escrow (testnet — lower values for easier testing)
         consensus.nOPoIMinStake              = 10 * COIN;   // 10 CS on testnet
