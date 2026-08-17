@@ -172,6 +172,15 @@ struct OPoIResponse {
     uint32_t    blockHeight;
     uint32_t    sigTime;
     uint256     txHash;
+    // F14-F: post-commit audit sortition result, decided once at REVEAL time
+    // (EvaluateOPoIAuditSample, opoi.cpp) and persisted here so every later
+    // block re-evaluates the SAME answer instead of recomputing against a
+    // possibly-changed OPoIStake::responsesTotal. auditDeadline is only
+    // meaningful when auditSelected is true — the height past which an
+    // unresolved selected response pays out anyway (see
+    // nOPoIAuditWindowBlocks, consensus/params.h).
+    uint8_t     auditSelected;
+    uint32_t    auditDeadline;
 
     ADD_SERIALIZE_METHODS;
     template <typename Stream, typename Operation>
@@ -180,6 +189,7 @@ struct OPoIResponse {
         READWRITE(commitment); READWRITE(tokenCount);
         READWRITE(responsePhase); READWRITE(responseCommitHash); READWRITE(commitHeight);
         READWRITE(blockHeight); READWRITE(sigTime); READWRITE(txHash);
+        READWRITE(auditSelected); READWRITE(auditDeadline);
     }
 
     void SetNull() {
@@ -187,6 +197,7 @@ struct OPoIResponse {
         commitment.SetNull(); tokenCount = 0;
         responsePhase = 0; responseCommitHash.clear(); commitHeight = 0;
         blockHeight = 0; sigTime = 0; txHash.SetNull();
+        auditSelected = 0; auditDeadline = 0;
     }
     bool IsNull()     const { return requestId.empty(); }
     bool IsRevealed() const { return responsePhase == 1; }
@@ -665,6 +676,11 @@ public:
     // mapResponseCommits's value type) since the commit hash string is
     // already used/displayed elsewhere unchanged.
     std::map<std::string, uint256>      mapResponseCommitTxHash; // "reqId:minerAddr" → committing txid
+    // F14-F: block height the COMMIT confirmed at — "reqId:minerAddr" → height.
+    // Needed as the audit-sortition seed anchor (GetOPoIAuditSampleSeedHash,
+    // opoi.cpp uses commitHeight+1). AddResponseCommit already received a
+    // blockHeight parameter before this — it was simply never stored anywhere.
+    std::map<std::string, uint32_t>     mapResponseCommitHeight;
 
     // Phase 3
     std::map<std::string, OPoIStake>     mapStakes;     // minerAddress → OPoIStake
@@ -781,7 +797,7 @@ public:
     void SetNull() {
         LOCK(cs);
         mapRequests.clear(); mapResponses.clear(); mapResponseCommits.clear();
-        mapResponseCommitTxHash.clear();
+        mapResponseCommitTxHash.clear(); mapResponseCommitHeight.clear();
         mapStakes.clear(); mapChallenges.clear();
         mapLockedUTXOs.clear(); mapAuditorVerifications.clear();
         mapShardAuditorVerifications.clear();
@@ -1094,10 +1110,23 @@ public:
         std::string key = requestId + ":" + minerAddress;
         mapResponseCommits[key] = commitHash;
         mapResponseCommitTxHash[key] = txHash;
+        mapResponseCommitHeight[key] = blockHeight; // F14-F: audit-sortition seed anchor
         // Track in request
         auto it = mapRequests.find(requestId);
         if (it != mapRequests.end())
             it->second.responseCommits[minerAddress] = commitHash;
+        return true;
+    }
+
+    // F14-F: block height of the COMMIT tx for (requestId, minerAddress) —
+    // the audit-sortition seed anchors to one block past this.
+    bool GetResponseCommitHeight(const std::string& requestId,
+                                 const std::string& minerAddress,
+                                 uint32_t& outHeight) const {
+        LOCK(cs);
+        auto it = mapResponseCommitHeight.find(requestId + ":" + minerAddress);
+        if (it == mapResponseCommitHeight.end()) return false;
+        outHeight = it->second;
         return true;
     }
 
@@ -1648,6 +1677,41 @@ void ProcessVerifiableResponsePayments(const std::vector<CTransaction>& vtx, con
 // setResolvedAuditorVerifications so the two resolution tracks never
 // interfere with each other for the same requestId. See opoi.cpp.
 void ProcessAuditorVerifications(uint32_t blockHeight, const Consensus::Params& params);
+
+// F14-F: decides whether an OPEN-task RESPONSE (requestId, minerAddress) is
+// drawn into the post-commit audit sortition — see the full rationale next to
+// nOPoIAuditSampleRateBp (consensus/params.h) and the implementation (opoi.cpp).
+// Returns false only if the request/commit data can't be found; VERIFIABLE
+// requests always come back with outSelected=false (exempt, F14-C already
+// covers them). Exported (unlike GetOPoIRequestSeedHash) because CreateNewBlock
+// (miner.cpp) needs the exact same same-block decision CheckOPoIPayments makes.
+bool EvaluateOPoIAuditSample(const std::string& requestId, const std::string& minerAddress,
+                             uint32_t currentHeight, const Consensus::Params& params,
+                             bool& outSelected, uint32_t& outDeadline);
+
+// F14-F: audit-sampled OPEN-task RESPONSE payments newly owed — every cached
+// response whose request is OPEN, was selected for audit
+// (OPoIResponse::auditSelected), isn't in OPoICache::setPaidResponses yet
+// (reused as-is from F14-C — a request has at most one RESPONSE either way),
+// and either (a) its Auditor verifications (pre-block cache combined with
+// this block's own not-yet-applied AUDITOR_VERIFY txs, same idempotent merge
+// GetVerifiablePaymentsForBlock uses) resolve to a PASS majority, or (b) a
+// FAIL majority was NEVER reached and currentHeight has passed
+// auditDeadline (nOPoIAuditWindowBlocks after REVEAL) with no quorum at all
+// — pays out anyway rather than blocking an honest miner's payment forever
+// just because nobody audited them (F14-C's own VERIFIABLE path has no such
+// timeout — a deliberate improvement here, not a regression there). A
+// resolved FAIL majority is never paid, same as F14-C. Called by
+// CreateNewBlock and CheckOPoIPayments, which must see the same vtx/height
+// to agree on the result.
+std::vector<OPoIResponsePayment> GetAuditSampledOpenPaymentsForBlock(
+    const std::vector<CTransaction>& vtx, uint32_t currentHeight, const Consensus::Params& params);
+
+// F14-F: called from ConnectBlock/RebuildOPoICache after the per-tx apply
+// loop — marks every audit-sampled OPEN response paid this block (per
+// GetAuditSampledOpenPaymentsForBlock).
+void ProcessAuditSampledOpenResponsePayments(const std::vector<CTransaction>& vtx,
+                                             uint32_t currentHeight, const Consensus::Params& params);
 
 // ── Phase 5: challenger rewards ───────────────────────────────────────────────
 

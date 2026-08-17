@@ -660,6 +660,17 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
                 // below (GetVerifiablePaymentsForBlock), mirroring CheckOPoIPayments.
                 if (req.IsVerifiable())
                     continue;
+                // F14-F: an OPEN response the post-commit audit sortition
+                // selected is deferred exactly like a VERIFIABLE response —
+                // see GetAuditSampledOpenPaymentsForBlock below, mirrors
+                // CheckOPoIPayments exactly.
+                {
+                    bool selected = false; uint32_t deadline = 0;
+                    EvaluateOPoIAuditSample(vtx.opoiRequestId, vtx.opoiMinerAddress,
+                                            (uint32_t)nHeight, chainparams.GetConsensus(),
+                                            selected, deadline);
+                    if (selected) continue;
+                }
                 CTxDestination minerDest = DecodeDestination(vtx.opoiMinerAddress);
                 if (!IsValidDestination(minerDest))
                     continue;
@@ -711,6 +722,25 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
             // GetVerifiablePaymentsForBlock; mirrors CheckOPoIPayments exactly).
             {
                 for (const auto& p : GetVerifiablePaymentsForBlock(pblock->vtx, chainparams.GetConsensus())) {
+                    CTxDestination minerDest = DecodeDestination(p.minerAddress);
+                    if (!IsValidDestination(minerDest))
+                        continue;
+                    if (totalOPoIPayment + p.amount > opoiBudget)
+                        continue;
+                    if (totalOPoIPayment + p.amount > txNew.vout[0].nValue)
+                        continue;
+                    txNew.vout.push_back(CTxOut(p.amount, GetScriptForDestination(minerDest)));
+                    totalOPoIPayment += p.amount;
+                }
+            }
+
+            // F14-F: audit-sampled OPEN-task RESPONSE payments that just
+            // resolved PASS, or whose timeout window passed unresolved
+            // (deferred — see the `continue` above and
+            // GetAuditSampledOpenPaymentsForBlock; mirrors CheckOPoIPayments exactly).
+            {
+                for (const auto& p : GetAuditSampledOpenPaymentsForBlock(pblock->vtx, (uint32_t)nHeight,
+                                                                          chainparams.GetConsensus())) {
                     CTxDestination minerDest = DecodeDestination(p.minerAddress);
                     if (!IsValidDestination(minerDest))
                         continue;

@@ -216,6 +216,15 @@ public:
         consensus.nOPoIMinAuditors           = 3;           // odd ≥ 3, majority always decisive
         consensus.nOPoIAuditorMinCollateral  = 50 * COIN;   // 50 CS minimum collateral
 
+        // F14-F — post-commit audit sortition for OPEN-task responses. The
+        // sample rate itself doesn't need per-network scaling (a percentage
+        // is testable at any block-production speed by generating enough
+        // responses) — only the timeout window is block-count-based.
+        consensus.nOPoIAuditSampleRateBp                = 1500;  // 15%
+        consensus.nOPoIAuditSampleRateNewMinerBp        = 10000; // 100% for new miners
+        consensus.nOPoIAuditSampleNewMinerResponseCount = 5;
+        consensus.nOPoIAuditWindowBlocks                = 200;   // ~83 minutes to resolve once selected
+
         // F15-A2 — Model Manifest governance
         consensus.nOPoIModelVoteWindowBlocks      = 4032;   // ~4 weeks voting window
         consensus.nOPoIModelApprovalPct           = 66;     // 66% of active stake to approve
@@ -433,6 +442,13 @@ public:
         consensus.nOPoIMinAuditors           = 3;
         consensus.nOPoIAuditorMinCollateral  = 5 * COIN;
 
+        // F14-F — post-commit audit sortition for OPEN-task responses
+        // (testnet — same rate as mainnet, shorter timeout window)
+        consensus.nOPoIAuditSampleRateBp                = 1500;
+        consensus.nOPoIAuditSampleRateNewMinerBp        = 10000;
+        consensus.nOPoIAuditSampleNewMinerResponseCount = 5;
+        consensus.nOPoIAuditWindowBlocks                = 60;    // ~25 minutes on testnet
+
         // F15-A2 — Model Manifest governance (testnet — faster cycle)
         consensus.nOPoIModelVoteWindowBlocks      = 200;
         consensus.nOPoIModelApprovalPct           = 66;
@@ -626,6 +642,14 @@ public:
         // F14-C — Auditors (regtest — quorum of 1 so a single-node test can resolve it)
         consensus.nOPoIMinAuditors           = 1;
         consensus.nOPoIAuditorMinCollateral  = 1 * COIN;
+
+        // F14-F — post-commit audit sortition for OPEN-task responses
+        // (regtest — same rate as mainnet; the rate itself doesn't need
+        // scaling, only the timeout window, kept small for fast `generate`).
+        consensus.nOPoIAuditSampleRateBp                = 1500;
+        consensus.nOPoIAuditSampleRateNewMinerBp        = 10000;
+        consensus.nOPoIAuditSampleNewMinerResponseCount = 5;
+        consensus.nOPoIAuditWindowBlocks                = 12;
 
         // F15-A2 — Model Manifest governance (regtest — minimal, for fast unit testing)
         consensus.nOPoIModelVoteWindowBlocks      = 5;

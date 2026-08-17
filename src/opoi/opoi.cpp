@@ -287,6 +287,103 @@ static bool GetOPoIRequestSeedHash(const std::string& requestId, uint256& outHas
     return true;
 }
 
+// ── F14-F: post-commit audit sortition for OPEN-task responses ───────────────
+//
+// Reuses GetOPoIRequestSeedHash's future-block-anchoring PATTERN, not its
+// exact anchor. That function anchors to the REQUEST's own confirmation
+// height — already fully known by the time a miner picks their RESPONSE's
+// COMMIT (F10-B), since a RESPONSE can only ever reference an already-mined
+// REQUEST. Reusing it verbatim here would let a miner grind their own commit
+// nonce (free — commitment_hash = SHA256(responseText||nonce), entirely
+// self-chosen, no re-inference needed) until the sortition happens to miss
+// them, defeating the whole point of an unpredictable sample. Anchoring
+// instead to the block ONE PAST the RESPONSE's own COMMIT height closes that
+// gap: that block cannot exist until after the COMMIT is already immutable
+// on-chain, so there is nothing left to grind. See nOPoIAuditSampleRateBp's
+// comment (consensus/params.h) for the full rationale.
+static bool GetOPoIAuditSampleSeedHash(uint32_t commitHeight, uint256& outHash)
+{
+    CBlockIndex* pIndex = chainActive[commitHeight + 1];
+    if (!pIndex) return false;
+    outHash = pIndex->GetBlockHash();
+    return true;
+}
+
+// sorteio = SHA256(commitment_hash || seedHash), compared against a
+// bp-derived threshold — same "hash vs. arith_uint256 threshold" technique
+// CheckVrfSortition/nOPoIVrfThreshold already use above.
+static bool ComputeOPoIAuditSampleSelected(const std::vector<unsigned char>& commitmentHashBytes,
+                                           const uint256& seedHash,
+                                           int rateBp)
+{
+    if (rateBp <= 0) return false;
+    if (rateBp >= 10000) return true;
+    if (commitmentHashBytes.size() != 32) return false;
+
+    unsigned char buf[64];
+    memcpy(buf, commitmentHashBytes.data(), 32);
+    memcpy(buf + 32, seedHash.begin(), 32);
+    unsigned char sorteio[32];
+    CSHA256().Write(buf, 64).Finalize(sorteio);
+
+    arith_uint256 val = UintToArith256(uint256(std::vector<unsigned char>(sorteio, sorteio + 32)));
+    arith_uint256 maxVal = ~arith_uint256(0);
+    arith_uint256 threshold = (maxVal / 10000) * (uint64_t)rateBp;
+    return val < threshold;
+}
+
+// Decides (and, if selected, computes the pay-anyway deadline for) whether
+// an OPEN-task RESPONSE is drawn into the F14-F audit sample. Pure function
+// of already-applied cache state (this REVEAL's own OPoIResponse record is
+// deliberately NOT read here — callers may run this either just before that
+// record exists, same block, via CheckOPoIPayments/CreateNewBlock, or after,
+// via ProcessOPoITransaction persisting the answer — both must agree).
+//
+// Returns false only if the request/commit data can't be found (should not
+// happen for a REVEAL that already passed CheckOPoITransaction, but
+// defensive); returns true with outSelected=false for VERIFIABLE requests
+// (F14-C already audits those 100% unconditionally — see the exemption
+// rationale in consensus/params.h) or once selection is decided either way.
+bool EvaluateOPoIAuditSample(const std::string& requestId, const std::string& minerAddress,
+                             uint32_t currentHeight, const Consensus::Params& params,
+                             bool& outSelected, uint32_t& outDeadline)
+{
+    outSelected = false;
+    outDeadline = 0;
+
+    OPoIRequest req;
+    if (!g_opoiCache.GetRequest(requestId, req)) return false;
+    if (req.IsVerifiable()) return true; // exempt — F14-C already covers 100% of these
+
+    uint32_t commitHeight = 0;
+    if (!g_opoiCache.GetResponseCommitHeight(requestId, minerAddress, commitHeight)) return false;
+
+    std::string commitHashHex;
+    if (!g_opoiCache.GetResponseCommit(requestId, minerAddress, commitHashHex)) return false;
+    std::vector<unsigned char> commitmentHashBytes = ParseHex(commitHashHex);
+
+    uint256 seedHash;
+    if (!GetOPoIAuditSampleSeedHash(commitHeight, seedHash)) return false;
+
+    // "New miner" grace period reuses OPoIStake::responsesTotal (F10-C) as-is
+    // — this must read the count as it stood BEFORE this response (i.e. the
+    // pre-block cache, or the pre-increment value within the same
+    // ProcessOPoITransaction call), matching what CheckOPoIPayments/
+    // CreateNewBlock already decided for this same block.
+    uint32_t responsesSoFar = 0;
+    OPoIStake stake;
+    if (g_opoiCache.GetStake(minerAddress, stake)) responsesSoFar = stake.responsesTotal;
+
+    int rateBp = (responsesSoFar < params.nOPoIAuditSampleNewMinerResponseCount)
+                 ? params.nOPoIAuditSampleRateNewMinerBp
+                 : params.nOPoIAuditSampleRateBp;
+
+    outSelected = ComputeOPoIAuditSampleSelected(commitmentHashBytes, seedHash, rateBp);
+    if (outSelected)
+        outDeadline = currentHeight + (uint32_t)std::max(1, params.nOPoIAuditWindowBlocks);
+    return true;
+}
+
 // ── ProcessOPoITransaction ────────────────────────────────────────────────────
 
 bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
@@ -310,6 +407,7 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
                 std::string key = tx.opoiRequestId + ":" + tx.opoiMinerAddress;
                 g_opoiCache.mapResponseCommits.erase(key);
                 g_opoiCache.mapResponseCommitTxHash.erase(key);
+                g_opoiCache.mapResponseCommitHeight.erase(key); // F14-F
                 auto it = g_opoiCache.mapRequests.find(tx.opoiRequestId);
                 if (it != g_opoiCache.mapRequests.end())
                     it->second.responseCommits.erase(tx.opoiMinerAddress);
@@ -528,7 +626,28 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         resp.blockHeight   = blockHeight;
         resp.sigTime       = tx.opoiSigTime;
         resp.txHash        = tx.GetHash();
+        // F14-F: audit-sortition decision, persisted onto the response record
+        // (not just recomputed later) so every future block agrees on the
+        // SAME answer instead of re-deriving it against a possibly-changed
+        // OPoIStake::responsesTotal. Must run BEFORE the ++responsesTotal
+        // just below — the "new miner" grace period is decided against the
+        // miner's count as it stood BEFORE this response, matching exactly
+        // what CheckOPoIPayments/CreateNewBlock already decided for this
+        // same block using the pre-block cache.
+        resp.auditSelected = 0;
+        resp.auditDeadline = 0;
+        if (pparams) {
+            bool selected = false; uint32_t deadline = 0;
+            EvaluateOPoIAuditSample(tx.opoiRequestId, tx.opoiMinerAddress, blockHeight, *pparams,
+                                    selected, deadline);
+            resp.auditSelected = selected ? 1 : 0;
+            resp.auditDeadline = deadline;
+        }
         g_opoiCache.AddResponse(resp);
+        if (resp.auditSelected)
+            LogPrintf("OPoI: RESPONSE for %s by %s SELECTED for F14-F audit sortition — "
+                      "payable once Auditor PASS or by height %u (timeout)\n",
+                      tx.opoiRequestId, tx.opoiMinerAddress, resp.auditDeadline);
         // F10-C: reputation tracking — count this responder's completed RESPONSE.
         {
             auto stakeIt = g_opoiCache.mapStakes.find(tx.opoiMinerAddress);
@@ -813,6 +932,7 @@ void RebuildOPoICache()
                 ProcessModelVotingWindows((uint32_t)pindex->nHeight, params);
                 ProcessShardPayments(block.vtx, params);
                 ProcessVerifiableResponsePayments(block.vtx, params);
+                ProcessAuditSampledOpenResponsePayments(block.vtx, (uint32_t)pindex->nHeight, params);
                 ProcessAuditorVerifications((uint32_t)pindex->nHeight, params);
             }
         }
@@ -1935,6 +2055,11 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
             return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY missing collateralIn"),
                              REJECT_INVALID, "bad-txns-opoi-auditor-no-collateral");
         if (!fIsVerifying) {
+            // Tasks the requester flagged VERIFIABLE (F14-B) always get an
+            // on-chain verdict. An OPEN (prose) task only gets one if F14-F's
+            // post-commit audit sortition actually drew it — an Auditor has
+            // nothing to check (and no reason to lock collateral) on an OPEN
+            // response nobody selected for audit.
             OPoIRequest req;
             if (!g_opoiCache.GetRequest(tx.opoiRequestId, req))
                 return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY for unknown request %s",
@@ -1942,13 +2067,17 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                                  REJECT_INVALID, "bad-txns-opoi-auditor-not-verifiable");
             if (tx.opoiShardIndex == OPOI_AUDITOR_VERIFY_NO_SHARD) {
                 // Whole-response verification (original, still fully supported
-                // shape): only tasks the requester flagged VERIFIABLE (F14-B) get
-                // an on-chain verdict — an Auditor has nothing to check on an
-                // OPEN (prose) task.
-                if (!req.IsVerifiable())
-                    return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY for non-VERIFIABLE request %s",
-                                               tx.opoiRequestId),
-                                     REJECT_INVALID, "bad-txns-opoi-auditor-not-verifiable");
+                // shape): tasks the requester flagged VERIFIABLE (F14-B) always
+                // get an on-chain verdict. An OPEN (prose) task only gets one if
+                // F14-F's post-commit audit sortition actually drew it.
+                if (!req.IsVerifiable()) {
+                    OPoIResponse resp;
+                    bool sampled = g_opoiCache.GetResponse(tx.opoiRequestId, resp) && resp.auditSelected;
+                    if (!sampled)
+                        return state.DoS(10, error("CheckOPoITransaction(): AUDITOR_VERIFY for non-VERIFIABLE, "
+                                                   "non-audit-sampled request %s", tx.opoiRequestId),
+                                         REJECT_INVALID, "bad-txns-opoi-auditor-not-verifiable");
+                }
             } else {
                 // D2 routing-trace dispute (2026-07-26): a shard-scoped
                 // verification checks one EXPERT/DENSE shard's routing-trace
@@ -2113,6 +2242,18 @@ bool CheckOPoIPayments(const std::vector<CTransaction>& vtx,
         if (req.IsVerifiable())
             continue;
 
+        // F14-F: an OPEN response the post-commit audit sortition selected
+        // is deferred exactly like a VERIFIABLE response, just via a
+        // separate pass below (GetAuditSampledOpenPaymentsForBlock) — it
+        // cannot be paid in its own confirming block either, since an
+        // Auditor can only vote on it once it's already on-chain.
+        {
+            bool selected = false; uint32_t deadline = 0;
+            EvaluateOPoIAuditSample(tx.opoiRequestId, tx.opoiMinerAddress,
+                                    (uint32_t)nHeight, params, selected, deadline);
+            if (selected) continue;
+        }
+
         // Total payment = baseFee + tokenCount * feePerToken
         CAmount totalPayment = req.payment;
         if (req.feePerToken > 0 && tx.opoiTokenCount > 0)
@@ -2193,6 +2334,30 @@ bool CheckOPoIPayments(const std::vector<CTransaction>& vtx,
                 return state.DoS(100, error("CheckOPoIPayments(): coinbase missing verifiable payment of %s to %s for request %s",
                                             FormatMoney(p.amount), p.minerAddress, p.requestId),
                                  REJECT_INVALID, "bad-cb-opoi-missing-verifiable-payment");
+            }
+            totalPaymentsChecked += p.amount;
+        }
+    }
+
+    // F14-F: audit-sampled OPEN-task RESPONSE payments — deferred until
+    // either an Auditor PASS majority resolves it or the timeout window
+    // passes with no quorum at all (see GetAuditSampledOpenPaymentsForBlock).
+    {
+        for (const auto& p : GetAuditSampledOpenPaymentsForBlock(vtx, (uint32_t)nHeight, params)) {
+            if (totalPaymentsChecked + p.amount > opoiBudget) {
+                LogPrint("opoi", "CheckOPoIPayments: audit-sampled payment %s to %s exceeds OPoI budget, skipping\n",
+                         FormatMoney(p.amount), p.minerAddress);
+                continue;
+            }
+            CTxDestination minerDest = DecodeDestination(p.minerAddress);
+            if (!IsValidDestination(minerDest))
+                return state.DoS(100, error("CheckOPoIPayments(): audit-sampled RESPONSE has invalid miner address %s",
+                                            p.minerAddress),
+                                 REJECT_INVALID, "bad-cb-opoi-invalid-audit-sample-miner-addr");
+            if (!findAndClaimOutput(GetScriptForDestination(minerDest), p.amount)) {
+                return state.DoS(100, error("CheckOPoIPayments(): coinbase missing audit-sampled payment of %s to %s for request %s",
+                                            FormatMoney(p.amount), p.minerAddress, p.requestId),
+                                 REJECT_INVALID, "bad-cb-opoi-missing-audit-sample-payment");
             }
             totalPaymentsChecked += p.amount;
         }
@@ -2394,6 +2559,76 @@ std::vector<OPoIResponsePayment> GetVerifiablePaymentsForBlock(const std::vector
 void ProcessVerifiableResponsePayments(const std::vector<CTransaction>& vtx, const Consensus::Params& params)
 {
     for (const auto& p : GetVerifiablePaymentsForBlock(vtx, params))
+        g_opoiCache.MarkResponsePaid(p.requestId);
+}
+
+// ── GetAuditSampledOpenPaymentsForBlock / ProcessAuditSampledOpenResponsePayments (F14-F) ──
+// Mirrors GetVerifiablePaymentsForBlock's combine-cache-with-this-block's-own-
+// AUDITOR_VERIFY-txs pattern exactly, for the OPEN-task responses F14-F's
+// sortition selected — same reason: a vote that itself completes quorum must
+// be visible to the pre-apply callers (CreateNewBlock/CheckOPoIPayments), not
+// just to the post-apply caller. Adds one behavior F14-C's VERIFIABLE path
+// doesn't have: if no quorum is EVER reached (no Auditor bothered), the
+// response still pays once currentHeight passes its auditDeadline — see
+// nOPoIAuditWindowBlocks's rationale (consensus/params.h) for why that
+// timeout exists here but not there.
+
+std::vector<OPoIResponsePayment> GetAuditSampledOpenPaymentsForBlock(
+    const std::vector<CTransaction>& vtx, uint32_t currentHeight, const Consensus::Params& params)
+{
+    std::vector<OPoIResponsePayment> out;
+    LOCK(g_opoiCache.cs);
+    for (const auto& resp : g_opoiCache.ListResponses()) {
+        if (!resp.auditSelected) continue; // not sampled — paid same-block, above
+        if (g_opoiCache.IsResponsePaid(resp.requestId)) continue;
+
+        OPoIRequest req;
+        if (!g_opoiCache.GetRequest(resp.requestId, req) || req.IsVerifiable() || req.payment <= 0)
+            continue; // VERIFIABLE never reaches here (exempt at selection time already)
+
+        std::vector<AuditorVerification> verifs = g_opoiCache.GetAuditorVerifications(resp.requestId);
+        std::set<std::string> seen;
+        for (const auto& v : verifs) seen.insert(v.auditorAddress);
+        for (size_t i = 1; i < vtx.size(); ++i) {
+            const CTransaction& tx = vtx[i];
+            if (tx.nVersion != OPOI_TX_VERSION || tx.nType != OPOI_AUDITOR_VERIFY_TX_TYPE) continue;
+            if (tx.opoiRequestId != resp.requestId) continue;
+            if (!seen.insert(tx.opoiAuditorAddress).second) continue; // already in cache
+            AuditorVerification v;
+            v.auditorAddress = tx.opoiAuditorAddress;
+            v.result         = tx.opoiAuditorVerifyResult;
+            verifs.push_back(v);
+        }
+
+        int majority = ComputeAuditorMajority(verifs, params.nOPoIMinAuditors);
+        bool payNow;
+        if (majority == AUDITOR_VERIFY_PASS) {
+            payNow = true;
+        } else if (majority < 0 && resp.auditDeadline > 0 && currentHeight > resp.auditDeadline) {
+            // No quorum ever reached and the grace window has passed — pay
+            // anyway rather than blocking an honest miner's payment forever.
+            payNow = true;
+            LogPrintf("OPoI: audit-sampled OPEN response for %s by %s paid on timeout "
+                      "(no Auditor quorum by height %u, deadline was %u)\n",
+                      resp.requestId, resp.minerAddress, currentHeight, resp.auditDeadline);
+        } else {
+            payNow = false; // FAIL majority (never paid) or still awaiting quorum/deadline
+        }
+        if (!payNow) continue;
+
+        CAmount totalPayment = req.payment;
+        if (req.feePerToken > 0 && resp.tokenCount > 0)
+            totalPayment += (CAmount)resp.tokenCount * req.feePerToken;
+
+        out.push_back({resp.requestId, resp.minerAddress, totalPayment});
+    }
+    return out;
+}
+
+void ProcessAuditSampledOpenResponsePayments(const std::vector<CTransaction>& vtx,
+                                             uint32_t currentHeight, const Consensus::Params& params)
+{
+    for (const auto& p : GetAuditSampledOpenPaymentsForBlock(vtx, currentHeight, params))
         g_opoiCache.MarkResponsePaid(p.requestId);
 }
 

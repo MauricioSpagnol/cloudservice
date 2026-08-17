@@ -82,6 +82,11 @@ static UniValue OPoIResponseToUniValue(const OPoIResponse& r)
     obj.pushKV("block_height",  (int)r.blockHeight);
     obj.pushKV("sig_time",      (int)r.sigTime);
     obj.pushKV("tx_hash",       r.txHash.GetHex());
+    // F14-F: post-commit audit sortition visibility (OPEN tasks only —
+    // VERIFIABLE responses are always implicitly "audited" via F14-C instead).
+    obj.pushKV("audit_selected", (bool)r.auditSelected);
+    if (r.auditSelected)
+        obj.pushKV("audit_deadline", (int)r.auditDeadline);
     return obj;
 }
 
@@ -2308,8 +2313,18 @@ UniValue submitauditorverification(const UniValue& params, bool fHelp)
     if (!g_opoiCache.GetRequest(requestId, req))
         throw JSONRPCError(RPC_INVALID_PARAMETER, "unknown request_id: " + requestId);
     if (!shardScoped) {
-        if (!req.IsVerifiable())
-            throw JSONRPCError(RPC_INVALID_PARAMETER, requestId + " is not a VERIFIABLE task — nothing for an Auditor to check");
+        if (!req.IsVerifiable()) {
+            // F14-F: an OPEN task only gets an Auditor verdict if the post-commit
+            // audit sortition actually selected its RESPONSE — mirrors the
+            // consensus-layer check (CheckOPoITransaction), just with a clearer
+            // client-side error before it ever reaches the mempool.
+            OPoIResponse resp;
+            bool sampled = g_opoiCache.GetResponse(requestId, resp) && resp.auditSelected;
+            if (!sampled)
+                throw JSONRPCError(RPC_INVALID_PARAMETER, requestId +
+                    " is not VERIFIABLE and its RESPONSE was not selected by the F14-F audit "
+                    "sortition — nothing for an Auditor to check");
+        }
     } else {
         // D2: shard-scoped verdicts don't require VERIFIABLE — bounds-check
         // shardIndex against the request's model MEG instead, same pattern

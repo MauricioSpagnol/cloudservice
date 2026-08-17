@@ -249,6 +249,61 @@ struct Params {
     int         nOPoICanaryAuditFrequency  = 0;
     int         nOPoICanaryResponseWindow  = 0;
 
+    /** F14-F — post-commit audit sortition for OPEN-task responses. Extends
+     *  F14-C (N-of-M Auditor verification), which today only ever runs for
+     *  VERIFIABLE-task responses (see req.IsVerifiable() gates in
+     *  CheckOPoIPayments/GetVerifiablePaymentsForBlock, opoi.cpp) — OPEN
+     *  (free-text) responses had zero systematic audit sampling, only
+     *  reactive challenge/reputation detection. VERIFIABLE responses are
+     *  deliberately EXEMPT from this lottery: F14-C already audits 100% of
+     *  them unconditionally, so also running this sortition on them would be
+     *  redundant double-coverage, not additional security.
+     *
+     *  Reuses GetOPoIRequestSeedHash's future-block-anchoring PATTERN
+     *  (opoi.cpp) but NOT its exact anchor: that function anchors to the
+     *  REQUEST's own confirmation height, which is already fully known by
+     *  the time a miner picks their RESPONSE's COMMIT (F10-B) — reusing it
+     *  verbatim here would let a miner grind their commit nonce (free,
+     *  since commitment_hash = SHA256(responseText||nonce) is entirely
+     *  self-chosen) until the sortition happens to miss them. Instead the
+     *  seed anchors to the block ONE past the RESPONSE's own COMMIT height
+     *  (see GetOPoIAuditSampleSeedHash) — a block that cannot exist until
+     *  after that miner's COMMIT is already immutable on-chain, closing the
+     *  grinding gap while still being safely in the past by the time REVEAL
+     *  is even allowed (commitWindowClosed already requires
+     *  nOPoIResponseCommitWindowBlocks to have passed since the REQUEST).
+     *
+     *  sorteio = SHA256(commitment_hash || seedHash); selected iff sorteio,
+     *  read as a big number, falls below a threshold derived from the bp
+     *  rate — same technique nOPoIVrfThreshold/CheckVrfSortition already use.
+     *
+     *  nOPoIAuditSampleNewMinerResponseCount reuses OPoIStake::responsesTotal
+     *  (F10-C's existing reputation counter) rather than adding a parallel
+     *  one — "new miner" means fewer than this many completed responses so
+     *  far. No exact N is pinned in the design doc; 5 is chosen here as a
+     *  small, easy-to-observe-in-testing grace period (big enough to not be
+     *  a single lucky/unlucky sample, small enough to cross in a short
+     *  regtest run) — same spirit as F9-F's tier-based obligation, applied
+     *  here to a miner's own response history instead.
+     *
+     *  A selected OPEN response is unpayable (same "deferred" gate F14-C's
+     *  VERIFIABLE responses already use — see setPaidResponses/IsResponsePaid,
+     *  shared/reused as-is since a request has at most one RESPONSE) until
+     *  either an Auditor PASS majority resolves it (submitauditorverification
+     *  / ProcessAuditorVerifications — F14-C's exact same machinery, just no
+     *  longer gated to req.IsVerifiable() alone) or nOPoIAuditWindowBlocks
+     *  pass with no quorum reached, at which point it pays anyway. F14-C's
+     *  own VERIFIABLE path has NO such timeout today (a documented v1 gap:
+     *  "never resolves = never pays", see ProcessAuditorVerifications) — a
+     *  deliberate deviation here, since it would be unreasonable to leave an
+     *  honest OPEN-task miner's payment blocked forever just because nobody
+     *  bothered to audit the sample they were drawn into. **/
+    int         nOPoIAuditSampleRateBp                = 1500;  // 15%, basis points
+    int         nOPoIAuditSampleRateNewMinerBp        = 10000; // 100% for a new miner's first N responses
+    uint32_t    nOPoIAuditSampleNewMinerResponseCount = 5;     // N — see rationale above
+    int         nOPoIAuditWindowBlocks                = 200;   // blocks after REVEAL before an
+                                                                 // unresolved selected response pays anyway
+
     /** F11-A — minimum REQUEST budget (opoiPayment), scaled by the
      *  requester's own declared prompt size (opoiPromptTokenCount):
      *  min(payment) = nOPoIFeeBase + promptTokenCount * nOPoIFeePerToken.

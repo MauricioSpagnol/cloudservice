@@ -4044,6 +4044,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         ProcessModelVotingWindows((uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessShardPayments(block.vtx, chainparams.GetConsensus());
         ProcessVerifiableResponsePayments(block.vtx, chainparams.GetConsensus());
+        ProcessAuditSampledOpenResponsePayments(block.vtx, (uint32_t)pindex->nHeight, chainparams.GetConsensus());
         ProcessAuditorVerifications((uint32_t)pindex->nHeight, chainparams.GetConsensus());
     }
 
