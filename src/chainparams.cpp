@@ -480,7 +480,7 @@ public:
         
         // vFixedSeeds.clear();
         vSeeds.clear();
-        // vSeeds.push_back(CDNSSeedData("...", "..."));
+        vSeeds.push_back(CDNSSeedData("seed-testnet.cscloudservice.com", "seed-testnet.cscloudservice.com"));
 
         base58Prefixes[PUBKEY_ADDRESS]     = {0x1D,0x25};
         base58Prefixes[SCRIPT_ADDRESS]     = {0x1C,0xBA};
