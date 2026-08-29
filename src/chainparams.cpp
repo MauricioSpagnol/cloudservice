@@ -182,6 +182,9 @@ public:
 
         // OPoI Phase 3 escrow
         consensus.nOPoIMinStake              = 100 * COIN;  // 100 CS minimum stake
+        // Adaptativo desde a própria ativação do OPoI: não há histórico de
+        // RESPONSE na mainnet para revalidar sob a regra antiga.
+        consensus.nOPoIAdaptiveVrfHeight     = 100000;
         consensus.nOPoIChallengeWindowBlocks = 144;         // ~1 hour at 25s/block
         consensus.nOPoIUnstakeCooldownBlocks = 1440;        // ~10 hours cooldown
         consensus.nOPoIRequestExpiryBlocks   = 2016;        // ~14 days PENDING before expiry
@@ -416,6 +419,12 @@ public:
 
         // OPoI Phase 3 escrow (testnet — lower values for easier testing)
         consensus.nOPoIMinStake              = 10 * COIN;   // 10 CS on testnet
+        // Mesma altura em que o OPoI ativa: a testnet é descartável e foi
+        // resetada para isto, então não há RESPONSE antiga para revalidar sob
+        // a regra antiga. Espelha a mainnet, onde o adaptativo também vale
+        // desde o primeiro bloco em que o OPoI existe — testar a transição de
+        // regra seria testar algo que a mainnet nunca vai fazer.
+        consensus.nOPoIAdaptiveVrfHeight     = 50;
         consensus.nOPoIChallengeWindowBlocks = 20;          // ~8 minutes on testnet
         consensus.nOPoIUnstakeCooldownBlocks = 60;          // ~25 minutes on testnet
         consensus.nOPoIRequestExpiryBlocks   = 200;         // ~83 minutes PENDING before expiry
@@ -614,6 +623,11 @@ public:
 
         // OPoI Phase 3 escrow (regtest — minimal values for unit testing)
         consensus.nOPoIMinStake              = 1 * COIN;
+        // Ativa em 200 em vez de desligado: cadeias de teste curtas (< 200)
+        // seguem no limiar fixo de ~87%, calibrado para staker único, mas o
+        // caminho adaptativo fica exercitável minerando além disso — deixá-lo
+        // desligado significaria que nenhum teste jamais o executa.
+        consensus.nOPoIAdaptiveVrfHeight     = 200;
         consensus.nOPoIChallengeWindowBlocks = 5;
         consensus.nOPoIUnstakeCooldownBlocks = 10;
         consensus.nOPoIRequestExpiryBlocks   = 20;           // 20 blocks PENDING before expiry in regtest

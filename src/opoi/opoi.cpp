@@ -103,6 +103,53 @@ static bool CheckVrfSortition(const std::string& minerAddress,
     return true;
 }
 
+// Threshold this request's RESPONSE sortition is judged against.
+//
+// Below nOPoIAdaptiveVrfHeight (or when the request isn't in the cache) this is
+// the fixed consensus constant, unchanged. At or above it, the threshold is
+// sized so that roughly nOPoIVrfTargetEligible stakers are eligible for THIS
+// request: threshold = 2^256 * target / stakers.
+//
+// The count comes from the request record, frozen when its own block was
+// connected (OPoIRequest::vrfActiveStakers) — never from the live cache, which
+// would differ between mempool time and mining time and between nodes.
+//
+// Degenerate cases are clamped rather than left to overflow: zero stakers (no
+// one to ask) and any count at or below the target both yield powLimit-style
+// "everyone eligible", which is the only sane reading of "select 3 of 2".
+static std::string OPoIVrfThresholdForRequest(const std::string& requestId,
+                                              const Consensus::Params& params)
+{
+    if (params.nOPoIAdaptiveVrfHeight <= 0)
+        return params.nOPoIVrfThreshold;
+
+    OPoIRequest req;
+    if (!g_opoiCache.GetRequest(requestId, req))
+        return params.nOPoIVrfThreshold;
+
+    // Gated on the REQUEST's height, not on where the RESPONSE lands. A
+    // request is judged by the rule in force when it was made, for its whole
+    // life — otherwise a response to a pre-activation request would be graded
+    // differently depending on how long the miner took to answer, and the two
+    // sides of the boundary would disagree about the same commit. It also
+    // keeps this callable from CheckOPoITransaction, which has no height of
+    // its own (it runs at mempool acceptance as well as in block validation).
+    if (req.blockHeight < (uint32_t)params.nOPoIAdaptiveVrfHeight)
+        return params.nOPoIVrfThreshold;
+
+    const uint32_t stakers = req.vrfActiveStakers;
+    const uint32_t target  = (uint32_t)std::max(1, params.nOPoIVrfTargetEligible);
+
+    // Everyone eligible — the sortition has nothing to narrow down.
+    if (stakers <= target)
+        return "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    // 2^256 * target / stakers, computed as (2^256 - 1) / stakers * target so
+    // it stays inside arith_uint256 (2^256 itself is not representable).
+    arith_uint256 threshold = (~arith_uint256(0) / arith_uint256(stakers)) * arith_uint256(target);
+    return threshold.GetHex();
+}
+
 // Bug fix (2026-07-05): distinguishes a harmless late P2P redelivery of a tx that
 // already locked this UTXO from a genuinely different, conflicting tx. Bitcoin
 // Core's normal defense against re-validating an already-known/confirmed tx
@@ -598,6 +645,11 @@ bool ProcessOPoITransaction(const CTransaction& tx, uint32_t blockHeight,
         req.sigTime     = tx.opoiSigTime;
         req.txHash      = tx.GetHash();
         req.status      = OPOI_STATUS_PENDING;
+        // Freeze the staker count this request's VRF threshold will be sized
+        // against. Read here, while connecting the request's own block, so the
+        // value is a function of chain history up to this point and nothing
+        // else — every node replaying reaches the identical number.
+        req.vrfActiveStakers = (uint32_t)g_opoiCache.CountActiveStakers();
         g_opoiCache.AddRequest(req);
         LogPrintf("OPoI: REQUEST %s (model=%s type=%s) at height %u\n",
                   tx.opoiRequestId, tx.opoiModel,
@@ -1515,7 +1567,7 @@ bool CheckOPoITransaction(const CTransaction& tx, CValidationState& state)
                                  REJECT_INVALID, "bad-txns-opoi-response-no-seed");
             std::string reason;
             if (!CheckVrfSortition(tx.opoiMinerAddress, tx.opoiRequestId, seedHash, "", tx.opoiVrfProof,
-                                    Params().GetConsensus().nOPoIVrfThreshold, reason))
+                                    OPoIVrfThresholdForRequest(tx.opoiRequestId, Params().GetConsensus()), reason))
                 return state.DoS(reason == "vrf-invalid" ? 100 : 10,
                                  error("CheckOPoITransaction(): RESPONSE VRF check failed (%s) for %s",
                                        reason, tx.opoiMinerAddress),

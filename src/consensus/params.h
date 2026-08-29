@@ -189,6 +189,31 @@ struct Params {
     // Value = 2^256 * 3 / 1000 ≈ selects ~3 miners per request (assumes ~1000 active miners)
     // Stored as hex string for arith_uint256 comparison in CheckOPoITransaction
     std::string nOPoIVrfThreshold      = "004C4B40000000000000000000000000000000000000000000000000000000000";
+    /** Height at or above which the VRF threshold is derived from the number of
+     *  ACTIVE stakers recorded on the request's own block, instead of the fixed
+     *  constant above. 0 = never (keep the constant).
+     *
+     *  Why: the constant is calibrated for one specific network size — the
+     *  comment above says so ("assumes ~1000 active miners"). On a smaller
+     *  network almost every request goes unanswered: with the value actually in
+     *  force each address is eligible ~1.86% of the time, so 10 miners cover
+     *  17% of requests and a single staker covers 1.9%. Measured on testnet
+     *  2026-08-28 before this: 41 requests, 36 expired, 0 fulfilled. The
+     *  requester pays either way, so an under-sized network silently charges
+     *  for answers it can never deliver.
+     *
+     *  Deriving it from the live staker count keeps ~3 miners eligible per
+     *  request at ANY network size, which holds coverage near 95% from ten
+     *  miners to a thousand without anyone retuning a constant.
+     *
+     *  Gated by height because it changes RESPONSE validation: blocks accepted
+     *  under the old rule must keep validating on reindex. Mainnet can enable
+     *  it from OPoI's own activation height — OPoI has no mainnet history yet
+     *  (activates at 100000; chain was at ~70900 when this was written). */
+    int         nOPoIAdaptiveVrfHeight = 0;
+    /** Target number of eligible miners per request when the adaptive threshold
+     *  is in force. Same "~3 miners per request" the fixed constant aimed at. */
+    int         nOPoIVrfTargetEligible = 3;
 
     /** F15-A2 — Model Manifest governance (register new dense/MoE/hybrid models via stake vote) **/
     int     nOPoIModelVoteWindowBlocks      = 200;  // how long a proposed model stays open to voting

@@ -133,6 +133,20 @@ struct OPoIRequest {
     // apply does, never calling SetNull()) can't leave this as stack garbage —
     // the exact bug class already found once for OPoIStake's reputation fields.
     bool        commitWindowClosed = false;
+    // Number of ACTIVE stakers at the moment this REQUEST was connected, used
+    // to size the VRF threshold (see Consensus::nOPoIAdaptiveVrfHeight).
+    //
+    // Frozen here rather than read live at RESPONSE time for the same reason
+    // the VRF seed is pinned to the request's own block: eligibility must be
+    // one fixed answer per (request, address), identical on every node and on
+    // every replay. A live count would move between mempool acceptance and
+    // mining, and between one node's tip and another's.
+    //
+    // Deliberately NOT serialized — mirrors commitWindowClosed. The cache is
+    // rebuilt from genesis by replaying blocks in order (RebuildOPoICache), so
+    // this is recomputed to the same value every time; persisting it would add
+    // a second source of truth that could disagree.
+    uint32_t    vrfActiveStakers = 0;
 
     ADD_SERIALIZE_METHODS;
     template <typename Stream, typename Operation>
