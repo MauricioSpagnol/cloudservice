@@ -5673,15 +5673,19 @@ bool static LoadBlockIndexDB()
         // Construct in-memory chain of branch IDs.
         // Relies on invariant: a block that does not activate a network upgrade
         // will always be valid under the same consensus rules as its parent.
-        // Genesis block has a branch ID of zero by definition, but has no
-        // validity status because it is side-loaded into a fresh chain.
+        // Genesis block has no validity status because it is side-loaded into a
+        // fresh chain. Its branch ID is the one of the epoch active at height 0:
+        // upgrades that are ALWAYS_ACTIVE on this network are already in force at
+        // genesis, and every non-activation block inherits it. Using
+        // SPROUT_BRANCH_ID unconditionally made RewindBlockIndex() see block 1 as
+        // insufficiently validated on every restart (fake multi-thousand block rewind).
         // Activation blocks will have branch IDs set (read from disk).
         if (pindex->pprev) {
             if (pindex->IsValid(BLOCK_VALID_CONSENSUS) && !pindex->nCachedBranchId) {
                 pindex->nCachedBranchId = pindex->pprev->nCachedBranchId;
             }
         } else {
-            pindex->nCachedBranchId = SPROUT_BRANCH_ID;
+            pindex->nCachedBranchId = CurrentEpochBranchId(0, chainparams.GetConsensus());
         }
         if (pindex->IsValid(BLOCK_VALID_TRANSACTIONS) && (pindex->nChainTx || pindex->pprev == NULL))
             setBlockIndexCandidates.insert(pindex);
