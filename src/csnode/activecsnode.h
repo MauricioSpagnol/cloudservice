@@ -61,6 +61,7 @@ public:
 
     // Manage my active deterministic Fluxnode
     void ManageDeterministricFluxnode();
+    static bool IpNeedsUpdate(int nHeight);
 
     bool BuildDeterministicStartTx(std::string strKey, std::string strTxHash, std::string strOutputIndex, std::string& errorMessage, CMutableTransaction& mutTransaction);
     void BuildDeterministicConfirmTx(CMutableTransaction& mutTransaction, const int nUpdateType);

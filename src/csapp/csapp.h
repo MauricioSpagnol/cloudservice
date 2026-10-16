@@ -98,6 +98,12 @@ public:
         it->second.specJson   = specJson;
         it->second.updatedAt  = blockHeight;
         it->second.lastTxHash = txHash;
+        // A released slot is updated with a blank spec and stays STOPPED.
+        // The marketplace sets csapp_resume when a new tenant claims it so
+        // the same registration goes back to RUNNING without registercsapp.
+        if (specJson.find("\"csapp_resume\":true") != std::string::npos ||
+            specJson.find("\"csapp_resume\": true") != std::string::npos)
+            it->second.status = CSAPP_STATUS_RUNNING;
         return true;
     }
 

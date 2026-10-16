@@ -1057,13 +1057,10 @@ void static BitcoinMiner(const CChainParams& chainparams)
                     SetThreadPriority(THREAD_PRIORITY_LOWEST);
                     coinbaseScript->KeepScript();
 
-                    // In regression test mode, stop mining after a block is found.
-                    if (chainparams.MineBlocksOnDemand()) {
-                        // Increment here because throwing skips the call below
-                        ehSolverRuns.increment();
-                        throw boost::thread_interrupted();
-                    }
-
+                    // Keep this thread alive. The outer loop builds the next
+                    // block, and the other threads see the new tip and do the
+                    // same. Regtest used to kill the winning thread here, so
+                    // every block permanently removed one miner.
                     return true;
                 };
                 std::function<bool(EhSolverCancelCheck)> cancelled = [&m_cs, &cancelSolver](EhSolverCancelCheck pos) {

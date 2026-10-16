@@ -607,10 +607,15 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_KAMIOOKA].nActivationHeight = Consensus::NetworkUpgrade::ALWAYS_ACTIVE;
 
         consensus.vUpgrades[Consensus::UPGRADE_KAMATA].nProtocolVersion = 170016;
-        consensus.vUpgrades[Consensus::UPGRADE_KAMATA].nActivationHeight = Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+        // TEST-ONLY: fluxnode start transactions are rejected until KAMATA.
+        // Regtest needs them so a PROTON collateral can be announced.
+        consensus.vUpgrades[Consensus::UPGRADE_KAMATA].nActivationHeight = Consensus::NetworkUpgrade::ALWAYS_ACTIVE;
 
         consensus.vUpgrades[Consensus::UPGRADE_FLUX].nProtocolVersion = 170017;
-        consensus.vUpgrades[Consensus::UPGRADE_FLUX].nActivationHeight = Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+        // TEST-ONLY: an IP change on a confirmed node is accepted only after
+        // this upgrade. Regtest needs it so a node confirmed with an empty
+        // address can publish 192.168.3.109:26126.
+        consensus.vUpgrades[Consensus::UPGRADE_FLUX].nActivationHeight = Consensus::NetworkUpgrade::ALWAYS_ACTIVE;
 
         consensus.vUpgrades[Consensus::UPGRADE_HALVING].nProtocolVersion = 170018;
         consensus.vUpgrades[Consensus::UPGRADE_HALVING].nActivationHeight = Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
@@ -728,9 +733,11 @@ public:
         fTestnetToBeDeprecatedFieldRPC = false;
 
         networkID = CBaseChainParams::Network::REGTEST;
-        vecBenchmarkingPublicKeys.resize(2);
-        vecBenchmarkingPublicKeys[0] = std::make_pair("04cf3c34f01486bbb34c1a7ca11c2ddb1b3d98698c3f37d54452ff91a8cd5e92a6910ce5fc2cc7ad63547454a965df53ff5be740d4ef4ac89848c2bafd1e40e6b7", 0);
-        vecBenchmarkingPublicKeys[1] = std::make_pair("045d54130187b4c4bba25004bf615881c2d79b16950a59114df27dc9858d8e531fda4f3a27aa95ceb2bcc87ddd734be40a6808422655e5350fa9417874556b7342", 1617508800); 
+        // Same key csbenchd loads from ~/.csbenchmark/benchmark.key. A second
+        // key with a past timestamp made every new confirm tx verify against
+        // the wrong public key.
+        vecBenchmarkingPublicKeys.resize(1);
+        vecBenchmarkingPublicKeys[0] = std::make_pair("04bd9a8274ec53bd87782a3cf30d5c96e1d6c1f8aa98fedfc3364754766b7c5e2e0b83d2f75048fe7181d8cae9ea7fef573a6602f1a118ad4f4e5a3e48be28930a", 0); 
 
         assert(vecBenchmarkingPublicKeys.size() > 0);
 

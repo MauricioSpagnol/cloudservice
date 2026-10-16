@@ -48,10 +48,12 @@ switch (command) {
         params = args[1] === 'true' ? [true] : [];
         break;
     case 'signfluxnodetransaction':
+    case 'signcsnodetransaction':
         if (!args[1]) {
-            process.stderr.write('signfluxnodetransaction requires a txhex argument\n');
+            process.stderr.write(command + ' requires a txhex argument\n');
             process.exit(1);
         }
+        method = 'signfluxnodetransaction';
         params = [args[1]];
         break;
     default:

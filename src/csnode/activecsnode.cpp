@@ -13,7 +13,21 @@
 
 #include "key_io.h"
 #include "csnode/benchmarks.h"
+#include "util.h"
 
+
+bool ActiveFluxnode::IpNeedsUpdate(int nHeight)
+{
+    if (strFluxnodeAddr.empty())
+        return false;
+    if (!g_fluxnodeCache.InConfirmTracker(activeFluxnode.deterministicOutPoint))
+        return false;
+
+    FluxnodeCacheData data = g_fluxnodeCache.GetFluxnodeData(activeFluxnode.deterministicOutPoint);
+    if (data.ip == strFluxnodeAddr)
+        return false;
+    return nHeight - data.nLastConfirmedBlockHeight >= FLUXNODE_CONFIRM_UPDATE_MIN_HEIGHT_IP_CHANGE_V1;
+}
 
 void ActiveFluxnode::ManageDeterministricFluxnode()
 {
@@ -48,7 +62,8 @@ void ActiveFluxnode::ManageDeterministricFluxnode()
         } else {
             return;
         }
-    } else if (g_fluxnodeCache.CheckIfNeedsNextConfirm(activeFluxnode.deterministicOutPoint, nHeight)) {
+    } else if (g_fluxnodeCache.CheckIfNeedsNextConfirm(activeFluxnode.deterministicOutPoint, nHeight)
+               || ActiveFluxnode::IpNeedsUpdate(nHeight)) {
         activeFluxnode.BuildDeterministicConfirmTx(mutTx, FluxnodeUpdateType::UPDATE_CONFIRM);
         LogPrintf("Time to Confirm Fluxnode reached, Creating Update Confirm Transaction on height: %s for outpoint: %s\n", nHeight, activeFluxnode.deterministicOutPoint.ToString());
     } else {
@@ -396,6 +411,9 @@ void ActiveFluxnode::BuildDeterministicConfirmTx(CMutableTransaction& mutTransac
 
     // Enforce a valid fluxnode tx version
     EnforceActiveFluxNodeTxVersion();
+    // The address from -csnodeaddr. Without this the confirm tx is stored
+    // with an empty IP and the node never becomes reachable.
+    mutTransaction.ip = strFluxnodeAddr;
 
     CKey keyCollateralAddress;
     CKey keyFluxnode;
